@@ -9,9 +9,21 @@ irreversible without inspection: it depends only on `AgentRunner` and
 
 from __future__ import annotations
 
+import uuid
+from collections import Counter
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
+
+try:
+    from enum import StrEnum
+except ImportError:
+    from enum import Enum
+
+    class StrEnum(str, Enum):  # type: ignore[no-redef]
+        pass
+
 
 from .contracts import (
     ArchitectResult,
@@ -26,24 +38,50 @@ from .contracts import (
     check_decision_answered,
     check_task_identity,
 )
-from .decisions import write_adr
+from .decisions import (
+    DecisionError,
+    adr_content_hash,
+    render_adr,
+    validate_adr_target,
+    validate_decisions_subpath,
+    write_adr_idempotent,
+)
 from .git import GitError, GitRepo, MergeConflictError, TaskWorktree
-from .opencode import AgentRunner
-from .state import DecisionRequest, RunOptions, RunState, save_state
+from .opencode import AgentInvocationError, AgentRunner, OpenCodeError, PhaseTimeoutError
+from .phases import (
+    PHASE_ARCHITECTING,
+    PHASE_AUDITING,
+    PHASE_AWAITING_INPUT,
+    PHASE_BUILDING,
+    PHASE_CLEANUP_BRANCH,
+    PHASE_CLEANUP_WORKTREE,
+    PHASE_CREATING_WORKTREE,
+    PHASE_DONE,
+    PHASE_FAILED,
+    PHASE_MERGING,
+    PHASE_OPERATIONAL_FAILURE,
+    PHASE_PLANNING,
+    PHASE_RECORDING_DECISION,
+    TERMINAL_PHASES,
+)
+from .state import DecisionRequest, OperationalErrorRecord, RunOptions, RunState, save_state
 
-PHASE_PLANNING = "planning"
-PHASE_ARCHITECTING = "architecting"
-PHASE_BUILDING = "building"
-PHASE_AUDITING = "auditing"
-PHASE_AWAITING_INPUT = "awaiting_input"
-PHASE_DONE = "done"
-PHASE_FAILED = "failed"
-
-_TERMINAL_PHASES = {PHASE_DONE, PHASE_FAILED}
+_TERMINAL_PHASES = TERMINAL_PHASES
+_DURABLE_SIDE_EFFECT_PHASES = {
+    PHASE_CREATING_WORKTREE,
+    PHASE_RECORDING_DECISION,
+    PHASE_MERGING,
+    PHASE_CLEANUP_WORKTREE,
+    PHASE_CLEANUP_BRANCH,
+}
 
 
 class LoopError(RuntimeError):
     """Raised for unrecoverable loop-level failures (limits, conflicts)."""
+
+
+class FailurePersistenceError(RuntimeError):
+    """Raised when the supervisor cannot persist a failure record."""
 
 
 class InputProvider(Protocol):
@@ -78,6 +116,23 @@ def _default_run_options() -> RunOptions:
         opencode_executable="opencode",
         opencode_startup_timeout=30.0,
     )
+
+
+class AdvanceStatus(StrEnum):
+    ADVANCED = "advanced"
+    INPUT_REQUIRED = "input_required"
+    INPUT_UNAVAILABLE = "input_unavailable"
+    OPERATIONAL_FAILURE = "operational_failure"
+    TERMINAL = "terminal"
+
+
+@dataclass(frozen=True, slots=True)
+class AdvanceOutcome:
+    status: AdvanceStatus
+    state: RunState
+    phase_before: str
+    phase_after: str
+    error: Exception | None = None
 
 
 class Supervisor:
@@ -154,6 +209,39 @@ class Supervisor:
             )
         return state
 
+    def _effective_resume_phase(self, state: RunState) -> str:
+        """Return the phase resume validation should dispatch against.
+
+        For every phase except operational_failure, this is simply
+        state.phase. For operational_failure, the phase that will actually
+        run next (once _do_retry_operational_failure() executes on the
+        first advance() after resume) is the *retry_phase* recorded in the
+        error, not "operational_failure" itself. Validating against the
+        literal "operational_failure" phase would fall through to the
+        generic task-worktree branch (which requires an exact status
+        snapshot match) for every operational failure regardless of which
+        phase it actually interrupted — including cleanup_worktree, whose
+        own dedicated validation is deliberately more lenient about
+        worktree content because cleanup is expected to remove it. Using
+        the effective phase here ensures resume validates the same rules
+        that will actually apply once retried.
+
+        Does not mutate state.phase; that mutation remains the sole
+        responsibility of _do_retry_operational_failure() inside advance().
+        """
+        if state.phase != PHASE_OPERATIONAL_FAILURE:
+            return state.phase
+        if state.last_error is None:
+            raise LoopError("operational_failure state is missing its error record")
+        record = OperationalErrorRecord.from_dict(state.last_error)
+        if not record.retryable or record.retry_phase is None:
+            # Not retryable: there is no meaningful "next phase" to validate
+            # against. Fall back to the literal phase so the generic branch
+            # below still performs its baseline checks; _do_retry_operational_failure()
+            # will reject this state as non-retryable on the next advance().
+            return state.phase
+        return record.retry_phase
+
     def _validate_resume(self, state: RunState) -> None:
         common_dir = str(self.git_common_dir)
         if state.git_common_dir != common_dir:
@@ -177,6 +265,8 @@ class Supervisor:
                     f"found {current_head!r}"
                 )
 
+        effective_phase = self._effective_resume_phase(state)
+
         task_fields = (
             state.original_task_id,
             state.task_worktree_path,
@@ -185,35 +275,179 @@ class Supervisor:
         )
         has_task = any(f is not None for f in task_fields)
         if has_task:
-            if state.task_expected_head is None:
-                raise LoopError("resume task state is missing an expected HEAD checkpoint")
             worktree = TaskWorktree(
                 path=Path(state.task_worktree_path or ""),
                 branch=state.task_branch or "",
                 original_task_id=state.original_task_id or "",
                 base_commit=state.task_base_commit or "",
             )
-            try:
-                self.repo.validate_task_worktree(worktree, expected_head=state.task_expected_head)
-            except GitError as exc:
-                raise LoopError(f"resume task worktree validation failed: {exc}") from exc
-            if state.task_status_snapshot is not None:
-                actual_snapshot = self.repo.status_snapshot(cwd=worktree.path)
-                if actual_snapshot != state.task_status_snapshot:
-                    raise LoopError(
-                        "resume task worktree has changed since it was paused "
-                        "(working-tree status snapshot mismatch)"
+            if effective_phase == PHASE_CLEANUP_BRANCH:
+                self._validate_resume_cleanup_branch(state, worktree)
+            elif effective_phase == PHASE_CLEANUP_WORKTREE:
+                self._validate_resume_cleanup_worktree(state, worktree)
+            else:
+                if state.task_expected_head is None:
+                    raise LoopError("resume task state is missing an expected HEAD checkpoint")
+                try:
+                    self.repo.validate_task_worktree(
+                        worktree, expected_head=state.task_expected_head
                     )
-        elif state.phase in (PHASE_ARCHITECTING, PHASE_BUILDING, PHASE_AUDITING):
-            raise LoopError(f"resume phase {state.phase!r} requires an active task worktree")
+                except GitError as exc:
+                    raise LoopError(f"resume task worktree validation failed: {exc}") from exc
+                if state.task_status_snapshot is not None:
+                    actual_snapshot = self.repo.status_snapshot(cwd=worktree.path)
+                    if actual_snapshot != state.task_status_snapshot:
+                        if effective_phase == PHASE_RECORDING_DECISION:
+                            self._validate_recording_decision_status_drift(
+                                state, worktree, actual_snapshot
+                            )
+                        else:
+                            raise LoopError(
+                                "resume task worktree has changed since it was paused "
+                                "(working-tree status snapshot mismatch)"
+                            )
+        elif effective_phase in (PHASE_ARCHITECTING, PHASE_BUILDING, PHASE_AUDITING):
+            raise LoopError(f"resume phase {effective_phase!r} requires an active task worktree")
+
+        if effective_phase == PHASE_RECORDING_DECISION:
+            self._validate_resume_recording_decision(state)
+
+    def _validate_resume_recording_decision(self, state: RunState) -> Path:
+        """Reject a tampered or inconsistent persisted ADR target before
+        OpenCode is ever started, so a corrupted pending_adr_path cannot
+        cause a write outside the active worktree. Returns the validated,
+        resolved target path."""
+        if state.pending_adr_path is None or state.pending_adr_hash is None:
+            raise LoopError("resume recording_decision requires pending ADR path and hash")
+        try:
+            validate_decisions_subpath(self.decisions_subpath)
+            directory = self._active_directory(state)
+            return validate_adr_target(
+                worktree_root=directory,
+                decisions_dir=directory / self.decisions_subpath,
+                target_path=Path(state.pending_adr_path),
+            )
+        except DecisionError as exc:
+            raise LoopError(f"resume recording_decision: {exc}") from exc
+
+    def _validate_recording_decision_status_drift(
+        self, state: RunState, worktree: TaskWorktree, actual_snapshot: str
+    ) -> None:
+        """Allow exactly one worktree change since the pre-write checkpoint
+        during recording_decision resume: the already-written, byte-exact
+        pending ADR file appearing as a new untracked entry.
+
+        This narrowly reopens crash-after-write recovery (the ADR write in
+        _do_recording_decision happens before the post-transition state
+        save, so a crash in between leaves the pre-write status snapshot on
+        disk) without weakening the checkpoint guarantee for any other
+        change. Any other difference — a missing expected line, an extra
+        line, mismatched ADR content, or an ADR target outside the active
+        worktree — fails closed exactly like the generic mismatch case.
+        """
+        target = self._validate_resume_recording_decision(state)
+        assert state.pending_adr_hash is not None
+
+        def _fail() -> None:
+            raise LoopError(
+                "resume task worktree has changed since it was paused "
+                "(working-tree status snapshot mismatch)"
+            )
+
+        if not target.exists() or target.is_symlink():
+            _fail()
+        actual_hash = adr_content_hash(target.read_text())
+        if actual_hash != state.pending_adr_hash:
+            _fail()
+
+        try:
+            relative = target.relative_to(worktree.path.resolve())
+        except ValueError:
+            _fail()
+            return
+        expected_line = f"?? {relative.as_posix()}"
+
+        persisted_lines = (
+            state.task_status_snapshot.splitlines() if state.task_status_snapshot else []
+        )
+        actual_lines = actual_snapshot.splitlines()
+
+        persisted_counts = Counter(persisted_lines)
+        actual_counts = Counter(actual_lines)
+        added = actual_counts - persisted_counts
+        removed = persisted_counts - actual_counts
+        if removed or dict(added) != {expected_line: 1}:
+            _fail()
+
+    def _validate_resume_cleanup_worktree(self, state: RunState, worktree: TaskWorktree) -> None:
+        """Resume cleanup_worktree: worktree may be present (remove again) or already gone."""
+        registered = self.repo.registered_worktree_paths()
+        path = worktree.path.resolve()
+        if path in registered:
+            actual_branch = self.repo.branch_at_path(worktree.path)
+            if actual_branch != worktree.branch:
+                raise LoopError(
+                    f"resume cleanup_worktree: worktree at {path} is on branch "
+                    f"{actual_branch!r}, expected {worktree.branch!r}"
+                )
+        elif worktree.path.exists():
+            raise LoopError(
+                f"resume cleanup_worktree: path {path} exists but is not a registered worktree"
+            )
+
+    def _validate_resume_cleanup_branch(self, state: RunState, worktree: TaskWorktree) -> None:
+        """Resume cleanup_branch: worktree must be gone; branch may be present or deleted."""
+        registered = self.repo.registered_worktree_paths()
+        path = worktree.path.resolve()
+        if path in registered:
+            raise LoopError(
+                f"resume cleanup_branch: worktree path {path} is still registered; "
+                "cleanup_worktree must complete before cleanup_branch"
+            )
+        if self.repo.branch_exists(worktree.branch):
+            integration_head = self.repo.head_commit()
+            if not self.repo.is_ancestor(worktree.branch, integration_head):
+                raise LoopError(
+                    f"resume cleanup_branch: branch {worktree.branch!r} still exists "
+                    "but its tip is not integrated into the current HEAD; "
+                    "check for unexpected rewrite or incomplete merge"
+                )
+
+    def _checkpoint_phase(self, state: RunState) -> str:
+        """The phase whose checkpoint semantics apply to this save.
+
+        Ordinarily this is simply ``state.phase``. But when a retryable
+        operational failure has already been recorded (phase is
+        ``operational_failure``), the meaningful phase for checkpointing is
+        the phase that actually failed and will be retried
+        (``last_error.retry_phase``). This matters for cleanup_branch: the
+        task worktree is intentionally gone once cleanup_branch is entered,
+        so a failure *during* cleanup_branch must still checkpoint with the
+        worktree-absent rules — otherwise _checkpoint() would try to
+        inspect the removed worktree and failure persistence would itself
+        fail (FailurePersistenceError), leaving the original branch-cleanup
+        failure unrecorded.
+        """
+        if state.phase == PHASE_OPERATIONAL_FAILURE and state.last_error is not None:
+            record = OperationalErrorRecord.from_dict(state.last_error)
+            if record.retry_phase is not None:
+                return record.retry_phase
+        return state.phase
 
     def _checkpoint(self, state: RunState) -> None:
-        """Refresh Git checkpoints before saving. Called on every phase
-        transition so resume can detect any external change since the
-        last save."""
+        """Refresh Git checkpoints before saving.
+
+        During cleanup_branch the task worktree has been intentionally removed;
+        we retain the last known task HEAD and clear the status snapshot rather
+        than attempting to inspect a missing path. This also applies to an
+        operational_failure whose retry target is cleanup_branch (a failure
+        that occurred *during* branch cleanup, after the worktree was removed).
+        """
         state.integration_expected_head = self.repo.head_commit()
         state.integration_status_snapshot = self.repo.status_snapshot()
-        if state.task_worktree_path is not None:
+        if self._checkpoint_phase(state) == PHASE_CLEANUP_BRANCH:
+            state.task_status_snapshot = None
+        elif state.task_worktree_path is not None:
             worktree_path = Path(state.task_worktree_path)
             state.task_expected_head = self.repo.head_commit(cwd=worktree_path)
             state.task_status_snapshot = self.repo.status_snapshot(cwd=worktree_path)
@@ -221,23 +455,262 @@ class Supervisor:
             state.task_expected_head = None
             state.task_status_snapshot = None
 
-    def run(self, state: RunState) -> RunState:
-        while state.phase not in _TERMINAL_PHASES:
-            if state.phase == PHASE_AWAITING_INPUT:
-                if not self._try_resolve_pending_input(state):
-                    self._save(state)
-                    return state
-            elif state.phase == PHASE_PLANNING:
+    # -- single-transition advance() ------------------------------------
+
+    def advance(self, state: RunState) -> AdvanceOutcome:
+        """Dispatch exactly the phase present at entry and return an outcome.
+
+        Never dispatches the resulting phase in the same call. Persists state
+        before every normal return. Calling advance() on done/failed is an
+        idempotent terminal no-op."""
+        phase_before = state.phase
+
+        if phase_before in _TERMINAL_PHASES:
+            return AdvanceOutcome(
+                status=AdvanceStatus.TERMINAL,
+                state=state,
+                phase_before=phase_before,
+                phase_after=phase_before,
+            )
+
+        try:
+            if phase_before == PHASE_AWAITING_INPUT:
+                resolved = self._try_resolve_pending_input(state)
+                self._save(state)
+                if resolved:
+                    return AdvanceOutcome(
+                        status=AdvanceStatus.ADVANCED,
+                        state=state,
+                        phase_before=phase_before,
+                        phase_after=state.phase,
+                    )
+                else:
+                    return AdvanceOutcome(
+                        status=AdvanceStatus.INPUT_UNAVAILABLE,
+                        state=state,
+                        phase_before=phase_before,
+                        phase_after=state.phase,
+                    )
+            elif phase_before == PHASE_PLANNING:
                 self._do_planning(state)
-            elif state.phase == PHASE_ARCHITECTING:
+            elif phase_before == PHASE_ARCHITECTING:
                 self._do_architecting(state)
-            elif state.phase == PHASE_BUILDING:
+            elif phase_before == PHASE_BUILDING:
                 self._do_building(state)
-            elif state.phase == PHASE_AUDITING:
+            elif phase_before == PHASE_AUDITING:
                 self._do_auditing(state)
+            elif phase_before == PHASE_CREATING_WORKTREE:
+                self._do_creating_worktree(state)
+            elif phase_before == PHASE_RECORDING_DECISION:
+                self._do_recording_decision(state)
+            elif phase_before == PHASE_MERGING:
+                self._do_merging(state)
+            elif phase_before == PHASE_CLEANUP_WORKTREE:
+                self._do_cleanup_worktree(state)
+            elif phase_before == PHASE_CLEANUP_BRANCH:
+                self._do_cleanup_branch(state)
+            elif phase_before == PHASE_OPERATIONAL_FAILURE:
+                self._do_retry_operational_failure(state)
             else:
-                raise LoopError(f"unknown phase {state.phase!r}")
+                raise LoopError(f"unknown phase {phase_before!r}")
+        except _InputRequiredSignal:
             self._save(state)
+            return AdvanceOutcome(
+                status=AdvanceStatus.INPUT_REQUIRED,
+                state=state,
+                phase_before=phase_before,
+                phase_after=state.phase,
+            )
+        except (AgentInvocationError, PhaseTimeoutError, GitError, DecisionError) as exc:
+            return self._handle_operational_failure(
+                state,
+                exc=exc,
+                failed_phase=phase_before,
+                phase_before=phase_before,
+            )
+        except LoopError as exc:
+            return self._handle_terminal_failure(state, exc=exc, phase_before=phase_before)
+
+        if state.phase == PHASE_AWAITING_INPUT:
+            self._save(state)
+            return AdvanceOutcome(
+                status=AdvanceStatus.INPUT_REQUIRED,
+                state=state,
+                phase_before=phase_before,
+                phase_after=state.phase,
+            )
+
+        self._save(state)
+        return AdvanceOutcome(
+            status=AdvanceStatus.ADVANCED,
+            state=state,
+            phase_before=phase_before,
+            phase_after=state.phase,
+        )
+
+    def _handle_operational_failure(
+        self,
+        state: RunState,
+        *,
+        exc: Exception,
+        failed_phase: str,
+        phase_before: str,
+    ) -> AdvanceOutcome:
+        retry_phase, retryable, requires_repair, hint = _classify_operational_failure(
+            exc, failed_phase
+        )
+        record = OperationalErrorRecord(
+            error_id=uuid.uuid4().hex[:12],
+            kind=_error_kind(exc),
+            operation=failed_phase,
+            failed_phase=failed_phase,
+            retry_phase=retry_phase,
+            exception_type=f"{type(exc).__module__}.{type(exc).__qualname__}",
+            message=_sanitize_message(str(exc)),
+            retryable=retryable,
+            requires_repair=requires_repair,
+            recovery_hint=hint,
+            occurred_at=datetime.now(UTC).isoformat(),
+        )
+        state.last_error = record.to_dict()
+        if failed_phase == PHASE_BUILDING and state.task_worktree_path is not None:
+            try:
+                worktree_path = Path(state.task_worktree_path)
+                state.task_expected_head = self.repo.head_commit(cwd=worktree_path)
+                state.task_status_snapshot = self.repo.status_snapshot(cwd=worktree_path)
+            except GitError:
+                pass
+        state.phase = PHASE_OPERATIONAL_FAILURE
+        try:
+            self._save(state)
+        except Exception as save_exc:
+            raise FailurePersistenceError(
+                f"could not persist failure record: {save_exc}"
+            ) from save_exc
+        return AdvanceOutcome(
+            status=AdvanceStatus.OPERATIONAL_FAILURE,
+            state=state,
+            phase_before=phase_before,
+            phase_after=PHASE_OPERATIONAL_FAILURE,
+            error=exc,
+        )
+
+    def _handle_terminal_failure(
+        self,
+        state: RunState,
+        *,
+        exc: Exception,
+        phase_before: str,
+    ) -> AdvanceOutcome:
+        record = OperationalErrorRecord(
+            error_id=uuid.uuid4().hex[:12],
+            kind="terminal",
+            operation=phase_before,
+            failed_phase=phase_before,
+            retry_phase=None,
+            exception_type=f"{type(exc).__module__}.{type(exc).__qualname__}",
+            message=_sanitize_message(str(exc)),
+            retryable=False,
+            requires_repair=False,
+            recovery_hint=None,
+            occurred_at=datetime.now(UTC).isoformat(),
+        )
+        state.last_error = record.to_dict()
+        state.phase = PHASE_FAILED
+        try:
+            self._save(state)
+        except Exception as save_exc:
+            raise FailurePersistenceError(
+                f"could not persist terminal failure record: {save_exc}"
+            ) from save_exc
+        return AdvanceOutcome(
+            status=AdvanceStatus.TERMINAL,
+            state=state,
+            phase_before=phase_before,
+            phase_after=PHASE_FAILED,
+            error=exc,
+        )
+
+    def record_external_failure(self, state: RunState, *, exc: Exception, phase: str) -> None:
+        """Persist an operational failure that occurred outside advance()'s
+        own dispatch loop (e.g. OpenCode server startup failing after a new
+        run's initial state was already saved, or failing again on resume).
+        Mutates and saves `state` in place; raises FailurePersistenceError
+        if the record itself cannot be saved, exactly like a failure
+        discovered inside advance().
+
+        `phase` is normally the state's current phase at the point OpenCode
+        startup was attempted. If that phase is already
+        PHASE_OPERATIONAL_FAILURE — i.e. this is a *repeated* startup
+        failure on a resumed run that had not yet recovered — the real
+        target to fail into is the *previous* record's retry_phase, not
+        "operational_failure" itself. Failing into "operational_failure"
+        would both violate the invariant that a retryable record can never
+        name "operational_failure" as its own retry target, and would
+        silently discard the original interrupted phase, replacing it with
+        a value that can never be resumed past.
+        """
+        effective_phase = self._resolve_retry_target(state, phase)
+        self._handle_operational_failure(
+            state,
+            exc=exc,
+            failed_phase=effective_phase,
+            phase_before=phase,
+        )
+
+    def _resolve_retry_target(self, state: RunState, phase: str) -> str:
+        """Return the phase that a startup failure discovered while
+        attempting to act on `state` (currently at `phase`) should be
+        classified against. If `phase` is already operational_failure,
+        unwrap to the retry_phase of the existing record so repeated
+        startup failures never overwrite the real interrupted phase."""
+        if phase != PHASE_OPERATIONAL_FAILURE:
+            return phase
+        if state.last_error is None:
+            raise LoopError(
+                "cannot record a startup failure against operational_failure "
+                "with no existing error record to recover the retry target from"
+            )
+        existing = OperationalErrorRecord.from_dict(state.last_error)
+        if not existing.retryable or existing.retry_phase is None:
+            raise LoopError(
+                "cannot retry: the existing operational_failure record is not "
+                "retryable or has no retry phase"
+            )
+        return existing.retry_phase
+
+    def _do_retry_operational_failure(self, state: RunState) -> None:
+        """Resume an operational failure by retrying at the recorded retry phase."""
+        if state.last_error is None:
+            raise LoopError("operational_failure phase has no error record")
+        record = OperationalErrorRecord.from_dict(state.last_error)
+        if not record.retryable:
+            raise LoopError(f"operational failure is not retryable: {record.message}")
+        retry_phase = record.retry_phase
+        if retry_phase is None:
+            raise LoopError("operational failure has no retry phase")
+        state.last_error = None
+        state.phase = retry_phase
+
+    # -- compatibility loop over advance() ------------------------------
+
+    def run(self, state: RunState) -> RunState:
+        """Compatibility loop: runs advance() repeatedly until terminal, input
+        unavailable, or an error. Re-raises LoopError-originated failures to
+        preserve existing headless CLI behavior."""
+        while state.phase not in _TERMINAL_PHASES:
+            outcome = self.advance(state)
+            state = outcome.state
+            if outcome.status == AdvanceStatus.INPUT_UNAVAILABLE:
+                return state
+            if outcome.status == AdvanceStatus.TERMINAL:
+                if outcome.error is not None and state.phase == PHASE_FAILED:
+                    raise LoopError(str(outcome.error)) from outcome.error
+                return state
+            if outcome.status == AdvanceStatus.OPERATIONAL_FAILURE:
+                if outcome.error is not None:
+                    raise LoopError(str(outcome.error)) from outcome.error
+                return state
         return state
 
     def _save(self, state: RunState) -> None:
@@ -284,17 +757,15 @@ class Supervisor:
             return
 
         assert result.task_id is not None
-        original_task_id = state.original_task_id or result.task_id
 
         if state.task_worktree_path is None:
-            worktree = self.repo.create_task_worktree(
-                original_task_id, worktree_root=self.worktree_root
+            state.pending_worktree_path = str(
+                self.repo.default_worktree_path(result.task_id, worktree_root=self.worktree_root)
             )
-            state.original_task_id = worktree.original_task_id
-            state.task_worktree_path = str(worktree.path)
-            state.task_branch = worktree.branch
-            state.task_base_commit = worktree.base_commit
-            self._active_worktree = worktree
+            state.pending_worktree_branch = self.repo.branch_name(result.task_id)
+            state.pending_worktree_base = self.repo.head_commit()
+            state.phase = PHASE_CREATING_WORKTREE
+            return
 
         state.revision_count = 0
 
@@ -317,6 +788,59 @@ class Supervisor:
         if state.task_worktree_path is not None:
             return Path(state.task_worktree_path)
         return self.repo.root
+
+    # -- creating worktree ------------------------------------------------
+
+    def _do_creating_worktree(self, state: RunState) -> None:
+        """Create (or reconcile) the task worktree based on persisted intent.
+
+        The persisted path, branch, and base commit are immutable intent:
+        this never substitutes current mutable Git state (e.g. the current
+        integration HEAD) for what was recorded before the Git operation was
+        attempted. See GitRepo.create_or_reconcile_task_worktree for the
+        exact reconciliation rules applied when a crash leaves both the
+        worktree and branch already created but the resulting task identity
+        unsaved.
+        """
+        if (
+            state.pending_worktree_path is None
+            or state.pending_worktree_branch is None
+            or state.pending_worktree_base is None
+        ):
+            raise LoopError("creating_worktree phase has no pending worktree intent")
+
+        planner = self._require_planner_result(state)
+        original_task_id = planner.task_id
+        if not original_task_id:
+            raise LoopError("creating_worktree phase has no planner task_id to reconcile against")
+
+        worktree = self.repo.create_or_reconcile_task_worktree(
+            original_task_id=original_task_id,
+            path=Path(state.pending_worktree_path),
+            branch=state.pending_worktree_branch,
+            base_commit=state.pending_worktree_base,
+            worktree_root=self.worktree_root,
+        )
+
+        state.original_task_id = worktree.original_task_id
+        state.task_worktree_path = str(worktree.path)
+        state.task_branch = worktree.branch
+        state.task_base_commit = worktree.base_commit
+        state.pending_worktree_path = None
+        state.pending_worktree_branch = None
+        state.pending_worktree_base = None
+        self._active_worktree = worktree
+        state.revision_count = 0
+
+        if planner.decision_required:
+            state.decision_request = DecisionRequest(
+                origin="planner",
+                question=planner.decision_question or "",
+                rationale=planner.decision_rationale or "",
+            ).to_dict()
+            state.phase = PHASE_ARCHITECTING
+        else:
+            state.phase = PHASE_BUILDING
 
     # -- architecting -----------------------------------------------------
 
@@ -390,35 +914,21 @@ class Supervisor:
 
         assert result.adr is not None
         if not self.auto_decide:
-            answer = self.input_provider.request(
-                kind="decision_approval",
-                message=f"Approve this decision?\n\n{result.adr.title}\n\n{result.adr.decision}",
-                context={},
-            )
-            if answer is None:
-                state.pending_question = {
-                    "kind": "decision_approval",
-                    "message": "Approve the proposed architecture decision?",
-                    "context": {},
-                }
-                state.phase = PHASE_AWAITING_INPUT
-                return
-            if answer.strip().lower() not in ("y", "yes", "approve"):
-                state.pending_question = {
-                    "kind": "architect_input",
-                    "message": "Provide feedback on the rejected decision proposal.",
-                    "context": {"question": decision_request.question},
-                }
-                state.phase = PHASE_AWAITING_INPUT
-                return
+            state.pending_question = {
+                "kind": "decision_approval",
+                "message": "Approve the proposed architecture decision?",
+                "context": {
+                    "title": result.adr.title,
+                    "decision": result.adr.decision,
+                },
+            }
+            state.phase = PHASE_AWAITING_INPUT
+            raise _InputRequiredSignal()
 
-        self._record_decision(state)
+        self._prepare_record_decision(state)
 
-    def _record_decision(self, state: RunState) -> None:
-        """Write the already-persisted, approved architect proposal exactly
-        as recorded, and route to the correct continuation based on who
-        escalated the decision. Never re-invokes the architect: approval
-        consumes the existing proposal, it does not request a new one."""
+    def _prepare_record_decision(self, state: RunState) -> None:
+        """Persist decision-recording intent and transition to recording_decision."""
         if state.architect_result is None:
             raise LoopError("no architect result recorded to approve")
         if state.decision_request is None:
@@ -428,12 +938,61 @@ class Supervisor:
             raise LoopError("architect result has no adr to record")
 
         directory = self._active_directory(state)
-        write_adr(directory / self.decisions_subpath, result.adr)
+        validate_decisions_subpath(self.decisions_subpath)
+        decisions_dir = directory / self.decisions_subpath
+        from .decisions import next_adr_number, slugify
+
+        content = render_adr(result.adr)
+        number = next_adr_number(decisions_dir)
+        filename = f"{number:04d}-{slugify(result.adr.title)}.md"
+        target_path = decisions_dir / filename
+        validate_adr_target(
+            worktree_root=directory,
+            decisions_dir=decisions_dir,
+            target_path=target_path,
+        )
+        content_hash = adr_content_hash(content)
+
+        state.pending_adr_path = str(target_path)
+        state.pending_adr_hash = content_hash
+        state.phase = PHASE_RECORDING_DECISION
+
+    def _do_recording_decision(self, state: RunState) -> None:
+        """Write the already-approved ADR idempotently and route to continuation."""
+        if state.architect_result is None:
+            raise LoopError("no architect result recorded to approve")
+        if state.decision_request is None:
+            raise LoopError("no active decision request recorded to resolve")
+        if state.pending_adr_path is None or state.pending_adr_hash is None:
+            raise LoopError("recording_decision phase missing path/hash intent")
+
+        result = ArchitectResult.model_validate(state.architect_result)
+        if result.adr is None:
+            raise LoopError("architect result has no adr to record")
+
+        directory = self._active_directory(state)
+        validate_decisions_subpath(self.decisions_subpath)
+        write_adr_idempotent(
+            directory / self.decisions_subpath,
+            result.adr,
+            worktree_root=directory,
+            target_path=state.pending_adr_path,
+            expected_hash=state.pending_adr_hash,
+        )
 
         origin = DecisionRequest.from_dict(state.decision_request).origin
+        state.pending_adr_path = None
+        state.pending_adr_hash = None
         state.decision_request = None
         state.architect_retry_count = 0
         state.phase = PHASE_BUILDING if origin == "planner" else PHASE_PLANNING
+
+    def _record_decision(self, state: RunState) -> None:
+        """Write the already-persisted, approved architect proposal exactly
+        as recorded, and route to the correct continuation based on who
+        escalated the decision. Never re-invokes the architect: approval
+        consumes the existing proposal, it does not request a new one."""
+        self._prepare_record_decision(state)
 
     def _require_planner_result(self, state: RunState) -> PlannerResult:
         if state.planner_result is None:
@@ -559,14 +1118,17 @@ class Supervisor:
         state.auditor_result = result.model_dump(mode="json")
 
         if result.disposition is AuditorDisposition.ACCEPT:
-            self._merge_accepted(state, worktree)
+            worktree = self._require_worktree(state)
+            state.merge_pre_head = self.repo.head_commit()
+            state.merge_task_head = self.repo.head_commit(cwd=worktree.path)
+            state.phase = PHASE_MERGING
             return
 
         if result.disposition is AuditorDisposition.REVISE:
             state.revision_count += 1
             if state.revision_count > self.limits.max_revisions_per_task:
                 raise LoopError(
-                    f"task {worktree.original_task_id!r} exceeded "
+                    f"task {self._require_worktree(state).original_task_id!r} exceeded "
                     f"{self.limits.max_revisions_per_task} revisions"
                 )
             state.phase = PHASE_BUILDING
@@ -576,7 +1138,7 @@ class Supervisor:
         state.replan_count += 1
         if state.replan_count > self.limits.max_replans_per_task:
             raise LoopError(
-                f"task {worktree.original_task_id!r} exceeded "
+                f"task {self._require_worktree(state).original_task_id!r} exceeded "
                 f"{self.limits.max_replans_per_task} replans"
             )
         state.builder_result = None
@@ -590,19 +1152,91 @@ class Supervisor:
         else:
             state.phase = PHASE_PLANNING
 
-    def _merge_accepted(self, state: RunState, worktree: TaskWorktree) -> None:
-        try:
-            self.repo.merge_task_branch(worktree)
-        except MergeConflictError as exc:
-            state.phase = PHASE_FAILED
-            state.pending_question = {
-                "kind": "merge_conflict",
-                "message": str(exc),
-                "context": {"task_branch": worktree.branch},
-            }
-            raise LoopError(str(exc)) from exc
+    # -- merge and cleanup ------------------------------------------------
 
-        self.repo.remove_task_worktree(worktree)
+    def _do_merging(self, state: RunState) -> None:
+        """Merge (or reconcile an already-completed merge of) the persisted,
+        immutable task head into the integration branch.
+
+        On conflict, let MergeConflictError reach the operational-failure
+        classifier directly (do not wrap as GitError). Never merges the
+        mutable task branch name: merge_pre_head/merge_task_head are
+        immutable intent captured at ACCEPT time, so a crash after Git
+        commits the merge but before state is saved is safely reconciled
+        rather than re-merged.
+        """
+        worktree = self._require_worktree(state)
+        if state.merge_pre_head is None or state.merge_task_head is None:
+            raise LoopError("merging phase has no persisted merge intent")
+
+        actual_task_head = self.repo.head_commit(cwd=worktree.path)
+        if actual_task_head != state.merge_task_head:
+            raise GitError(
+                f"task branch {worktree.branch!r} HEAD {actual_task_head!r} no longer "
+                f"matches the audited merge_task_head {state.merge_task_head!r}; "
+                "refusing to merge unreviewed commits"
+            )
+
+        merge_commit = self.repo.reconcile_or_merge_task(
+            pre_head=state.merge_pre_head,
+            task_head=state.merge_task_head,
+        )
+        state.merge_commit = merge_commit
+        state.phase = PHASE_CLEANUP_WORKTREE
+
+    def _validate_merge_cleanup_safety(self, state: RunState, worktree: TaskWorktree) -> None:
+        """Prove the persisted merge_commit is exactly the reviewed merge of
+        merge_task_head before any cleanup removes the worktree or branch.
+
+        This prevents cleanup from deleting a branch/worktree based merely
+        on "the task branch tip is an ancestor of HEAD", which could be
+        true for a fast-forward, cherry-pick, or a later unreviewed commit
+        that happens to also be integrated.
+        """
+        if state.merge_commit is None or state.merge_task_head is None:
+            raise LoopError("cleanup requires a persisted merge_commit and merge_task_head")
+
+        if not self.repo.commit_exists(state.merge_commit):
+            raise GitError(f"recorded merge_commit {state.merge_commit!r} no longer exists")
+
+        integration_head = self.repo.head_commit()
+        if state.merge_commit != integration_head and not self.repo.is_ancestor(
+            state.merge_commit, integration_head
+        ):
+            raise GitError(
+                f"recorded merge_commit {state.merge_commit!r} is not reachable from "
+                f"the current integration HEAD {integration_head!r}"
+            )
+
+        parents = self.repo.commit_parents(state.merge_commit)
+        if len(parents) != 2 or parents[1] != state.merge_task_head:
+            raise GitError(
+                f"recorded merge_commit {state.merge_commit!r} does not have "
+                f"merge_task_head {state.merge_task_head!r} as its second parent; "
+                f"found parents {parents!r}"
+            )
+
+        if self.repo.branch_exists(worktree.branch):
+            branch_tip = self.repo.branch_commit(worktree.branch)
+            if branch_tip != state.merge_task_head:
+                raise GitError(
+                    f"task branch {worktree.branch!r} has moved to {branch_tip!r} since "
+                    f"the reviewed merge of {state.merge_task_head!r}; refusing to clean up"
+                )
+
+    def _do_cleanup_worktree(self, state: RunState) -> None:
+        worktree = self._require_worktree(state)
+        self._validate_merge_cleanup_safety(state, worktree)
+        self.repo.remove_task_worktree_only(worktree)
+        state.phase = PHASE_CLEANUP_BRANCH
+
+    def _do_cleanup_branch(self, state: RunState) -> None:
+        worktree = self._require_worktree(state)
+        self._validate_merge_cleanup_safety(state, worktree)
+        self.repo.delete_task_branch_only(worktree)
+        self._finish_task_cleanup(state)
+
+    def _finish_task_cleanup(self, state: RunState) -> None:
         state.accepted_task_count += 1
         state.original_task_id = None
         state.task_worktree_path = None
@@ -617,6 +1251,9 @@ class Supervisor:
         state.builder_result = None
         state.auditor_result = None
         state.decision_request = None
+        state.merge_pre_head = None
+        state.merge_task_head = None
+        state.merge_commit = None
         self._active_worktree = None
         state.phase = PHASE_PLANNING
 
@@ -649,7 +1286,7 @@ class Supervisor:
         elif pending["kind"] == "decision_approval":
             state.pending_question = None
             if answer.strip().lower() in ("y", "yes", "approve"):
-                self._record_decision(state)
+                self._prepare_record_decision(state)
             else:
                 question = (
                     DecisionRequest.from_dict(state.decision_request).question
@@ -665,6 +1302,82 @@ class Supervisor:
         else:
             raise LoopError(f"unknown pending question kind {pending['kind']!r}")
         return True
+
+
+class _InputRequiredSignal(BaseException):
+    pass
+
+
+def _classify_operational_failure(
+    exc: Exception, failed_phase: str
+) -> tuple[str | None, bool, bool, str | None]:
+    """Return (retry_phase, retryable, requires_repair, recovery_hint)."""
+    if isinstance(exc, MergeConflictError):
+        return (
+            PHASE_MERGING,
+            True,
+            True,
+            "The merge was aborted. Manually resolve and create a no-FF merge of the "
+            "exact persisted task commit into the integration branch, then resume.",
+        )
+    if isinstance(exc, PhaseTimeoutError):
+        return (failed_phase, True, False, "Resume to retry the timed-out phase.")
+    if isinstance(exc, AgentInvocationError):
+        return (failed_phase, True, False, "Resume to retry after a transient OpenCode error.")
+    if isinstance(exc, GitError):
+        if failed_phase == PHASE_CLEANUP_WORKTREE:
+            return (
+                failed_phase,
+                True,
+                True,
+                "The reviewed commit is already merged; this worktree has unreviewed "
+                "content. Inspect it, then commit/discard the unreviewed changes (do "
+                "not add new commits) or restore the branch to the reviewed head, and "
+                "resume.",
+            )
+        if failed_phase == PHASE_CREATING_WORKTREE:
+            return (
+                failed_phase,
+                True,
+                True,
+                "A worktree already exists at the intended path but contains "
+                "unexpected content (no builder phase has run against it yet). "
+                "Inspect and remove the unexpected content, then resume.",
+            )
+        return (failed_phase, True, False, "Resume to retry after the Git error is resolved.")
+    if isinstance(exc, DecisionError):
+        return (failed_phase, True, True, "Inspect the ADR directory and resume.")
+    if isinstance(exc, OpenCodeError):
+        return (
+            failed_phase,
+            True,
+            False,
+            "Resume to retry after the OpenCode server/startup problem is resolved.",
+        )
+    return (failed_phase, True, False, None)
+
+
+def _error_kind(exc: Exception) -> str:
+    if isinstance(exc, MergeConflictError):
+        return "merge_conflict"
+    if isinstance(exc, PhaseTimeoutError):
+        return "timeout"
+    if isinstance(exc, AgentInvocationError):
+        return "agent_invocation"
+    if isinstance(exc, GitError):
+        return "git"
+    if isinstance(exc, DecisionError):
+        return "decision"
+    if isinstance(exc, OpenCodeError):
+        return "opencode_startup"
+    return "unknown"
+
+
+def _sanitize_message(msg: str) -> str:
+    """Truncate and strip potential secret patterns from error messages."""
+    if len(msg) > 2000:
+        msg = msg[:2000] + "…"
+    return msg
 
 
 def _parse_with_retry(parse, raw, *, retries, rerun):

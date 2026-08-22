@@ -578,8 +578,8 @@ def test_resume_rejects_task_worktree_head_change(tmp_path):
     runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
     supervisor, repo = _make_supervisor(tmp_path, runner)
     state = supervisor.start_new_run()
-    supervisor._do_planning(state)
-    supervisor._save(state)
+    supervisor.advance(state)
+    supervisor.advance(state)
     assert state.task_worktree_path is not None
 
     # Task worktree already created and checkpointed; commit an extra
@@ -598,8 +598,8 @@ def test_resume_rejects_unregistered_task_directory(tmp_path):
     runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
     supervisor, repo = _make_supervisor(tmp_path, runner)
     state = supervisor.start_new_run()
-    supervisor._do_planning(state)
-    supervisor._save(state)
+    supervisor.advance(state)
+    supervisor.advance(state)
 
     worktree_path = Path(state.task_worktree_path)
     expected_head = state.task_expected_head
@@ -712,11 +712,13 @@ def test_planner_complete_with_active_worktree_fails_closed(tmp_path):
     )
     supervisor, repo = _make_supervisor(tmp_path, runner)
     state = supervisor.start_new_run()
-    supervisor._do_planning(state)
+    supervisor.advance(state)
+    supervisor.advance(state)
     assert state.task_worktree_path is not None
 
+    state.phase = "planning"
     with pytest.raises(LoopError):
-        supervisor._do_planning(state)
+        supervisor.run(state)
     assert state.task_worktree_path is not None
 
 

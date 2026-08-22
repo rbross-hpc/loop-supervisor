@@ -211,6 +211,66 @@ Useful flags: `--worktree-root`, `--max-tasks`, `--max-revisions`,
 The integration checkout must be a clean Git working tree on a real
 branch (not detached `HEAD`) before a run starts.
 
+## Textual TUI
+
+```bash
+loop-supervisor tui --project /path/to/integration/checkout
+```
+
+Opens a terminal UI with:
+
+- **Run browser** — lists saved runs (phase, task, last error) and a
+  "Start new run" action. No lock is acquired while browsing.
+- **Run screen** — shows durable supervisor state and best-effort live
+  OpenCode activity in separate, clearly-labelled panes.
+- **Pending-input panel** — presents the appropriate controls (multiline
+  text, approve/reject buttons, retry) for each operator-input scenario.
+
+The TUI acquires the repository lock before starting execution and
+releases it on exit. Pass `--recover-stale-lock` if a previous run
+crashed and left a stale lock from a demonstrably dead local process.
+
+### Durable vs live status
+
+The left pane ("Durable supervisor state") shows the authoritative
+`RunState` from disk: phase, run ID, task, revision/replan counters,
+and the last error record. This never changes unless `advance()` commits
+a transition.
+
+The right pane ("Live OpenCode activity — ephemeral") shows real-time
+SSE telemetry: active sessions, assistant text tail, active tools, and
+file edits. If SSE disconnects, a notice is shown and the durable pane
+remains fully functional. Live state is never used to infer supervisor
+phase.
+
+### Repository lock
+
+Only one mutating supervisor session (run, resume, or TUI) can act on a
+given repository at a time. The lock is stored at:
+
+    <git-common-dir>/loop-supervisor/supervisor.lock
+
+If a crash leaves a stale lock from a dead local process, pass
+`--recover-stale-lock` to remove it and retry. Remote-hostname and
+malformed locks are never auto-recovered.
+
+### Operational failure and retry
+
+Transient failures (network errors, Git errors, merge conflicts) are
+persisted as `operational_failure` with a structured error record and a
+`retry_phase`. The TUI shows a Retry button; `loop-supervisor resume`
+also retries from the recorded phase.
+
+Non-recoverable failures (policy limits, invariant violations) set
+`phase = "failed"`; no further resume is possible. Start a new run.
+
+### Merge-conflict repair
+
+If a `--no-ff` merge conflicts, the supervisor aborts the merge, records
+the conflict as an operational failure requiring repair, and stops. Resolve
+the conflict manually in the integration worktree, then resume (or click
+Retry in the TUI).
+
 ## Bootstrapping a new project
 
 Two ways to start a fresh project from this template:
@@ -257,9 +317,11 @@ mypy src
 
 ## Current limitations
 
-- Headless only; no TUI yet.
 - One task in flight at a time (no parallel task worktrees).
 - No post-merge test run after a successful `ACCEPT` merge (builder and
   auditor test runs are relied upon instead).
-- No lock preventing two supervisor runs against the same integration
-  repository concurrently.
+- Cancellation during an active OpenCode invocation is cooperative
+  (abort request sent); no guarantee of immediate termination.
+- Diff browsing and full log inspection are not yet in the TUI.
+- Automatic merge-conflict resolution is out of scope; operator repair is
+  always required.
