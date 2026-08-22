@@ -10,18 +10,35 @@ test process can configure it before spawning:
     "exit_early"     -- exit(1) immediately instead of serving
     "never_ready"    -- start listening on a socket but never print the
                         ready line, to exercise startup timeout handling
+    "partial_line_never_ready" -- write a non-newline-terminated fragment
+                        and never complete it, to exercise readiness
+                        detection that must not block on a partial line
+    "split_ready_line" -- write the ready line in two separate writes
+                        with a short delay between them, to exercise
+                        reassembly of a line split across reads
 - FAKE_OPENCODE_RESPONSE: JSON text returned as `structured_output` for
     every /session/{id}/message call.
 - FAKE_OPENCODE_ERROR: if set, /session/{id}/message returns this string
     as the assistant message's `error` field instead of output.
 - FAKE_OPENCODE_HTTP_STATUS: if set, /session/{id}/message responds with
     this HTTP status code and an empty body.
+- FAKE_OPENCODE_DESCENDANT_PID_FILE: if set, spawn a plain (non-session-
+    leader) child process that writes its own PID to this path immediately
+    on startup, then loops sleeping. The child is started without its own
+    new session, so it inherits this process's process group — exactly like
+    a real tool subprocess OpenCode spawns would. Tests read the PID and
+    probe it with kill(pid, 0) to determine liveness.
+- FAKE_OPENCODE_DESCENDANT_IGNORE_SIGTERM: if set (and a descendant pid
+    file is configured), the descendant ignores SIGTERM so tests can
+    exercise stop()'s escalation to SIGKILL against the whole process
+    group.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -55,7 +72,36 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/global/health"):
             self._send_json(200, {"healthy": True, "version": "fake"})
             return
+        if self.path.startswith("/global/event"):
+            self._handle_sse()
+            return
         self._send_json(404, {"error": "not found"})
+
+    def _handle_sse(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        import time
+
+        payload = json.dumps(
+            {"directory": "/repo", "payload": {"type": "server.connected", "properties": {}}}
+        )
+        try:
+            self.wfile.write(f"data: {payload}\n\n".encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        sse_mode = os.environ.get("FAKE_OPENCODE_SSE", "hold")
+        if sse_mode == "disconnect":
+            return
+        while True:
+            try:
+                time.sleep(0.1)
+                self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
 
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length", 0))
@@ -79,6 +125,31 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"info": {"error": error}, "parts": []})
                 return
 
+            block_seconds = os.environ.get("FAKE_OPENCODE_MESSAGE_BLOCK_SECONDS")
+            if block_seconds:
+                import time as _time
+
+                _time.sleep(float(block_seconds))
+
+            malformed = os.environ.get("FAKE_OPENCODE_MESSAGE_MALFORMED")
+            if malformed == "not_json":
+                body = b"not json at all {{{"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if malformed == "array":
+                self._send_json(200, [1, 2, 3])
+                return
+            if malformed == "info_not_object":
+                self._send_json(200, {"info": "not an object", "parts": []})
+                return
+            if malformed == "parts_not_list":
+                self._send_json(200, {"info": {}, "parts": "not a list"})
+                return
+
             raw_response = os.environ.get("FAKE_OPENCODE_RESPONSE", "{}")
             self._send_json(
                 200,
@@ -90,14 +161,75 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path_only.startswith("/session/") and path_only.endswith("/abort"):
+            block_seconds = os.environ.get("FAKE_OPENCODE_ABORT_BLOCK_SECONDS")
+            if block_seconds:
+                import time as _time
+
+                _time.sleep(float(block_seconds))
+            if os.environ.get("FAKE_OPENCODE_ABORT_FAIL"):
+                self.send_response(500)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self._send_json(200, True)
             return
 
         if path_only == "/session":
+            block_seconds = os.environ.get("FAKE_OPENCODE_SESSION_BLOCK_SECONDS")
+            if block_seconds:
+                import time as _time
+
+                _time.sleep(float(block_seconds))
+
+            malformed = os.environ.get("FAKE_OPENCODE_SESSION_MALFORMED")
+            if malformed == "not_json":
+                body = b"not json at all {{{"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if malformed == "array":
+                self._send_json(200, [1, 2, 3])
+                return
+            if malformed == "no_id":
+                self._send_json(200, {})
+                return
+            if malformed == "non_string_id":
+                self._send_json(200, {"id": 12345})
+                return
+
             self._send_json(200, {"id": "ses_fake123"})
             return
 
         self._send_json(404, {"error": "not found"})
+
+
+_DESCENDANT_SCRIPT = """
+import os, signal, sys, time
+pid_file = sys.argv[1]
+if len(sys.argv) > 2 and sys.argv[2] == "ignore_sigterm":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(pid_file, "w") as f:
+    f.write(str(os.getpid()))
+while True:
+    time.sleep(0.05)
+"""
+
+
+def _maybe_spawn_descendant() -> subprocess.Popen[bytes] | None:
+    pid_file = os.environ.get("FAKE_OPENCODE_DESCENDANT_PID_FILE")
+    if not pid_file:
+        return None
+    args = [sys.executable, "-c", _DESCENDANT_SCRIPT, pid_file]
+    if os.environ.get("FAKE_OPENCODE_DESCENDANT_IGNORE_SIGTERM"):
+        args.append("ignore_sigterm")
+    # Deliberately no start_new_session here: this child must inherit the
+    # fake server's own process group, exactly like a real tool/agent
+    # subprocess OpenCode spawns would, so it is only reachable via
+    # group-wide signaling (killpg), not by signaling the leader alone.
+    return subprocess.Popen(args)
 
 
 def main() -> int:
@@ -110,8 +242,11 @@ def main() -> int:
     hostname, port = _parse_args(sys.argv[2:])
 
     if mode == "exit_early":
+        _maybe_spawn_descendant()
         print("simulated early failure", file=sys.stderr)
         return 1
+
+    _maybe_spawn_descendant()
 
     server = ThreadingHTTPServer((hostname, port), Handler)
     actual_port = server.server_address[1]
@@ -123,7 +258,42 @@ def main() -> int:
         thread.join()
         return 0
 
+    if mode == "ignore_sigterm":
+        import signal as _signal
+
+        _signal.signal(_signal.SIGTERM, _signal.SIG_IGN)
+
+    if mode == "partial_line_never_ready":
+        # Write a fragment with no trailing newline and never complete it,
+        # to exercise the case where a naive readline()-based readiness
+        # reader would block indefinitely on the partial line rather than
+        # honoring the startup deadline.
+        sys.stdout.write("opencode server starting up, almost there")
+        sys.stdout.flush()
+        thread.join()
+        return 0
+
+    if mode == "split_ready_line":
+        import time as _time
+
+        ready_line = f"opencode server listening on http://{hostname}:{actual_port}\n"
+        split_at = len(ready_line) // 2
+        sys.stdout.write(ready_line[:split_at])
+        sys.stdout.flush()
+        _time.sleep(0.2)
+        sys.stdout.write(ready_line[split_at:])
+        sys.stdout.flush()
+        thread.join()
+        return 0
+
     print(f"opencode server listening on http://{hostname}:{actual_port}", flush=True)
+    if mode == "exit_after_ready":
+        import time as _time
+
+        _time.sleep(0.2)
+        server.shutdown()
+        thread.join()
+        return 0
     thread.join()
     return 0
 
