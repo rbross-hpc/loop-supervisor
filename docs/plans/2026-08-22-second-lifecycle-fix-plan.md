@@ -182,29 +182,62 @@ these fixes must uphold and extend.
       persistence, concurrent starts/stops, restart, command-write retry,
       production launcher invocation, and no parent-side PGID probing.
 - [x] Step 2 — bounded/precedence-safe HTTP client cleanup (blocker 3).
-      Added `_BoundedCloseAttempt`/`_close_bounded`/
-      `_close_request_local_client` running `client.close()` on a
-      dedicated daemon thread bounded by `_CLIENT_CLOSE_TIMEOUT_SECONDS`
-      (1.0s). Applied at all four close sites: `create_session()`,
-      `send_prompt()`, `_abort_session_bounded()`, and the shared client
-      in `stop()`. Every request-local call site now decides its primary
-      exception first and attaches a close failure via `add_note()`
-      rather than letting it replace the primary; a close failure with no
-      pending primary raises `OpenCodeCleanupError`. `stop()` tracks an
-      in-progress shared-client close (`_client_close_attempt`) so a
-      retried `stop()` observes rather than restarts a still-running
-      close. Added 9 new tests in `tests/test_opencode.py` covering
-      throwing/hanging close after session-creation and prompt timeouts,
-      `run_agent()` still aborting and delivering the exact timeout to
-      the observer, abort surviving a throwing close, a hanging abort
-      close bounded, a successful prompt with a failing close raising
-      `OpenCodeCleanupError`, `stop()` continuing past a hanging shared
-      close, and a retried `stop()` not invoking a second concurrent
-      close.
-      Verification for steps 1+2: `pytest -q` 519 passed, stable across 3
-      runs (no flakiness observed); `ruff check .` clean; `ruff format .`
-      applied and `--check` clean; `mypy src` clean; `git diff --check`
-      clean.
+      A fresh independent audit found the prior implementation
+      incomplete: bounded-close construction/start could still escape
+      uncaught, `_close_bounded()`'s timeout bound was frozen at
+      definition time via a default argument (immune to later
+      `_CLIENT_CLOSE_TIMEOUT_SECONDS` changes), each of
+      `create_session()`/`send_prompt()`/`_abort_session_bounded()`
+      closed before the full request outcome (status/decode/validation/
+      assistant-shape) was decided, `OpenCodeServer.__exit__()` only
+      caught `Exception` (a cleanup `KeyboardInterrupt`/`SystemExit`
+      could replace a body exception), and the shared-client close
+      ownership state machine in `stop()` needed explicit
+      construction/start/mismatch/retry handling.
+
+      Remediated on `fix/http-cleanup-precedence`: `_BoundedCloseAttempt`
+      now separates construction from thread start, and
+      `_start_bounded_close()` is a non-throwing factory catching
+      construction/`Thread()`/`start()` failures and returning them
+      rather than raising. `_close_bounded()` reads
+      `_CLIENT_CLOSE_TIMEOUT_SECONDS` dynamically on every call (no
+      frozen default argument). `create_session()`, `send_prompt()`, and
+      `_abort_session_bounded()` now decide the complete primary outcome
+      — transport, HTTP status, JSON decode, ID/shape validation,
+      assistant-error, and text/structured-output extraction — inside a
+      single guarded block, closing only in an `except BaseException as
+      primary: ...; raise` / `else: ...; return` structure so a close
+      failure/timeout can never replace a primary that was only
+      partially decided. `_add_cleanup_note()` attaches at most one
+      deterministic note without ever touching `__cause__` and without
+      letting annotation failure itself replace the primary.
+      `OpenCodeServer.__exit__()` now catches `BaseException` (not just
+      `Exception`) from `stop()`, so a cleanup-time
+      `KeyboardInterrupt`/`SystemExit` is noted rather than replacing the
+      body exception. The shared-client close block in `stop()` is now
+      an explicit state machine: construction/start failure retains the
+      client with no attempt installed; an existing attempt for the same
+      client is re-waited, never re-invoked; an attempt bound to a
+      different client is reported and left untouched; a timeout retains
+      both client and attempt; a completed exception retains the client
+      and clears the attempt for one retry; success clears both.
+      `start()` remains rejected while either is unresolved.
+
+      Added a comprehensive `httpx.MockTransport` test matrix for
+      `create_session()`/`send_prompt()`/`_abort_session_bounded()` and
+      every required close outcome, plus bounded-close orchestration,
+      context-manager precedence, and shared-client ownership/retry
+      semantics. A subsequent adversarial audit reopened Step 2 after
+      finding unsafe cleanup-exception rendering, unguarded shared wait/
+      result inspection, ambiguous post-start failure ownership, a
+      leaking context-manager test, and missing exact-semantics/failure-
+      mode assertions. Those gaps were remediated and independently
+      re-audited **GO**. Final verification: `test_opencode.py` 139 passed;
+      `test_runtime.py`/`test_tui_app.py` 42 passed; full `pytest -q` 611
+      passed across three consecutive runs; `ruff check .`, `ruff format
+      --check .`, `mypy src`, and `git diff --check` clean. The audit also
+      reran 139 OpenCode tests and all 611 tests, confirmed no fixture
+      process leaks, and verified Step 1 process ownership was unchanged.
 - [ ] Step 3 — headless cleanup completeness (blocker 5)
 - [ ] Step 4 — TUI ownership registry (blocker 2)
 - [ ] Step 5 — per-attempt shutdown signaling (blocker 1)

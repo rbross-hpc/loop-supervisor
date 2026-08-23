@@ -6,15 +6,22 @@ import threading
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 
+import loop_supervisor.opencode as oc_module
 from loop_supervisor.opencode import (
     AgentInvocationError,
     OpenCodeCleanupError,
     OpenCodeError,
     OpenCodeServer,
     OpenCodeServerConfig,
+    PhaseTimeoutError,
     ServerStartupError,
+    _BoundedCloseAttempt,
+    _close_bounded,
+    _close_request_local_client,
+    _start_bounded_close,
 )
 
 FIXTURE = str(Path(__file__).parent / "fixtures" / "fake_opencode.py")
@@ -870,11 +877,12 @@ def test_run_agent_still_aborts_and_reports_exact_timeout_despite_close_failure(
     from loop_supervisor.opencode import InvocationRef, PhaseTimeoutError
 
     call_count = {"n": 0}
+    aborted: list[str] = []
 
     def _boom_after_first_close(self):
         call_count["n"] += 1
         if call_count["n"] == 1:
-            return  # session creation's close succeeds normally
+            return
         raise RuntimeError("simulated close failure")
 
     _patch_close_for_finite_timeout_clients(monkeypatch, _boom_after_first_close)
@@ -894,6 +902,13 @@ def test_run_agent_still_aborts_and_reports_exact_timeout_despite_close_failure(
     )
     with _FakeServer(tmp_path, config) as server:
         server.add_observer(_Observer())
+        original_abort = server._abort_session_best_effort
+
+        def _record_abort(session_id):
+            aborted.append(session_id)
+            original_abort(session_id)
+
+        monkeypatch.setattr(server, "_abort_session_best_effort", _record_abort)
         caught: PhaseTimeoutError | None = None
         try:
             server.run_agent(agent="loop-planner", directory=tmp_path, prompt="go", timeout=1.0)
@@ -904,6 +919,65 @@ def test_run_agent_still_aborts_and_reports_exact_timeout_despite_close_failure(
     assert server.active_invocations() == []
     assert len(received) == 1
     assert received[0] is caught
+    assert len(aborted) == 1
+    assert call_count["n"] >= 2
+
+
+def test_run_agent_still_aborts_and_reports_exact_timeout_despite_hanging_close(
+    tmp_path, monkeypatch
+):
+    from loop_supervisor.opencode import InvocationRef, PhaseTimeoutError
+
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
+    release = threading.Event()
+    completed = threading.Event()
+    close_calls = {"n": 0}
+    aborted: list[str] = []
+    received: list[BaseException | None] = []
+    real_close = httpx.Client.close
+
+    def _hang_prompt_close(self):
+        close_calls["n"] += 1
+        if close_calls["n"] == 2:
+            release.wait(timeout=10)
+            completed.set()
+        return real_close(self)
+
+    _patch_close_for_finite_timeout_clients(monkeypatch, _hang_prompt_close)
+
+    class _Observer:
+        def invocation_started(self, invocation: InvocationRef) -> None:
+            pass
+
+        def invocation_finished(self, invocation, error) -> None:
+            received.append(error)
+
+    config = _argv_config(
+        FAKE_OPENCODE_MODE="normal",
+        FAKE_OPENCODE_MESSAGE_BLOCK_SECONDS="5",
+    )
+    try:
+        with _FakeServer(tmp_path, config) as server:
+            server.add_observer(_Observer())
+            original_abort = server._abort_session_best_effort
+
+            def _record_abort(session_id):
+                aborted.append(session_id)
+                original_abort(session_id)
+
+            monkeypatch.setattr(server, "_abort_session_best_effort", _record_abort)
+            caught: PhaseTimeoutError | None = None
+            try:
+                server.run_agent(agent="loop-planner", directory=tmp_path, prompt="go", timeout=1.0)
+            except PhaseTimeoutError as exc:
+                caught = exc
+    finally:
+        release.set()
+    assert completed.wait(timeout=5)
+    assert caught is not None
+    assert received == [caught]
+    assert len(aborted) == 1
+    assert close_calls["n"] >= 3
 
 
 def test_abort_survives_throwing_close(tmp_path, monkeypatch):
@@ -1520,3 +1594,1210 @@ def test_launcher_side_kill_error_is_retryable(tmp_path):
     finally:
         if server._owner is not None:
             server.stop()
+
+
+# =============================================================================
+# Step 2 (re-audit remediation): bounded, precedence-safe HTTP cleanup
+# =============================================================================
+#
+# These tests exercise create_session()/send_prompt()/_abort_session_bounded()
+# against a mocked transport (httpx.MockTransport) rather than the fixture
+# subprocess, so every HTTP outcome (status, JSON shape, assistant error,
+# structured output) can be combined deterministically with every close()
+# outcome (success, throw, hang) without relying on the fake server's
+# environment-variable surface for combinations it doesn't support.
+
+
+def _mock_server(tmp_path, handler, *, monkeypatch):
+    """Build a started-enough OpenCodeServer for exercising the
+    request-local client code paths (create_session/send_prompt/
+    _abort_session_bounded), with every httpx.Client it constructs wired
+    to `handler` via MockTransport instead of a real socket."""
+    server = OpenCodeServer(tmp_path, OpenCodeServerConfig())
+    server.base_url = "http://mock-opencode"
+
+    real_init = httpx.Client.__init__
+
+    def _fake_init(self, *args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.Client, "__init__", _fake_init)
+    return server
+
+
+def _json_handler(status: int, payload: object):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json=payload)
+
+    return handler
+
+
+def _raw_handler(status: int, content: bytes):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=content)
+
+    return handler
+
+
+def _timeout_handler(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout("simulated read timeout", request=request)
+
+
+def _network_error_handler(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("simulated connection failure", request=request)
+
+
+def _patch_close(monkeypatch, replacement):
+    """Patch httpx.Client.close globally to `replacement`. Used with the
+    mock-transport server helper above, where every client constructed
+    during the test is request-local and under test (there is no
+    shared/long-lived control client involved), so no dispatch by
+    timeout is needed."""
+    monkeypatch.setattr(httpx.Client, "close", replacement)
+
+
+def _throwing_close(self) -> None:
+    raise RuntimeError("simulated close failure")
+
+
+def _make_hanging_close(release: threading.Event, entered: threading.Event | None = None):
+    real_close = httpx.Client.close
+
+    def _hanging(self) -> None:
+        if entered is not None:
+            entered.set()
+        release.wait(timeout=10)
+        return real_close(self)
+
+    return _hanging
+
+
+# -- _BoundedCloseAttempt / _start_bounded_close / _close_bounded -----------
+
+
+def test_bounded_close_attempt_success():
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    attempt = _start_bounded_close(client)
+    assert isinstance(attempt, _BoundedCloseAttempt)
+    assert attempt.wait(5.0) is True
+    assert attempt.error is None
+
+
+def test_bounded_close_attempt_reports_close_exception(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    monkeypatch.setattr(httpx.Client, "close", _throwing_close)
+    attempt = _start_bounded_close(client)
+    assert isinstance(attempt, _BoundedCloseAttempt)
+    assert attempt.wait(5.0) is True
+    assert isinstance(attempt.error, RuntimeError)
+
+
+def test_bounded_close_attempt_reports_hang(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    release = threading.Event()
+    monkeypatch.setattr(httpx.Client, "close", _make_hanging_close(release))
+    try:
+        attempt = _start_bounded_close(client)
+        assert isinstance(attempt, _BoundedCloseAttempt)
+        assert attempt.wait(0.1) is False
+    finally:
+        release.set()
+        assert attempt.wait(5.0) is True
+        assert attempt.error is None
+
+
+def test_bounded_close_attempt_daemon_thread():
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    attempt = _BoundedCloseAttempt(client)
+    attempt.start()
+    assert attempt._thread is not None
+    assert attempt._thread.daemon is True
+    attempt.wait(5.0)
+
+
+def test_start_bounded_close_reports_event_construction_failure(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+
+    def _boom_event():
+        raise RuntimeError("simulated Event() construction failure")
+
+    monkeypatch.setattr(threading, "Event", _boom_event)
+    result = _start_bounded_close(client)
+    assert isinstance(result, RuntimeError)
+    monkeypatch.undo()
+    client.close()
+
+
+def test_start_bounded_close_reports_thread_construction_failure(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+
+    def _boom_thread_init(self, *args, **kwargs):
+        raise RuntimeError("simulated Thread() construction failure")
+
+    monkeypatch.setattr(threading.Thread, "__init__", _boom_thread_init)
+    result = _start_bounded_close(client)
+    assert isinstance(result, RuntimeError)
+    assert not isinstance(result, _BoundedCloseAttempt)
+    # client.close() itself was never reached: no worker started, so the
+    # underlying socket/connection is simply left open here. Close it via
+    # the original (unpatched) mechanism to avoid a ResourceWarning.
+    monkeypatch.undo()
+    client.close()
+
+
+def test_start_bounded_close_reports_thread_start_failure(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+
+    def _boom_start(self):
+        raise RuntimeError("simulated Thread.start() failure")
+
+    monkeypatch.setattr(threading.Thread, "start", _boom_start)
+    result = _start_bounded_close(client)
+    assert isinstance(result, RuntimeError)
+    assert not isinstance(result, _BoundedCloseAttempt)
+    monkeypatch.undo()
+    client.close()
+
+
+def test_start_bounded_close_retains_attempt_if_start_raises_after_worker_begins(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    original_start = threading.Thread.start
+
+    def _start_then_boom(self):
+        original_start(self)
+        raise RuntimeError("simulated post-start failure")
+
+    monkeypatch.setattr(threading.Thread, "start", _start_then_boom)
+    result = _start_bounded_close(client)
+    assert isinstance(result, _BoundedCloseAttempt)
+    assert result.wait(5.0) is True
+    assert isinstance(result.startup_error, RuntimeError)
+
+
+def test_close_bounded_success():
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    assert _close_bounded(client) is None
+
+
+def test_close_bounded_reports_orchestration_failure(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+
+    def _boom_start(self):
+        raise RuntimeError("simulated Thread.start() failure")
+
+    monkeypatch.setattr(threading.Thread, "start", _boom_start)
+    error = _close_bounded(client)
+    assert isinstance(error, RuntimeError)
+    monkeypatch.undo()
+    client.close()
+
+
+def test_close_bounded_reports_wait_failure(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    failure = RuntimeError("simulated wait failure")
+
+    def _boom_wait(self, timeout):
+        raise failure
+
+    monkeypatch.setattr(_BoundedCloseAttempt, "wait", _boom_wait)
+    assert _close_bounded(client) is failure
+    monkeypatch.undo()
+    client.close()
+
+
+def test_close_bounded_reports_result_inspection_failure(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    failure = RuntimeError("simulated result inspection failure")
+
+    def _boom_error(self):
+        raise failure
+
+    monkeypatch.setattr(_BoundedCloseAttempt, "error", property(_boom_error))
+    assert _close_bounded(client) is failure
+
+
+def test_close_bounded_reads_dynamic_timeout(monkeypatch):
+    """_close_bounded must look up _CLIENT_CLOSE_TIMEOUT_SECONDS at call
+    time, not freeze whatever value was current when the function was
+    defined: changing the module attribute must be honored immediately
+    on the next call, with no explicit `timeout` argument given."""
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    release = threading.Event()
+    monkeypatch.setattr(httpx.Client, "close", _make_hanging_close(release))
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
+    try:
+        start = time.monotonic()
+        error = _close_bounded(client)
+        elapsed = time.monotonic() - start
+        assert isinstance(error, OpenCodeCleanupError)
+        assert elapsed < 2.0
+    finally:
+        release.set()
+
+
+def test_close_bounded_invokes_close_exactly_once_after_timeout(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    release = threading.Event()
+    call_count = {"n": 0}
+    real_close = httpx.Client.close
+
+    def _hanging(self):
+        call_count["n"] += 1
+        release.wait(timeout=10)
+        return real_close(self)
+
+    monkeypatch.setattr(httpx.Client, "close", _hanging)
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
+    try:
+        error = _close_bounded(client)
+        assert isinstance(error, OpenCodeCleanupError)
+        assert call_count["n"] == 1
+    finally:
+        release.set()
+        time.sleep(0.2)
+        assert call_count["n"] == 1
+
+
+def test_close_bounded_worker_eventually_completes_after_release(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    release = threading.Event()
+    entered = threading.Event()
+    completed = threading.Event()
+    real_close = httpx.Client.close
+
+    def _hanging_close(self):
+        entered.set()
+        release.wait(timeout=10)
+        real_close(self)
+        completed.set()
+
+    monkeypatch.setattr(httpx.Client, "close", _hanging_close)
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
+    try:
+        error = _close_bounded(client)
+        assert isinstance(error, OpenCodeCleanupError)
+        assert entered.wait(timeout=5)
+    finally:
+        release.set()
+    assert completed.wait(timeout=5)
+
+
+def test_close_request_local_client_success_returns():
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    _close_request_local_client(client, None)
+
+
+def test_close_request_local_client_success_with_close_failure_raises_cleanup(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    monkeypatch.setattr(httpx.Client, "close", _throwing_close)
+    with pytest.raises(OpenCodeCleanupError):
+        _close_request_local_client(client, None)
+
+
+def test_close_request_local_client_primary_survives_close_failure_and_gets_note(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    monkeypatch.setattr(httpx.Client, "close", _throwing_close)
+    primary = AgentInvocationError("original failure")
+    _close_request_local_client(client, primary)
+    notes = getattr(primary, "__notes__", [])
+    assert len(notes) == 1
+    assert "closing the HTTP client did not complete cleanly" in notes[0]
+
+
+# -- create_session(): full outcome selection before close ------------------
+
+
+def test_cleanup_note_preserves_existing_notes_and_cause(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    close_failure = RuntimeError("simulated close failure")
+    primary = AgentInvocationError("primary")
+    cause = ValueError("cause")
+    primary.__cause__ = cause
+    primary.add_note("existing note")
+    monkeypatch.setattr(oc_module, "_close_bounded", lambda client: close_failure)
+
+    _close_request_local_client(client, primary)
+
+    assert primary.__cause__ is cause
+    assert primary.__notes__ == [
+        "existing note",
+        "additionally, closing the HTTP client did not complete cleanly: simulated close failure",
+    ]
+
+
+def test_cleanup_note_failure_never_replaces_primary(monkeypatch):
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    primary = AgentInvocationError("primary")
+    close_failure = RuntimeError("simulated close failure")
+    monkeypatch.setattr(oc_module, "_close_bounded", lambda client: close_failure)
+
+    def _boom_add_note(message):
+        raise RuntimeError("simulated add_note failure")
+
+    monkeypatch.setattr(primary, "add_note", _boom_add_note)
+    _close_request_local_client(client, primary)
+
+
+def test_cleanup_error_with_throwing_str_never_replaces_primary(monkeypatch):
+    class _UnprintableError(BaseException):
+        def __str__(self):
+            raise RuntimeError("simulated str failure")
+
+    client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    primary = AgentInvocationError("primary")
+    cleanup_error = _UnprintableError()
+    monkeypatch.setattr(oc_module, "_close_bounded", lambda client: cleanup_error)
+
+    _close_request_local_client(client, primary)
+
+    assert primary.__notes__ == [
+        "additionally, closing the HTTP client did not complete cleanly: "
+        "unprintable _UnprintableError"
+    ]
+
+
+def test_create_session_timeout_then_close_success(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _timeout_handler, monkeypatch=monkeypatch)
+    with pytest.raises(PhaseTimeoutError):
+        server.create_session(tmp_path, title="t", timeout=1.0)
+
+
+def test_create_session_timeout_then_close_failure_preserves_primary_with_note(
+    tmp_path, monkeypatch
+):
+    server = _mock_server(tmp_path, _timeout_handler, monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(PhaseTimeoutError) as excinfo:
+        server.create_session(tmp_path, title="t", timeout=1.0)
+    exc = excinfo.value
+    cause = exc.__cause__
+    assert isinstance(cause, httpx.ReadTimeout)
+    assert cause.request.url.host == "mock-opencode"
+    traceback_names = []
+    current = exc.__traceback__
+    while current is not None:
+        traceback_names.append(current.tb_frame.f_code.co_name)
+        current = current.tb_next
+    assert "create_session" in traceback_names
+    assert "_close_request_local_client" not in traceback_names
+    notes = getattr(exc, "__notes__", [])
+    assert len(notes) == 1
+    assert "closing the HTTP client did not complete cleanly" in notes[0]
+
+
+def test_create_session_timeout_then_hanging_close_preserves_primary(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _timeout_handler, monkeypatch=monkeypatch)
+    release = threading.Event()
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
+    _patch_close(monkeypatch, _make_hanging_close(release))
+    try:
+        start = time.monotonic()
+        with pytest.raises(PhaseTimeoutError) as excinfo:
+            server.create_session(tmp_path, title="t", timeout=1.0)
+        elapsed = time.monotonic() - start
+        assert elapsed < 3.0
+        notes = getattr(excinfo.value, "__notes__", [])
+        assert len(notes) == 1
+    finally:
+        release.set()
+
+
+def test_create_session_request_error_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _network_error_handler, monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.create_session(tmp_path, title="t", timeout=1.0)
+    assert isinstance(excinfo.value.__cause__, httpx.ConnectError)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_create_session_http_500_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(500, {"error": "boom"}), monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.create_session(tmp_path, title="t", timeout=1.0)
+    assert excinfo.value.__cause__ is None
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_create_session_invalid_json_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _raw_handler(200, b"not json {{{"), monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.create_session(tmp_path, title="t", timeout=1.0)
+    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_create_session_non_object_json_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(200, [1, 2, 3]), monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.create_session(tmp_path, title="t", timeout=1.0)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_create_session_missing_id_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(200, {}), monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.create_session(tmp_path, title="t", timeout=1.0)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_create_session_empty_id_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(200, {"id": ""}), monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.create_session(tmp_path, title="t", timeout=1.0)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_create_session_non_string_id_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(200, {"id": 123}), monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.create_session(tmp_path, title="t", timeout=1.0)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_create_session_success_then_close_failure_raises_cleanup_error(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(200, {"id": "ses_ok"}), monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(OpenCodeCleanupError):
+        server.create_session(tmp_path, title="t", timeout=1.0)
+
+
+def test_create_session_success_then_hanging_close_raises_cleanup_error(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(200, {"id": "ses_ok"}), monkeypatch=monkeypatch)
+    release = threading.Event()
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
+    _patch_close(monkeypatch, _make_hanging_close(release))
+    try:
+        start = time.monotonic()
+        with pytest.raises(OpenCodeCleanupError):
+            server.create_session(tmp_path, title="t", timeout=1.0)
+        assert time.monotonic() - start < 3.0
+    finally:
+        release.set()
+
+
+def test_create_session_success_normal_close_succeeds(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(200, {"id": "ses_ok"}), monkeypatch=monkeypatch)
+    assert server.create_session(tmp_path, title="t", timeout=1.0) == "ses_ok"
+
+
+# -- send_prompt(): full outcome selection before close ----------------------
+
+
+def _prompt_kwargs(session_id: str = "s1") -> dict:
+    return dict(session_id=session_id, directory=Path("/tmp"), agent="a", prompt="go")
+
+
+def test_send_prompt_timeout_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _timeout_handler, monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(PhaseTimeoutError) as excinfo:
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert isinstance(excinfo.value.__cause__, httpx.ReadTimeout)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_send_prompt_request_error_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _network_error_handler, monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert isinstance(excinfo.value.__cause__, httpx.ConnectError)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_send_prompt_http_500_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(500, {}), monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_send_prompt_invalid_json_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _raw_handler(200, b"not json {{{"), monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_send_prompt_non_object_json_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(200, [1, 2]), monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_send_prompt_malformed_info_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(
+        tmp_path, _json_handler(200, {"info": "nope", "parts": []}), monkeypatch=monkeypatch
+    )
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_send_prompt_assistant_error_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(
+        tmp_path,
+        _json_handler(200, {"info": {"error": "model exploded"}, "parts": []}),
+        monkeypatch=monkeypatch,
+    )
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert "model exploded" in str(excinfo.value)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_send_prompt_assistant_error_then_hanging_close(tmp_path, monkeypatch):
+    """A non-transport primary (assistant error, decided well after the
+    request itself completed) must also survive a hanging close."""
+    server = _mock_server(
+        tmp_path,
+        _json_handler(200, {"info": {"error": "model exploded"}, "parts": []}),
+        monkeypatch=monkeypatch,
+    )
+    release = threading.Event()
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
+    _patch_close(monkeypatch, _make_hanging_close(release))
+    try:
+        start = time.monotonic()
+        with pytest.raises(AgentInvocationError) as excinfo:
+            server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+        assert time.monotonic() - start < 3.0
+        assert "model exploded" in str(excinfo.value)
+        assert len(getattr(excinfo.value, "__notes__", [])) == 1
+    finally:
+        release.set()
+
+
+def test_send_prompt_malformed_structured_output_then_close_failure(tmp_path, monkeypatch):
+    """_extract_text() re-serializes `structured_output` with json.dumps();
+    that call failing (e.g. a value the JSON encoder rejects) must be
+    classified as AgentInvocationError, same as every other malformed-
+    response case, and must still survive a close() failure."""
+    server = _mock_server(
+        tmp_path,
+        _json_handler(200, {"info": {"structured_output": {"a": 1}}, "parts": []}),
+        monkeypatch=monkeypatch,
+    )
+    _patch_close(monkeypatch, _throwing_close)
+
+    def _boom_dumps(*args, **kwargs):
+        raise TypeError("simulated unserializable structured_output")
+
+    monkeypatch.setattr(json, "dumps", _boom_dumps)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert "malformed structured output" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, TypeError)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_send_prompt_malformed_parts_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(
+        tmp_path,
+        _json_handler(200, {"info": {}, "parts": "not a list"}),
+        monkeypatch=monkeypatch,
+    )
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_send_prompt_no_text_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(
+        tmp_path, _json_handler(200, {"info": {}, "parts": []}), monkeypatch=monkeypatch
+    )
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert "returned no text output" in str(excinfo.value)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_send_prompt_success_text_then_close_success(tmp_path, monkeypatch):
+    server = _mock_server(
+        tmp_path,
+        _json_handler(200, {"info": {}, "parts": [{"type": "text", "text": "hello"}]}),
+        monkeypatch=monkeypatch,
+    )
+    assert server.send_prompt(**_prompt_kwargs(), timeout=1.0) == "hello"
+
+
+def test_send_prompt_success_structured_output_then_close_success(tmp_path, monkeypatch):
+    server = _mock_server(
+        tmp_path,
+        _json_handler(200, {"info": {"structured_output": {"a": 1}}, "parts": []}),
+        monkeypatch=monkeypatch,
+    )
+    result = server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert json.loads(result) == {"a": 1}
+
+
+def test_send_prompt_success_then_close_failure_raises_cleanup_error(tmp_path, monkeypatch):
+    server = _mock_server(
+        tmp_path,
+        _json_handler(200, {"info": {}, "parts": [{"type": "text", "text": "hi"}]}),
+        monkeypatch=monkeypatch,
+    )
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(OpenCodeCleanupError):
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+
+
+def test_send_prompt_success_then_hanging_close_raises_cleanup_error(tmp_path, monkeypatch):
+    server = _mock_server(
+        tmp_path,
+        _json_handler(200, {"info": {}, "parts": [{"type": "text", "text": "hi"}]}),
+        monkeypatch=monkeypatch,
+    )
+    release = threading.Event()
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
+    _patch_close(monkeypatch, _make_hanging_close(release))
+    try:
+        start = time.monotonic()
+        with pytest.raises(OpenCodeCleanupError):
+            server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+        assert time.monotonic() - start < 3.0
+    finally:
+        release.set()
+
+
+# -- _abort_session_bounded(): full outcome selection before close -----------
+
+
+def test_abort_bounded_timeout_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _timeout_handler, monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(OpenCodeError) as excinfo:
+        server._abort_session_bounded("s1")
+    assert isinstance(excinfo.value.__cause__, httpx.ReadTimeout)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_abort_bounded_timeout_then_hanging_close_preserves_primary(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _timeout_handler, monkeypatch=monkeypatch)
+    release = threading.Event()
+    completed = threading.Event()
+    real_close = httpx.Client.close
+
+    def _hanging_close(self):
+        release.wait(timeout=10)
+        real_close(self)
+        completed.set()
+
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
+    _patch_close(monkeypatch, _hanging_close)
+    try:
+        with pytest.raises(OpenCodeError) as excinfo:
+            server._abort_session_bounded("s1")
+        assert isinstance(excinfo.value.__cause__, httpx.ReadTimeout)
+        assert len(excinfo.value.__notes__) == 1
+    finally:
+        release.set()
+    assert completed.wait(timeout=5)
+
+
+def test_abort_bounded_request_error_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _network_error_handler, monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(OpenCodeError) as excinfo:
+        server._abort_session_bounded("s1")
+    assert isinstance(excinfo.value.__cause__, httpx.ConnectError)
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_abort_bounded_http_500_then_close_failure(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(500, {}), monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server._abort_session_bounded("s1")
+    assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_abort_bounded_success_then_close_failure_raises_cleanup_error(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(200, True), monkeypatch=monkeypatch)
+    _patch_close(monkeypatch, _throwing_close)
+    with pytest.raises(OpenCodeCleanupError):
+        server._abort_session_bounded("s1")
+
+
+def test_abort_bounded_success_then_hanging_close_raises_cleanup_error(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(200, True), monkeypatch=monkeypatch)
+    release = threading.Event()
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.05)
+    _patch_close(monkeypatch, _make_hanging_close(release))
+    try:
+        start = time.monotonic()
+        with pytest.raises(OpenCodeCleanupError):
+            server._abort_session_bounded("s1")
+        assert time.monotonic() - start < 3.0
+    finally:
+        release.set()
+
+
+def test_abort_bounded_success_normal_close_succeeds(tmp_path, monkeypatch):
+    server = _mock_server(tmp_path, _json_handler(200, True), monkeypatch=monkeypatch)
+    server._abort_session_bounded("s1")  # must not raise
+
+
+# -- OpenCodeServer.__exit__(): context-manager precedence -------------------
+
+
+class _BodyError(RuntimeError):
+    pass
+
+
+def _run_body_through_exit(server: OpenCodeServer, body_error: BaseException) -> None:
+    """Emulate exactly what `with server: raise body_error` does, without
+    calling server.start() a second time (the server here is already
+    started by the caller): raise body_error, capture real sys.exc_info(),
+    pass it to __exit__ as the `with` statement would, and re-raise
+    body_error afterward since __exit__ always returns False (never
+    suppresses)."""
+    try:
+        raise body_error
+    except BaseException:
+        exc_type, exc_val, exc_tb = sys.exc_info()
+        suppressed = server.__exit__(exc_type, exc_val, exc_tb)
+        if suppressed:
+            raise AssertionError("__exit__ must never suppress the body exception") from None
+        raise
+
+
+def test_context_manager_body_success_stop_failure_propagates(tmp_path, monkeypatch):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    def _boom_stop(self):
+        raise RuntimeError("simulated stop failure")
+
+    monkeypatch.setattr(OpenCodeServer, "stop", _boom_stop)
+    try:
+        with pytest.raises(RuntimeError, match="simulated stop failure"):
+            server.__exit__(None, None, None)
+    finally:
+        monkeypatch.undo()
+        server.stop()
+
+
+def test_context_manager_body_error_stop_success_reraises_body_unchanged(tmp_path):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    with pytest.raises(_BodyError, match="body boom"):
+        with _FakeServer(tmp_path, config):
+            raise _BodyError("body boom")
+
+
+def test_context_manager_body_error_stop_failure_attaches_note_and_preserves_body(
+    tmp_path, monkeypatch
+):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    def _boom_stop(self):
+        raise RuntimeError("simulated stop failure")
+
+    monkeypatch.setattr(OpenCodeServer, "stop", _boom_stop)
+    body_error = _BodyError("body boom")
+    with pytest.raises(_BodyError) as excinfo:
+        _run_body_through_exit(server, body_error)
+    assert excinfo.value is body_error
+    notes = getattr(body_error, "__notes__", [])
+    assert len(notes) == 1
+    assert "stop() failed during __exit__" in notes[0]
+    monkeypatch.undo()
+    server.stop()
+
+
+def test_context_manager_body_error_with_explicit_cause_is_preserved(tmp_path, monkeypatch):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    def _boom_stop(self):
+        raise RuntimeError("simulated stop failure")
+
+    monkeypatch.setattr(OpenCodeServer, "stop", _boom_stop)
+    cause = ValueError("original cause")
+    try:
+        raise cause
+    except ValueError as exc:
+        body_error = _BodyError("body boom")
+        body_error.__cause__ = exc
+
+    with pytest.raises(_BodyError) as excinfo:
+        _run_body_through_exit(server, body_error)
+    assert excinfo.value.__cause__ is cause
+    monkeypatch.undo()
+    server.stop()
+
+
+def test_context_manager_unprintable_cleanup_error_never_replaces_body(tmp_path, monkeypatch):
+    class _UnprintableCleanupError(BaseException):
+        def __str__(self):
+            raise RuntimeError("simulated str failure")
+
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    def _boom_stop(self):
+        raise _UnprintableCleanupError()
+
+    monkeypatch.setattr(OpenCodeServer, "stop", _boom_stop)
+    body_error = _BodyError("body boom")
+    with pytest.raises(_BodyError) as excinfo:
+        _run_body_through_exit(server, body_error)
+    assert excinfo.value is body_error
+    assert body_error.__notes__ == [
+        "additionally, OpenCodeServer.stop() failed during __exit__: "
+        "unprintable _UnprintableCleanupError"
+    ]
+    monkeypatch.undo()
+    server.stop()
+
+
+def test_context_manager_body_keyboard_interrupt_propagates(tmp_path):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    with pytest.raises(KeyboardInterrupt):
+        with _FakeServer(tmp_path, config):
+            raise KeyboardInterrupt()
+
+
+def test_context_manager_body_system_exit_propagates(tmp_path):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    with pytest.raises(SystemExit):
+        with _FakeServer(tmp_path, config):
+            raise SystemExit(1)
+
+
+def test_context_manager_ordinary_body_error_survives_cleanup_keyboard_interrupt(
+    tmp_path, monkeypatch
+):
+    """A cleanup-time KeyboardInterrupt/SystemExit (not just an ordinary
+    Exception) must never replace a body RuntimeError."""
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    def _boom_stop(self):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(OpenCodeServer, "stop", _boom_stop)
+    body_error = _BodyError("body boom")
+    with pytest.raises(_BodyError) as excinfo:
+        _run_body_through_exit(server, body_error)
+    assert excinfo.value is body_error
+    notes = getattr(body_error, "__notes__", [])
+    assert len(notes) == 1
+    monkeypatch.undo()
+    server.stop()
+
+
+# -- Shared-client close ownership state machine in stop() -------------------
+
+
+def test_shared_close_attempt_construction_failure_retains_client(tmp_path, monkeypatch):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    def _boom(client):
+        return RuntimeError("simulated construction failure")
+
+    monkeypatch.setattr(oc_module, "_start_bounded_close", _boom)
+    with pytest.raises((OpenCodeCleanupError, ExceptionGroup)):
+        server.stop()
+    assert server._client is not None
+    assert server._client_close_attempt is None
+    assert server._owner is None
+    assert server._stdout_thread is None
+
+    monkeypatch.undo()
+    server.stop()
+    assert server._client is None
+
+
+def test_shared_close_thread_start_failure_retains_client(tmp_path, monkeypatch):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    def _boom_start(self):
+        raise RuntimeError("simulated Thread.start() failure")
+
+    monkeypatch.setattr(threading.Thread, "start", _boom_start)
+    with pytest.raises((OpenCodeCleanupError, ExceptionGroup)):
+        server.stop()
+    assert server._client is not None
+    assert server._client_close_attempt is None
+    assert server._owner is None
+    assert server._stdout_thread is None
+    monkeypatch.undo()
+    server.stop()
+    assert server._client is None
+
+
+def test_shared_close_wait_baseexception_still_cleans_process_tree(tmp_path, monkeypatch):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+    owner = server._owner
+    assert owner is not None
+
+    def _boom_wait(self, timeout):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(_BoundedCloseAttempt, "wait", _boom_wait)
+    with pytest.raises(OpenCodeCleanupError):
+        server.stop()
+    assert owner.launcher.poll() is not None
+    assert server._owner is None
+    assert server._stdout_thread is None
+    assert server._client is not None
+    monkeypatch.undo()
+    server.stop()
+
+
+def test_shared_close_result_inspection_failure_still_cleans_process_tree(tmp_path, monkeypatch):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+    owner = server._owner
+    assert owner is not None
+
+    def _boom_error(self):
+        raise SystemExit(3)
+
+    monkeypatch.setattr(_BoundedCloseAttempt, "error", property(_boom_error))
+    with pytest.raises(OpenCodeCleanupError):
+        server.stop()
+    assert owner.launcher.poll() is not None
+    assert server._owner is None
+    assert server._stdout_thread is None
+    assert server._client is not None
+    monkeypatch.undo()
+    server.stop()
+
+
+def test_shared_close_completed_exception_then_successful_retry(tmp_path, monkeypatch):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    call_count = {"n": 0}
+    real_close = httpx.Client.close
+
+    def _fail_once(self):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("simulated close failure")
+        return real_close(self)
+
+    monkeypatch.setattr(type(server._client), "close", _fail_once)
+    with pytest.raises((OpenCodeCleanupError, ExceptionGroup)):
+        server.stop()
+    assert server._client is not None
+    assert server._client_close_attempt is None  # cleared for retry
+
+    server.stop()
+    assert server._client is None
+    assert call_count["n"] == 2
+
+
+def test_shared_close_timeout_then_rewait_one_close_call(tmp_path, monkeypatch):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.1)
+    release = threading.Event()
+    call_count = {"n": 0}
+    real_close = httpx.Client.close
+
+    def _hanging(self):
+        call_count["n"] += 1
+        release.wait(timeout=10)
+        return real_close(self)
+
+    monkeypatch.setattr(type(server._client), "close", _hanging)
+    try:
+        with pytest.raises((OpenCodeCleanupError, ExceptionGroup)):
+            server.stop()
+        with pytest.raises((OpenCodeCleanupError, ExceptionGroup)):
+            server.stop()
+        assert call_count["n"] == 1
+        assert server._client is not None
+    finally:
+        release.set()
+
+    for _ in range(100):
+        if server._client is None:
+            break
+        try:
+            server.stop()
+        except Exception:
+            pass
+        time.sleep(0.05)
+    assert server._client is None
+    assert call_count["n"] == 1
+
+
+def test_shared_close_delayed_success_after_stop_returns(tmp_path, monkeypatch):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.1)
+    release = threading.Event()
+    real_close = httpx.Client.close
+
+    def _delayed(self):
+        release.wait(timeout=10)
+        return real_close(self)
+
+    monkeypatch.setattr(type(server._client), "close", _delayed)
+    try:
+        with pytest.raises((OpenCodeCleanupError, ExceptionGroup)):
+            server.stop()
+        assert server._client is not None
+    finally:
+        release.set()
+
+    for _ in range(100):
+        if server._client is None:
+            break
+        try:
+            server.stop()
+        except Exception:
+            pass
+        time.sleep(0.05)
+    assert server._client is None
+    assert server._client_close_attempt is None
+
+
+def test_shared_close_delayed_exception_then_one_new_retry(tmp_path, monkeypatch):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.1)
+    release = threading.Event()
+    call_count = {"n": 0}
+    real_close = httpx.Client.close
+
+    def _delayed_then_boom(self):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            release.wait(timeout=10)
+            raise RuntimeError("simulated delayed close failure")
+        return real_close(self)
+
+    monkeypatch.setattr(type(server._client), "close", _delayed_then_boom)
+    # First stop(): starts the close, which is still blocked on `release`
+    # when the bound expires, so this reports a timeout and retains both
+    # the client and the in-progress attempt.
+    with pytest.raises((OpenCodeCleanupError, ExceptionGroup)):
+        server.stop()
+    assert server._client is not None
+    assert server._client_close_attempt is not None
+    release.set()
+
+    # Second stop(): re-waits on the same attempt (no second concurrent
+    # close() call yet) until it finishes with the exception, reports it,
+    # and clears the completed attempt so a further retry may start a
+    # fresh close().
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and server._client_close_attempt is not None:
+        try:
+            server.stop()
+        except (OpenCodeCleanupError, ExceptionGroup):
+            pass
+        if call_count["n"] >= 1 and server._client_close_attempt is None:
+            break
+        time.sleep(0.05)
+    assert server._client_close_attempt is None
+    assert server._client is not None
+    assert call_count["n"] == 1
+
+    # Third stop(): starts exactly one fresh close(), which now succeeds.
+    server.stop()
+    assert server._client is None
+    assert call_count["n"] == 2
+
+
+def test_shared_close_attempt_client_mismatch_reports_and_preserves_state(tmp_path, monkeypatch):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    other_client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
+    mismatched_attempt = _BoundedCloseAttempt(other_client)
+    mismatched_attempt.start()
+    mismatched_attempt.wait(5.0)
+    server._client_close_attempt = mismatched_attempt
+
+    real_client = server._client
+    with pytest.raises((OpenCodeCleanupError, ExceptionGroup)):
+        server.stop()
+    assert server._client is real_client
+    assert server._client_close_attempt is mismatched_attempt
+    assert server._owner is None
+    assert server._stdout_thread is None
+
+    server._client_close_attempt = None
+    server.stop()
+    assert server._client is None
+
+
+def test_start_rejected_while_client_close_attempt_unresolved(tmp_path, monkeypatch):
+    config = _argv_config(FAKE_OPENCODE_MODE="normal")
+    server = _FakeServer(tmp_path, config)
+    server.start()
+
+    monkeypatch.setattr(oc_module, "_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.1)
+    release = threading.Event()
+    real_close = httpx.Client.close
+
+    def _hanging(self):
+        release.wait(timeout=10)
+        return real_close(self)
+
+    monkeypatch.setattr(type(server._client), "close", _hanging)
+    try:
+        with pytest.raises((OpenCodeCleanupError, ExceptionGroup)):
+            server.stop()
+        assert server._client_close_attempt is not None
+        assert server._owner is None
+        assert server._pending_launcher is None
+        assert server._stdout_thread is None
+        with pytest.raises(OpenCodeError, match="unresolved"):
+            server.start()
+    finally:
+        release.set()
+
+    for _ in range(100):
+        if server._client is None:
+            break
+        try:
+            server.stop()
+        except Exception:
+            pass
+        time.sleep(0.05)
+    assert server._client is None

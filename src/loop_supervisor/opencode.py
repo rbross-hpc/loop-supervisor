@@ -59,7 +59,8 @@ _ABORT_TIMEOUT_SECONDS = 5.0
 # after an already-selected timeout/response would otherwise re-introduce
 # exactly the unbounded-wait failure mode the request timeout is meant to
 # prevent. close() is run on a dedicated daemon thread (see
-# _run_close_bounded below) so this bound can be enforced without a
+# _BoundedCloseAttempt/_close_bounded below) so this bound can be enforced
+# without a
 # built-in way to forcibly interrupt a blocked synchronous call: Python
 # cannot safely kill a running thread, so a timed-out close leaves its
 # worker thread (and the client/socket it holds) to finish in the
@@ -222,6 +223,12 @@ class _BoundedCloseAttempt:
     """Tracks one in-progress httpx.Client.close() call run on a dedicated
     daemon thread.
 
+    Construction alone never starts the worker: call start() (or use the
+    _start_bounded_close() factory below) to do that. This keeps
+    construction and thread startup separable so a caller can catch
+    failures from each step without any of them escaping as an
+    unhandled exception from __init__.
+
     Python has no safe way to forcibly interrupt a blocked synchronous
     call, so a close() that does not finish within the caller's bound
     cannot be cancelled — it is left running in the background (the
@@ -236,17 +243,36 @@ class _BoundedCloseAttempt:
     def __init__(self, client: httpx.Client) -> None:
         self.client = client
         self._done = threading.Event()
+        self._started = threading.Event()
         self._error: BaseException | None = None
+        self._startup_error: BaseException | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Construct and start the daemon worker thread. May raise if
+        threading.Thread(...) construction or thread.start() itself
+        fails; callers should treat that as an orchestration failure
+        distinct from close() failing (see _start_bounded_close, which
+        wraps this non-throwingly)."""
         thread = threading.Thread(target=self._run, name="opencode-client-close", daemon=True)
+        self._thread = thread
         thread.start()
 
     def _run(self) -> None:
+        self._started.set()
         try:
             self.client.close()
         except BaseException as exc:  # noqa: BLE001 - reported to the waiter, not raised here
             self._error = exc
         finally:
             self._done.set()
+
+    def record_startup_error(self, error: BaseException) -> None:
+        self._startup_error = error
+
+    def worker_may_have_started(self) -> bool:
+        thread = self._thread
+        return self._started.is_set() or (thread is not None and thread.ident is not None)
 
     def wait(self, timeout: float) -> bool:
         """Wait up to timeout seconds for the close to finish (whether it
@@ -255,10 +281,52 @@ class _BoundedCloseAttempt:
 
     @property
     def error(self) -> BaseException | None:
-        """The exception close() raised, if it has finished and did so.
-        Meaningless (and irrelevant) while wait() would still return
-        False."""
+        """The exception close() raised, if it has finished and did so."""
         return self._error
+
+    @property
+    def startup_error(self) -> BaseException | None:
+        return self._startup_error
+
+
+def _start_bounded_close(client: httpx.Client) -> _BoundedCloseAttempt | BaseException:
+    """Non-throwing factory: construct a _BoundedCloseAttempt and start
+    its daemon worker thread, catching any failure from attempt/Event
+    construction, threading.Thread(...) construction, or thread.start()
+    and returning it instead of raising. Never invokes client.close()
+    itself on the calling thread. Callers must not let the returned
+    BaseException replace an already-decided primary outcome (see the
+    precedence convention documented on _close_request_local_client and
+    the shared-client handling in OpenCodeServer.stop())."""
+    try:
+        attempt = _BoundedCloseAttempt(client)
+    except BaseException as exc:  # noqa: BLE001 - reported to the caller, not raised here
+        return exc
+    try:
+        attempt.start()
+    except BaseException as exc:  # noqa: BLE001 - reported to the caller, not raised here
+        try:
+            worker_may_have_started = attempt.worker_may_have_started()
+        except BaseException:  # noqa: BLE001 - ambiguous startup retains ownership
+            worker_may_have_started = True
+        if worker_may_have_started:
+            try:
+                attempt.record_startup_error(exc)
+            except BaseException:  # noqa: BLE001 - retain ambiguous worker ownership
+                pass
+            return attempt
+        return exc
+    return attempt
+
+
+def _safe_exception_text(error: BaseException) -> str:
+    try:
+        return str(error)
+    except BaseException:  # noqa: BLE001 - diagnostic rendering must not escape
+        try:
+            return f"unprintable {type(error).__name__}"
+        except BaseException:  # noqa: BLE001 - use a constant if introspection fails
+            return "unprintable cleanup failure"
 
 
 def _close_request_local_client(client: httpx.Client, primary: BaseException | None) -> None:
@@ -276,31 +344,67 @@ def _close_request_local_client(client: httpx.Client, primary: BaseException | N
       decided outcome yet: an unconfirmed close is itself the failure,
       so it is raised as OpenCodeCleanupError rather than silently
       returning a result whose underlying connection may still be open.
+
+    The worker thread started for this close is daemon-owned and never
+    registered anywhere else: a request-local close that times out is
+    solely owned by its own background thread, never added to
+    OpenCodeServer's shared-client retry state (that state exists only
+    for the long-lived control client tracked by stop()).
     """
     error = _close_bounded(client)
     if error is None:
         return
     if primary is not None:
-        primary.add_note(f"additionally, closing the HTTP client did not complete cleanly: {error}")
+        _add_cleanup_note(
+            primary,
+            "additionally, closing the HTTP client did not complete cleanly: ",
+            error,
+        )
         return
     raise OpenCodeCleanupError(
-        f"closing the HTTP client did not complete cleanly: {error}"
+        "closing the HTTP client did not complete cleanly: " + _safe_exception_text(error)
     ) from error
 
 
-def _close_bounded(
-    client: httpx.Client, timeout: float = _CLIENT_CLOSE_TIMEOUT_SECONDS
-) -> BaseException | None:
+def _add_cleanup_note(
+    primary: BaseException,
+    prefix: str,
+    cleanup_error: BaseException,
+) -> None:
+    """Attach one deterministic cleanup note to `primary`, preserving any
+    existing notes. Never touches `primary.__cause__`, and never lets a
+    failure while formatting or calling add_note() itself propagate: the
+    primary exception's identity must be preserved regardless of whether
+    annotating it succeeds."""
+    try:
+        primary.add_note(prefix + _safe_exception_text(cleanup_error))
+    except BaseException:  # noqa: BLE001 - annotating must never replace the primary
+        pass
+
+
+def _as_reportable_error(error: BaseException) -> Exception:
+    """Normalize an arbitrary BaseException into an Exception suitable
+    for inclusion in stop()'s errors without ever raising itself."""
+    if isinstance(error, Exception):
+        return error
+    return OpenCodeCleanupError(_safe_exception_text(error))
+
+
+def _close_bounded(client: httpx.Client, timeout: float | None = None) -> BaseException | None:
     """Close a request-local client on a dedicated daemon thread, bounded
-    by `timeout`. Returns None once close is confirmed to have completed
-    successfully. Otherwise returns an exception describing why it did
-    not: either the exception close() itself raised, or an
-    OpenCodeCleanupError if close had not completed at all within the
-    bound. Never raises: the caller decides how to combine this with any
-    primary exception it is already handling (see the precedence
-    convention used throughout create_session/send_prompt/
-    _abort_session_bounded: a close failure is attached as a note to a
-    primary exception, never allowed to replace it).
+    by `timeout` (or, if not given, the *current* value of
+    _CLIENT_CLOSE_TIMEOUT_SECONDS — looked up dynamically here rather
+    than captured at function-definition time, so a test or caller that
+    changes the module-level constant is honored on every call). Returns
+    None once close is confirmed to have completed successfully.
+    Otherwise returns an exception describing why it did not: either the
+    exception close() itself raised, an orchestration failure starting
+    the worker, or an OpenCodeCleanupError if close had not completed at
+    all within the bound. Never raises: the caller decides how to
+    combine this with any primary exception it is already handling (see
+    the precedence convention used throughout create_session/
+    send_prompt/_abort_session_bounded: a close failure is attached as a
+    note to a primary exception, never allowed to replace it).
 
     Intended for one-off request-local clients where no later stop()
     needs to track an in-progress close; OpenCodeServer.stop() manages
@@ -308,13 +412,22 @@ def _close_bounded(
     stop() must observe (not restart) an already-running close on the
     shared client.
     """
-    attempt = _BoundedCloseAttempt(client)
-    if not attempt.wait(timeout):
-        return OpenCodeCleanupError(
-            f"closing the HTTP client did not complete within {timeout}s; "
-            "the close is still running in the background"
-        )
-    return attempt.error
+    bound = _CLIENT_CLOSE_TIMEOUT_SECONDS if timeout is None else timeout
+    attempt = _start_bounded_close(client)
+    if isinstance(attempt, BaseException):
+        return attempt
+    try:
+        finished = attempt.wait(bound)
+        if not finished:
+            return OpenCodeCleanupError(
+                f"closing the HTTP client did not complete within {bound}s; "
+                "the close is still running in the background"
+            )
+        startup_error = attempt.startup_error
+        error = attempt.error
+    except BaseException as exc:  # noqa: BLE001 - reported to the caller, not raised here
+        return exc
+    return error if error is not None else startup_error
 
 
 @dataclass
@@ -381,19 +494,24 @@ class OpenCodeServer:
         exceptions.
 
         - With no body exception: stop() errors propagate normally.
-        - With a body exception: stop() is still attempted; if it raises,
-          the failure is attached as a note to the body exception, and the
-          body exception is re-raised (return False). The body exception is
-          never replaced by cleanup errors.
+        - With a body exception: stop() is still attempted; if it raises
+          *any* BaseException — including KeyboardInterrupt/SystemExit
+          raised by cleanup itself, not just ordinary Exception subclasses
+          — the failure is attached as a note to the body exception, and
+          the body exception is re-raised unchanged (return False). The
+          body exception (a RuntimeError, KeyboardInterrupt, SystemExit,
+          or anything else) is never replaced by a cleanup failure.
         """
         if exc_val is None:
             self.stop()
             return False
         try:
             self.stop()
-        except Exception as stop_exc:
-            exc_val.add_note(
-                f"additionally, OpenCodeServer.stop() failed during __exit__: {stop_exc}"
+        except BaseException as stop_exc:  # noqa: BLE001 - must never replace exc_val
+            _add_cleanup_note(
+                exc_val,
+                "additionally, OpenCodeServer.stop() failed during __exit__: ",
+                stop_exc,
             )
         return False
 
@@ -687,38 +805,83 @@ class OpenCodeServer:
             errors: list[Exception] = []
             self._stdout_stop.set()
 
-            if self._client is not None:
+            if self._client is None and self._client_close_attempt is not None:
+                errors.append(
+                    OpenCodeCleanupError(
+                        "internal error: client-close attempt exists without a tracked client"
+                    )
+                )
+            elif self._client is not None:
                 attempt = self._client_close_attempt
-                if attempt is None or attempt.client is not self._client:
-                    try:
-                        attempt = _BoundedCloseAttempt(self._client)
-                        self._client_close_attempt = attempt
-                    except Exception as exc:
-                        errors.append(exc)
-                        attempt = None
-                if attempt is not None:
-                    try:
-                        finished = attempt.wait(_CLIENT_CLOSE_TIMEOUT_SECONDS)
-                    except Exception as exc:
-                        errors.append(exc)
-                    else:
-                        if not finished:
-                            errors.append(
-                                OpenCodeCleanupError(
-                                    "closing the OpenCode control client timed out"
-                                )
-                            )
-                        elif attempt.error is not None:
-                            error = attempt.error
-                            errors.append(
-                                error
-                                if isinstance(error, Exception)
-                                else OpenCodeCleanupError(repr(error))
-                            )
-                            self._client_close_attempt = None
+                if attempt is not None and attempt.client is not self._client:
+                    # An in-progress attempt exists but is bound to a
+                    # different client object than the one currently
+                    # tracked: this should not happen under the cleanup
+                    # lock, and it must never be papered over by
+                    # overwriting either ownership field (which could
+                    # orphan the real in-flight close or start a second
+                    # concurrent close() against _client). Report it and
+                    # leave both fields exactly as they are; do not
+                    # attempt any close this round.
+                    errors.append(
+                        OpenCodeCleanupError(
+                            "internal error: in-progress client-close attempt does not "
+                            "match the currently tracked client"
+                        )
+                    )
+                else:
+                    if attempt is None:
+                        started = _start_bounded_close(self._client)
+                        if isinstance(started, BaseException):
+                            # Construction/start failed before any worker
+                            # began running close() at all: _client is
+                            # retained (nothing was closed), no attempt
+                            # is installed, and a later stop() may retry.
+                            errors.append(_as_reportable_error(started))
+                            attempt = None
                         else:
-                            self._client = None
-                            self._client_close_attempt = None
+                            attempt = started
+                            self._client_close_attempt = attempt
+
+                    if attempt is not None:
+                        # Either a freshly started attempt or a
+                        # pre-existing attempt for the same client:
+                        # re-wait rather than starting a second
+                        # concurrent close() call.
+                        try:
+                            finished = attempt.wait(_CLIENT_CLOSE_TIMEOUT_SECONDS)
+                            if finished:
+                                startup_error = attempt.startup_error
+                                close_error = attempt.error
+                            else:
+                                startup_error = None
+                                close_error = None
+                        except BaseException as exc:  # noqa: BLE001 - continue all cleanup stages
+                            errors.append(_as_reportable_error(exc))
+                        else:
+                            if not finished:
+                                # Timeout: retain both client and attempt
+                                # so a retried stop() re-waits on the
+                                # same in-flight close rather than
+                                # starting a new one.
+                                errors.append(
+                                    OpenCodeCleanupError(
+                                        "closing the OpenCode control client timed out"
+                                    )
+                                )
+                            elif close_error is not None or startup_error is not None:
+                                # Completed with an exception: retain the
+                                # client, but clear the completed attempt
+                                # so a later stop() may start one retry
+                                # close().
+                                error = close_error if close_error is not None else startup_error
+                                assert error is not None
+                                errors.append(_as_reportable_error(error))
+                                self._client_close_attempt = None
+                            else:
+                                # Successful completion: clear both.
+                                self._client = None
+                                self._client_close_attempt = None
 
             pending = self._pending_launcher
             if pending is not None:
@@ -900,44 +1063,47 @@ class OpenCodeServer:
             client = self.client
             close_client = False
 
-        # The request outcome is decided first and held here rather than
-        # raised immediately: a close() failure/timeout below must never
-        # replace it (see _close_request_local_client's precedence
-        # convention). response is left unset if the request itself
-        # failed.
-        primary: BaseException | None = None
-        response = None
+        # The complete request outcome (transport, HTTP status, JSON
+        # decoding, and session-ID validation) is decided in full before
+        # any close() is attempted: a close() failure/timeout must never
+        # replace a primary outcome that was only partially decided (see
+        # _close_request_local_client's precedence convention). Every
+        # branch here — the translated transport error, an HTTP-status
+        # error, a decode error, or a missing/invalid ID — is `raise`d so
+        # it becomes `primary` in the `except BaseException` clause below,
+        # not held in an intermediate variable.
         try:
-            response = client.post(
-                "/session",
-                params={"directory": str(directory)},
-                json={"title": title},
-            )
-        except httpx.TimeoutException as exc:
-            primary = PhaseTimeoutError(
-                f"creating session for {title!r} did not respond within "
-                f"{timeout if timeout is not None else 'the configured'}s"
-            )
-            primary.__cause__ = exc
-        except httpx.RequestError as exc:
-            primary = AgentInvocationError(f"network error creating session for {title!r}: {exc}")
-            primary.__cause__ = exc
+            try:
+                response = client.post(
+                    "/session",
+                    params={"directory": str(directory)},
+                    json={"title": title},
+                )
+            except httpx.TimeoutException as exc:
+                raise PhaseTimeoutError(
+                    f"creating session for {title!r} did not respond within "
+                    f"{timeout if timeout is not None else 'the configured'}s"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise AgentInvocationError(
+                    f"network error creating session for {title!r}: {exc}"
+                ) from exc
 
-        if close_client:
-            _close_request_local_client(client, primary)
-
-        if primary is not None:
-            raise primary
-        assert response is not None
-
-        _raise_for_status(response, "create session")
-        data = _decode_json_object(response, "create session")
-        session_id = data.get("id")
-        if not isinstance(session_id, str) or not session_id:
-            raise AgentInvocationError(
-                f"create session response is missing a valid string 'id' field: {data!r}"[:500]
-            )
-        return session_id
+            _raise_for_status(response, "create session")
+            data = _decode_json_object(response, "create session")
+            session_id = data.get("id")
+            if not isinstance(session_id, str) or not session_id:
+                raise AgentInvocationError(
+                    f"create session response is missing a valid string 'id' field: {data!r}"[:500]
+                )
+        except BaseException as primary:
+            if close_client:
+                _close_request_local_client(client, primary)
+            raise
+        else:
+            if close_client:
+                _close_request_local_client(client, None)
+            return session_id
 
     def send_prompt(
         self,
@@ -961,36 +1127,38 @@ class OpenCodeServer:
 
         client = httpx.Client(base_url=self.base_url, timeout=timeout)
 
-        # See create_session(): the request outcome is decided first and
-        # held here so a subsequent close() failure/timeout can never
-        # replace it (notably PhaseTimeoutError, which run_agent() relies
-        # on to trigger a best-effort abort — see _abort_session_best_effort).
-        primary: BaseException | None = None
-        response = None
+        # See create_session(): the complete request outcome (transport,
+        # HTTP status, JSON decoding, and text/structured-output
+        # extraction, including assistant-error and response-shape
+        # failures) is decided in full before any close() is attempted,
+        # so a subsequent close() failure/timeout can never replace it
+        # (notably PhaseTimeoutError, which run_agent() relies on to
+        # trigger a best-effort abort — see _abort_session_best_effort).
         try:
-            response = client.post(
-                f"/session/{session_id}/message",
-                params={"directory": str(directory)},
-                json=body,
-            )
-        except httpx.TimeoutException as exc:
-            primary = PhaseTimeoutError(f"agent {agent!r} did not respond within {timeout}s")
-            primary.__cause__ = exc
-        except httpx.RequestError as exc:
-            primary = AgentInvocationError(
-                f"network error communicating with agent {agent!r}: {exc}"
-            )
-            primary.__cause__ = exc
+            try:
+                response = client.post(
+                    f"/session/{session_id}/message",
+                    params={"directory": str(directory)},
+                    json=body,
+                )
+            except httpx.TimeoutException as exc:
+                raise PhaseTimeoutError(
+                    f"agent {agent!r} did not respond within {timeout}s"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise AgentInvocationError(
+                    f"network error communicating with agent {agent!r}: {exc}"
+                ) from exc
 
-        _close_request_local_client(client, primary)
-
-        if primary is not None:
-            raise primary
-        assert response is not None
-
-        _raise_for_status(response, f"prompt for agent {agent!r}")
-        data = _decode_json_object(response, f"prompt for agent {agent!r}")
-        return _extract_text(data, agent=agent)
+            _raise_for_status(response, f"prompt for agent {agent!r}")
+            data = _decode_json_object(response, f"prompt for agent {agent!r}")
+            text = _extract_text(data, agent=agent)
+        except BaseException as primary:
+            _close_request_local_client(client, primary)
+            raise
+        else:
+            _close_request_local_client(client, None)
+            return text
 
     def abort_session(self, session_id: str) -> None:
         """Abort one session, bounded by _ABORT_TIMEOUT_SECONDS.
@@ -1024,29 +1192,29 @@ class OpenCodeServer:
 
         # Same precedence convention as create_session()/send_prompt(): a
         # bounded close() failure/timeout must never replace the abort
-        # request's own outcome, and every caller here (both
-        # abort_session() and abort_active_sessions()) already treats
-        # this method's exceptions as best-effort/non-fatal.
-        primary: BaseException | None = None
-        response = None
+        # request's complete own outcome (transport failure or non-2xx
+        # HTTP status), and every caller here (both abort_session() and
+        # abort_active_sessions()) already treats this method's
+        # exceptions as best-effort/non-fatal.
         try:
-            response = client.post(f"/session/{session_id}/abort")
-        except httpx.TimeoutException as exc:
-            primary = OpenCodeError(
-                f"aborting session {session_id!r} did not respond within {_ABORT_TIMEOUT_SECONDS}s"
-            )
-            primary.__cause__ = exc
-        except httpx.RequestError as exc:
-            primary = OpenCodeError(f"network error aborting session {session_id!r}: {exc}")
-            primary.__cause__ = exc
+            try:
+                response = client.post(f"/session/{session_id}/abort")
+            except httpx.TimeoutException as exc:
+                raise OpenCodeError(
+                    f"aborting session {session_id!r} did not respond within "
+                    f"{_ABORT_TIMEOUT_SECONDS}s"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise OpenCodeError(
+                    f"network error aborting session {session_id!r}: {exc}"
+                ) from exc
 
-        _close_request_local_client(client, primary)
-
-        if primary is not None:
-            raise primary
-        assert response is not None
-
-        _raise_for_status(response, f"abort session {session_id!r}")
+            _raise_for_status(response, f"abort session {session_id!r}")
+        except BaseException as primary:
+            _close_request_local_client(client, primary)
+            raise
+        else:
+            _close_request_local_client(client, None)
 
     def abort_active_sessions(self) -> None:
         """Best-effort abort of all currently registered active sessions,
