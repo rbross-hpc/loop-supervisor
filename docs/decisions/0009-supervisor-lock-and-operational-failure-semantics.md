@@ -57,12 +57,40 @@ repository. An operator who encounters a retained lock after a failed
 cleanup must verify no OpenCode process survives before passing
 `--recover-stale-lock`.
 
+In the headless runtime, "confirmed" means a bounded retry sequence
+(`_confirm_server_stopped()` in `runtime.py`, `_CLEANUP_ATTEMPTS` calls to
+`server.stop()` on the exact same `OpenCodeServer` instance, with bounded
+backoff between attempts) has produced at least one attempt that returned
+without raising. The server handle itself is never discarded between
+retries, and a later successful attempt fully confirms cleanup regardless
+of how many earlier attempts failed transiently. This same bounded retry
+is applied uniformly to a failed `server.start()`, to the runner handoff
+and `supervisor.run()` (success or failure), and to the ordinary
+post-run cleanup path — there is exactly one cleanup-confirmation
+mechanism in the headless runtime, not one path for startup and a
+different one for run completion.
+
 **Primary errors take precedence over cleanup errors.** Whenever a
 primary operation (a run/resume failure, a startup failure) and a
 secondary cleanup step (`server.stop()`) both fail, the primary error is
 what propagates; the cleanup failure is attached as additional context
-(e.g. appended to the exception message) rather than replacing it. This
-holds in both the headless runtime and the TUI.
+(e.g. appended to the exception message, or as a `PEP 678` note via
+`add_note()` when the primary is a live exception object rather than a
+freshly constructed message) rather than replacing it. This holds in both
+the headless runtime and the TUI, and it holds uniformly across
+`BaseException`, not only `Exception`: a `KeyboardInterrupt`/`SystemExit`
+raised from `server.start()`, from `supervisor.run()`, or from the runner
+handoff is never wrapped in `RuntimeError_` and never persisted as an
+`OperationalErrorRecord` — its exact identity and traceback propagate via
+a bare `raise`, with retained-lock/unresolved-cleanup guidance attached
+only as a note if cleanup itself could not be confirmed. Symmetrically, a
+`KeyboardInterrupt`/`SystemExit` raised by cleanup itself (i.e. by
+`server.stop()` during one of the bounded retry attempts) is reported
+structurally to the caller rather than being allowed to replace whatever
+primary exception is already being handled; if there is no primary to
+preserve (an otherwise fully successful run followed by unconfirmable
+cleanup), that exact interrupt is what propagates, annotated with a
+retained-lock note, rather than being converted into a `RuntimeError_`.
 
 This precedence applies to the *complete* outcome of an operation, not
 just its first failure point. In `OpenCodeServer.create_session()`,

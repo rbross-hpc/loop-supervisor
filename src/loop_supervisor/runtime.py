@@ -35,19 +35,114 @@ attached to it as a note rather than replacing it.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 from .git import GitError, GitRepo
 from .locking import LockError, SupervisorLock
-from .opencode import OpenCodeError, OpenCodeServer, OpenCodeServerConfig
+from .opencode import OpenCodeServer, OpenCodeServerConfig
 from .state import RunOptions, RunState, StateError, list_runs, load_state, validate_run_id
 from .supervisor import LoopError, Supervisor
+
+# Bounded retry for confirming OpenCode server cleanup (server.stop()).
+# Applied uniformly to startup failures, successful-run completion, and
+# any BaseException raised from supervisor.run()/the runner handoff — the
+# lease may only be marked releasable once one of these attempts actually
+# confirms stop() succeeded. Backoff increases per attempt (0.1s, 0.2s)
+# and is never applied after the final attempt.
+_CLEANUP_ATTEMPTS = 3
+_CLEANUP_BACKOFF_SECONDS = 0.1
 
 
 class RuntimeError_(RuntimeError):
     """Raised by the runtime controller for startup/configuration errors."""
+
+
+@dataclass
+class _CleanupOutcome:
+    """Structured result of a bounded server-stop retry sequence. Never
+    raised itself; callers decide how to combine this with any primary
+    exception they are already handling (see _confirm_server_stopped)."""
+
+    confirmed: bool
+    last_error: BaseException | None
+    attempts: int
+
+
+def _confirm_server_stopped(server: OpenCodeServer) -> _CleanupOutcome:
+    """Retry server.stop() on the same OpenCodeServer instance up to
+    _CLEANUP_ATTEMPTS times, with bounded backoff between attempts,
+    returning structured success/failure information instead of raising.
+
+    Cleanup is confirmed only once a stop() call returns without raising;
+    a later successful attempt means cleanup is confirmed and earlier
+    transient failures need not remain attached to whatever primary
+    exception the caller is handling. The server handle itself is never
+    discarded between retries — every attempt calls stop() again on the
+    exact same instance, since OpenCodeServer.stop() is documented as
+    safe to retry after a partial failure.
+
+    A KeyboardInterrupt/SystemExit raised by stop() itself stops the
+    retry loop immediately (retrying cleanup after an operator interrupt
+    would ignore their request); it is reported via last_error like any
+    other failure rather than being re-raised here, so it can never
+    replace whatever primary exception the caller is already handling.
+    """
+    last_error: BaseException | None = None
+    for attempt in range(_CLEANUP_ATTEMPTS):
+        try:
+            server.stop()
+        except (KeyboardInterrupt, SystemExit) as exc:
+            return _CleanupOutcome(confirmed=False, last_error=exc, attempts=attempt + 1)
+        except BaseException as exc:  # noqa: BLE001 - reported, not raised; caller may retry
+            last_error = exc
+            if attempt < _CLEANUP_ATTEMPTS - 1:
+                time.sleep(_CLEANUP_BACKOFF_SECONDS * (attempt + 1))
+            continue
+        else:
+            return _CleanupOutcome(confirmed=True, last_error=None, attempts=attempt + 1)
+    return _CleanupOutcome(confirmed=False, last_error=last_error, attempts=_CLEANUP_ATTEMPTS)
+
+
+def _add_note(exc: BaseException, message: str) -> None:
+    """Attach one deterministic note to `exc`, never letting a failure to
+    annotate (or the underlying add_note() call itself) propagate: the
+    caller's exception identity must be preserved regardless of whether
+    annotating it succeeds."""
+    try:
+        exc.add_note(message)
+    except BaseException:  # noqa: BLE001 - annotating must never replace the primary
+        pass
+
+
+def _unresolved_cleanup_message(prefix: str, outcome: _CleanupOutcome) -> str:
+    return (
+        f"{prefix} OpenCode server cleanup could not be confirmed "
+        f"({outcome.last_error}) — the repository lock has been retained; verify no "
+        "OpenCode process survives before using --recover-stale-lock"
+    )
+
+
+def _raise_unresolved_cleanup(prefix: str, outcome: _CleanupOutcome) -> NoReturn:
+    """Raise for an otherwise-successful operation whose OpenCode cleanup
+    could not be confirmed (no primary exception to preserve).
+
+    If the last cleanup attempt failed with KeyboardInterrupt/SystemExit,
+    that exact object is annotated with a retained-lock note and
+    re-raised unchanged, rather than wrapped: an operator's interrupt
+    must never be converted into an ordinary RuntimeError_. Any ordinary
+    Exception cleanup failure is wrapped in RuntimeError_ as before.
+    """
+    last_error = outcome.last_error
+    message = _unresolved_cleanup_message(prefix, outcome)
+    if last_error is not None and not isinstance(last_error, Exception):
+        _add_note(last_error, message)
+        raise last_error
+    raise RuntimeError_(message) from last_error
 
 
 class _LockLease:
@@ -106,21 +201,30 @@ def _lock_context(
     lease = _LockLease(lock)
     try:
         yield lease
-    except BaseException:
+    except BaseException as body_exc:
         # lock.release() can raise LockError on a transient failure (see
         # SupervisorLock.release()) rather than always succeeding. That
         # must never mask whatever exception the body itself raised (e.g.
         # a real run/resume failure): the run's own outcome is more
         # actionable than a secondary lock-release detail, and losing it
-        # would make debugging real failures much harder. And if the
-        # lease was marked unreleasable (OpenCode cleanup was never
-        # confirmed), the lock must not be released at all: it is
-        # deliberately left on disk for explicit stale-lock recovery.
+        # would make debugging real failures much harder. If release()
+        # fails, its failure is attached as a note instead of being
+        # silently discarded, so the operator still learns about it. And
+        # if the lease was marked unreleasable (OpenCode cleanup was
+        # never confirmed), release() must not be called at all: the
+        # caller (_startup_failure / _run_and_stop) is responsible for
+        # having already attached retained-lock guidance to body_exc
+        # before this point, and calling release() before OpenCode
+        # cleanup is confirmed would be exactly the ordering violation
+        # this lease exists to prevent.
         if lease.releasable:
             try:
                 lease.release()
-            except LockError:
-                pass
+            except LockError as release_exc:
+                _add_note(
+                    body_exc,
+                    f"additionally, the repository lock could not be released: {release_exc}",
+                )
         raise
     else:
         if lease.releasable:
@@ -176,10 +280,9 @@ def run_new(
         lease.mark_unreleasable()
         try:
             server.start()
-        except OpenCodeError as exc:
-            raise _startup_failure(supervisor, state, server, lease, exc) from exc
+        except BaseException as exc:
+            _startup_failure(supervisor, state, server, lease, exc)
 
-        supervisor.runner = server
         final = _run_and_stop(supervisor, state, server, lease)
 
     return final
@@ -251,10 +354,9 @@ def run_resume(
         lease.mark_unreleasable()
         try:
             server.start()
-        except OpenCodeError as exc:
-            raise _startup_failure(supervisor, state, server, lease, exc) from exc
+        except BaseException as exc:
+            _startup_failure(supervisor, state, server, lease, exc)
 
-        supervisor.runner = server
         final = _run_and_stop(supervisor, state, server, lease)
 
     return final
@@ -265,30 +367,42 @@ def _startup_failure(
     state: RunState,
     server: OpenCodeServer,
     lease: _LockLease,
-    exc: OpenCodeError,
-) -> RuntimeError_:
-    """Build the exception to raise for a failed server.start(), persisting
-    the operational failure and deciding whether the lock lease may be
-    marked releasable again.
+    exc: BaseException,
+) -> NoReturn:
+    """Handle a failure raised from server.start(), persisting the
+    operational failure (for ordinary exceptions only) and deciding
+    whether the lock lease may be marked releasable again. Always raises;
+    never returns.
 
     server.start() already terminates the process and releases its own
     resources on any failure past subprocess creation, but that guarantee
     is not something this caller can observe directly — and startup's own
-    internal best-effort cleanup could itself have failed silently. A
-    retry of stop() here is defense in depth: it is the only way this
-    function can confirm (rather than assume) that no OpenCode process
-    survives before it is safe to mark the lease releasable again. If that
-    retry also fails, the lease is left unreleasable and the lock is
-    retained on disk for explicit stale-lock recovery once the operator
-    has verified no OpenCode process remains.
+    internal best-effort cleanup could itself have failed silently.
+    Bounded stop() retries here are defense in depth: they are the only
+    way this function can confirm (rather than assume) that no OpenCode
+    process survives before it is safe to mark the lease releasable
+    again. If cleanup remains unresolved after every retry, the lease is
+    left unreleasable and the lock is retained on disk for explicit
+    stale-lock recovery once the operator has verified no OpenCode
+    process remains.
+
+    KeyboardInterrupt, SystemExit, and any other direct BaseException
+    (not an Exception subclass) are never persisted as operational
+    failures and are always re-raised unchanged via a bare `raise`,
+    preserving their exact identity and traceback — they are never
+    wrapped in RuntimeError_. Cleanup notes are attached only if cleanup
+    remains unresolved. A KeyboardInterrupt/SystemExit raised by cleanup
+    itself is never re-raised in place of the startup primary; it is only
+    described in the retained-lock note/message.
     """
-    cleanup_error: Exception | None = None
-    try:
-        server.stop()
-    except Exception as stop_exc:
-        cleanup_error = stop_exc
-    else:
+    outcome = _confirm_server_stopped(server)
+    if outcome.confirmed:
         lease.mark_releasable()
+
+    if not isinstance(exc, Exception):
+        if not outcome.confirmed:
+            _add_note(exc, _unresolved_cleanup_message("startup was interrupted; the", outcome))
+        raise exc
 
     try:
         supervisor.record_external_failure(state, exc=exc, phase=state.phase)
@@ -297,73 +411,83 @@ def _startup_failure(
         # prefer surfacing it (it means the operator has no durable record
         # to resume from), but never let it hide an unresolved cleanup
         # failure.
-        if cleanup_error is not None:
-            result = RuntimeError_(
+        if not outcome.confirmed:
+            message = (
                 f"failed to start OpenCode server: {exc}; additionally, the failure "
                 f"could not be persisted ({persist_exc}); additionally, OpenCode "
-                f"server cleanup could not be confirmed ({cleanup_error}) — the "
+                f"server cleanup could not be confirmed ({outcome.last_error}) — the "
                 "repository lock has been retained; verify no OpenCode process "
                 "survives before using --recover-stale-lock"
             )
         else:
-            result = RuntimeError_(
+            message = (
                 f"failed to start OpenCode server: {exc}; additionally, the failure "
                 f"could not be persisted ({persist_exc})"
             )
-        result.__cause__ = exc
-        return result
+        result = RuntimeError_(message)
+        _add_note(result, f"persistence failure: {persist_exc}")
+        if not outcome.confirmed:
+            _add_note(result, _unresolved_cleanup_message("startup failed and the", outcome))
+        raise result from exc
 
-    if cleanup_error is not None:
-        result = RuntimeError_(
+    if not outcome.confirmed:
+        message = (
             f"failed to start OpenCode server: {exc}; additionally, OpenCode server "
-            f"cleanup could not be confirmed ({cleanup_error}) — the repository lock "
+            f"cleanup could not be confirmed ({outcome.last_error}) — the repository lock "
             "has been retained; verify no OpenCode process survives before using "
             "--recover-stale-lock"
         )
-        result.__cause__ = exc
-        return result
+        result = RuntimeError_(message)
+        _add_note(result, _unresolved_cleanup_message("startup failed and the", outcome))
+        raise result from exc
 
-    return RuntimeError_(f"failed to start OpenCode server: {exc}")
+    raise RuntimeError_(f"failed to start OpenCode server: {exc}") from exc
 
 
 def _run_and_stop(
     supervisor: Supervisor, state: RunState, server: OpenCodeServer, lease: _LockLease
 ) -> RunState:
-    """Run the supervisor loop and always attempt to stop the server
-    afterward, without letting a server.stop() cleanup failure mask a
-    primary exception (or result) from supervisor.run().
+    """Hand the started server to the supervisor, run the supervisor loop,
+    and always attempt bounded, confirmed server-stop cleanup afterward,
+    without letting a cleanup failure mask a primary exception (or
+    result) from the runner handoff or supervisor.run().
+
+    The runner handoff (`supervisor.runner = server`) happens inside this
+    function's protected boundary rather than in run_new()/run_resume(),
+    so a failure raised by the assignment itself (e.g. a property setter
+    that validates its argument) is treated exactly like a run failure:
+    the started server is still cleaned up and the lock lease is only
+    marked releasable once that cleanup is confirmed.
 
     server.stop() can raise OpenCodeCleanupError/ExceptionGroup if one or
     more of its own cleanup stages failed (see OpenCodeServer.stop());
-    that must never silently replace a real run failure, since the run's
-    own outcome is far more actionable than a secondary process-cleanup
-    detail — but a failed stop() also means the lock lease must remain
-    unreleasable (see mark_unreleasable() in run_new()/run_resume()), so
-    the lock is retained on disk rather than released while an OpenCode
-    process may still be alive. The lease is only marked releasable again
-    once stop() is confirmed to succeed, regardless of whether
-    supervisor.run() itself succeeded or raised.
+    that must never silently replace a real primary failure, since the
+    primary's own outcome is far more actionable than a secondary
+    process-cleanup detail — but a failed stop() also means the lock
+    lease must remain unreleasable (see mark_unreleasable() in
+    run_new()/run_resume()), so the lock is retained on disk rather than
+    released while an OpenCode process may still be alive. The lease is
+    only marked releasable again once stop() is confirmed to succeed,
+    regardless of whether the runner handoff/supervisor.run() itself
+    succeeded or raised. A KeyboardInterrupt/SystemExit raised by cleanup
+    itself never replaces a pending primary exception; it is described
+    only in a note attached to that primary.
     """
     try:
+        supervisor.runner = server
         final = supervisor.run(state)
-    except BaseException:
-        try:
-            server.stop()
-        except Exception:
-            pass
-        else:
+    except BaseException as exc:
+        outcome = _confirm_server_stopped(server)
+        if outcome.confirmed:
             lease.mark_releasable()
+        else:
+            _add_note(exc, _unresolved_cleanup_message("the run failed and the", outcome))
         raise
-    try:
-        server.stop()
-    except Exception as exc:
-        raise RuntimeError_(
-            f"run completed but OpenCode server cleanup could not be confirmed "
-            f"({exc}) — the repository lock has been retained; verify no OpenCode "
-            "process survives before using --recover-stale-lock"
-        ) from exc
-    else:
-        lease.mark_releasable()
+
+    outcome = _confirm_server_stopped(server)
+    if not outcome.confirmed:
+        _raise_unresolved_cleanup("run completed but", outcome)
+    lease.mark_releasable()
     return final
 
 

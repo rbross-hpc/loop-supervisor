@@ -642,8 +642,12 @@ class OpenCodeServer:
             if primary is not None:
                 try:
                     self.stop()
-                except Exception as cleanup_error:
-                    primary.add_note(f"additionally, startup cleanup failed: {cleanup_error}")
+                except BaseException as cleanup_error:  # noqa: BLE001 - must never replace primary
+                    _add_cleanup_note(
+                        primary,
+                        "additionally, startup cleanup failed: ",
+                        cleanup_error,
+                    )
                 raise primary
 
     def _read_launcher_event(
