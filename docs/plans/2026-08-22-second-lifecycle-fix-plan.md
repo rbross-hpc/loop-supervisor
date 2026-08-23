@@ -357,7 +357,78 @@ these fixes must uphold and extend.
       full `pytest -q` 648 passed across three consecutive clean runs;
       `ruff check .`, `ruff format --check .`, `mypy src`, and
       `git diff --check` clean. Step 1/2/4 semantics were not touched.
-      **Findings 3–4 remain unresolved; this step is not complete.**
+
+      A further independent read-only audit of that remediation (scoped to
+      findings 1–2 only) returned **NO-GO** again, finding two remaining
+      defects:
+
+      1. `runtime._startup_failure()`'s direct-`BaseException` bare
+         `raise` (the former `runtime.py:444`) was still called *from*
+         `run_new()`/`run_resume()`'s own `except BaseException as exc:`
+         block rather than executed directly inside it. Calling any
+         function from within an active `except` clause and having that
+         function bare-`raise` does re-raise the exact same exception
+         object, but it still appends the caller's own call-site frame to
+         the traceback on unwind — so `run_new()`/`run_resume()` ended up
+         appearing *twice* in the traceback (once at the original
+         `server.start()` call site, once at the `_startup_failure(...)`
+         call site), which is not "exact traceback preservation." Prior
+         tests only asserted `"_startup_failure" not in frame_names`,
+         which cannot detect a duplicated caller frame.
+      2. `OpenCodeServer.start()`'s `OSError`→`ServerStartupError`
+         normalization (`opencode.py:604-609`) formatted the caught
+         `OSError` directly into an f-string before `_safe_exception_text`
+         existed in that branch; an `OSError` subclass with a throwing
+         `__str__` caused the f-string formatting itself to raise,
+         escaping as that formatting exception (losing both the
+         `ServerStartupError` wrapping and exact `__cause__` identity).
+         This finding is `opencode.py`-specific and tracked separately;
+         it is **not** addressed by this entry (see below) — only the
+         `runtime.py` traceback-duplication finding (1) is in scope here.
+
+      Finding (1) was remediated on
+      `fix/step3-runtime-traceback-preservation` (scope limited to the
+      `runtime.py` traceback-duplication defect only):
+
+      - `run_new()`/`run_resume()` now branch on `isinstance(exc,
+        Exception)` themselves, directly inside their own `except
+        BaseException as exc:` block. For a direct `BaseException`, a new
+        non-raising helper, `_finalize_interrupted_startup()`, performs
+        cleanup confirmation, lease bookkeeping, and retained-lock note
+        attachment (never raising or touching `exc`'s identity), and the
+        bare `raise` immediately follows it — executed literally inside
+        `run_new()`/`run_resume()`'s own `except` clause, not inside any
+        called function — so no frame is added at all and `run_new()`/
+        `run_resume()` appears exactly once in the resulting traceback,
+        at the original `server.start()` call site.
+      - `_startup_failure()`'s signature and type annotation were
+        narrowed to `exc: Exception` (from `BaseException`), its
+        direct-`BaseException` branch and dead `raise` were removed, and
+        its docstring now states callers must route non-`Exception`
+        `BaseException`s through `_finalize_interrupted_startup()`
+        instead. All ordinary-`Exception` persistence/cleanup/
+        `RuntimeError_`-wrapping behavior is unchanged.
+
+      Added a `_assert_exact_startup_traceback()` test helper (asserts
+      the entry function appears exactly once, at the exact original
+      `server.start()` call-site line number, with the traceback's
+      deepest frame being the fake server's `start()`) and used it in a
+      new `run_resume()` traceback test and a new `SystemExit` traceback
+      test, alongside the existing (strengthened)
+      `KeyboardInterrupt`/`run_new()` traceback test and the existing
+      unresolved-cleanup-note test. Each new/strengthened test was
+      confirmed to fail against the prior implementation (duplicate
+      `run_new`/`run_resume` frame detected) before the fix and pass
+      after it. Verification after this remediation: `test_runtime.py`/
+      `test_opencode.py`/`test_cli_runtime.py` 204 passed; full
+      `pytest -q` 650 passed across three consecutive clean runs; `ruff
+      check .`, `ruff format --check .`, `mypy src`, and `git diff
+      --check` clean. `opencode.py` was not touched by this remediation.
+
+      **Findings 3–4 (backoff interruption precedence, cleanup-interrupt
+      retry/exhaustion edge cases) and the `opencode.py` unprintable-
+      `OSError` finding above remain unresolved; this step is not
+      complete.**
 - [x] Step 4 — TUI ownership registry (blocker 2). Implemented on
       `fix/tui-ownership-registry`. `LoopSupervisorApp` now maintains an
       authoritative `_owned_run_screens` registry, populated in

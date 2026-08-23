@@ -314,6 +314,18 @@ def run_new(
         try:
             server.start()
         except BaseException as exc:
+            if not isinstance(exc, Exception):
+                # A direct BaseException (KeyboardInterrupt, SystemExit, or
+                # any other non-Exception) must propagate with its exact
+                # original identity and traceback (see ADR 0009). The bare
+                # `raise` below executes directly in this `except` clause
+                # — the one still actively handling `exc` — rather than in
+                # a called helper, so no additional frame is added to the
+                # traceback the caller observes. _finalize_interrupted_startup
+                # only performs cleanup confirmation/lease/note bookkeeping
+                # and never itself raises or re-raises `exc`.
+                _finalize_interrupted_startup(server, lease, exc)
+                raise
             _startup_failure(supervisor, state, server, lease, exc)
 
         final = _run_and_stop(supervisor, state, server, lease)
@@ -388,6 +400,12 @@ def run_resume(
         try:
             server.start()
         except BaseException as exc:
+            if not isinstance(exc, Exception):
+                # See the matching comment in run_new(): this bare `raise`
+                # must execute here, in the `except` clause still actively
+                # handling `exc`, to preserve its exact traceback.
+                _finalize_interrupted_startup(server, lease, exc)
+                raise
             _startup_failure(supervisor, state, server, lease, exc)
 
         final = _run_and_stop(supervisor, state, server, lease)
@@ -395,17 +413,53 @@ def run_resume(
     return final
 
 
+def _finalize_interrupted_startup(
+    server: OpenCodeServer, lease: _LockLease, exc: BaseException
+) -> None:
+    """Perform cleanup confirmation, lease bookkeeping, and note
+    attachment for a direct `BaseException` (not an `Exception` subclass)
+    raised from `server.start()`. Never raises or re-raises `exc` itself
+    — the caller (run_new()/run_resume()) is responsible for the actual
+    bare `raise` immediately after calling this, from within its own
+    `except` clause, so `exc`'s exact identity and traceback are
+    preserved unchanged (no frame from this helper, or from a shared
+    `_startup_failure()`, is ever added).
+
+    Bounded stop() retries here are defense in depth: they are the only
+    way this function can confirm (rather than assume) that no OpenCode
+    process survives before it is safe to mark the lease releasable
+    again. If cleanup remains unresolved after every retry, the lease is
+    left unreleasable and a retained-lock note is attached to `exc`
+    directly (never replacing it) so the operator learns cleanup could
+    not be confirmed.
+    """
+    outcome = _confirm_server_stopped(server)
+    if outcome.confirmed:
+        lease.mark_releasable()
+    else:
+        _add_note(exc, _unresolved_cleanup_message("startup was interrupted; the", outcome))
+
+
 def _startup_failure(
     supervisor: Supervisor,
     state: RunState,
     server: OpenCodeServer,
     lease: _LockLease,
-    exc: BaseException,
+    exc: Exception,
 ) -> NoReturn:
-    """Handle a failure raised from server.start(), persisting the
-    operational failure (for ordinary exceptions only) and deciding
-    whether the lock lease may be marked releasable again. Always raises;
-    never returns.
+    """Handle an ordinary Exception raised from server.start(), persisting
+    the operational failure and deciding whether the lock lease may be
+    marked releasable again. Always raises; never returns.
+
+    Callers (run_new()/run_resume()) must only reach this function for
+    `exc` values that are `Exception` subclasses. A direct `BaseException`
+    (KeyboardInterrupt, SystemExit, or any other non-Exception) must never
+    be routed here: it is handled entirely by the caller itself, via
+    _finalize_interrupted_startup() followed immediately by a bare
+    `raise` in the caller's own `except` clause, so its exact identity
+    and traceback are preserved with no frame from this function (or any
+    other called helper) ever added. See _finalize_interrupted_startup()
+    for that path.
 
     server.start() already terminates the process and releases its own
     resources on any failure past subprocess creation, but that guarantee
@@ -418,30 +472,10 @@ def _startup_failure(
     left unreleasable and the lock is retained on disk for explicit
     stale-lock recovery once the operator has verified no OpenCode
     process remains.
-
-    KeyboardInterrupt, SystemExit, and any other direct BaseException
-    (not an Exception subclass) are never persisted as operational
-    failures and are always re-raised unchanged via a bare `raise` —
-    executed here while `exc` is still the exception actively being
-    handled in the caller's `except` clause (run_new()/run_resume() call
-    this function from inside their own `except BaseException as exc:`
-    block), so this is a true bare re-raise of the original exception
-    object, not a redispatch that would add this function's own frame to
-    its traceback. Its exact identity and traceback are therefore
-    preserved unchanged — it is never wrapped in RuntimeError_. Cleanup
-    notes are attached only if cleanup remains unresolved. A
-    KeyboardInterrupt/SystemExit raised by cleanup itself is never
-    re-raised in place of the startup primary; it is only described in
-    the retained-lock note/message.
     """
     outcome = _confirm_server_stopped(server)
     if outcome.confirmed:
         lease.mark_releasable()
-
-    if not isinstance(exc, Exception):
-        if not outcome.confirmed:
-            _add_note(exc, _unresolved_cleanup_message("startup was interrupted; the", outcome))
-        raise
 
     exc_text = _safe_exception_text(exc)
     try:
