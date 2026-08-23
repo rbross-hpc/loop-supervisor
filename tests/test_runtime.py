@@ -1362,11 +1362,38 @@ def test_run_new_startup_keyboard_interrupt_preserves_identity(tmp_path):
     assert state.phase != "operational_failure"
 
 
+def _traceback_frames(exc: BaseException):
+    tb = exc.__traceback__
+    while tb is not None:
+        yield tb
+        tb = tb.tb_next
+
+
+def _assert_exact_startup_traceback(
+    exc: BaseException, *, entry_func: str, entry_lineno: int, tail_func: str
+) -> None:
+    """Assert that `exc`'s traceback contains exactly one frame for
+    `entry_func` (the run_new()/run_resume() function whose
+    `server.start()` call originally raised), at exactly `entry_lineno`
+    (the line of that `server.start()` call, not a later line such as a
+    `_startup_failure(...)`/`_finalize_interrupted_startup(...)` call
+    site), and that its final (deepest) frame is `tail_func` (the fake
+    server's `start()`). This distinguishes a true bare re-raise (which
+    adds no frame at all) from a redispatch via `raise exc`/a helper call
+    (which would either duplicate `entry_func` at a later line or insert
+    an extra frame for the helper itself)."""
+    frames = [(tb.tb_frame.f_code.co_name, tb.tb_lineno) for tb in _traceback_frames(exc)]
+    entry_frames = [(name, lineno) for name, lineno in frames if name == entry_func]
+    assert entry_frames == [(entry_func, entry_lineno)], frames
+    assert frames[-1][0] == tail_func, frames
+
+
 def test_run_new_startup_keyboard_interrupt_preserves_exact_traceback(tmp_path):
     """A KeyboardInterrupt raised from server.start() must propagate with
-    its original traceback: no frame from _startup_failure's own bare
-    `raise` may be inserted, since that would mean the exception was
-    redispatched (`raise exc`) rather than truly bare re-raised."""
+    its original traceback: no frame from _startup_failure,
+    _finalize_interrupted_startup, or a redispatching `raise exc` may be
+    inserted, and run_new() must appear exactly once, at its original
+    `server.start()` call site."""
     import pytest
 
     _init_repo(tmp_path / "repo")
@@ -1393,12 +1420,65 @@ def test_run_new_startup_keyboard_interrupt_preserves_exact_traceback(tmp_path):
         with pytest.raises(KeyboardInterrupt) as excinfo:
             run_new(tmp_path / "repo", _make_options())
         assert excinfo.value is the_interrupt
-        frame_names = []
-        tb = excinfo.value.__traceback__
-        while tb is not None:
-            frame_names.append(tb.tb_frame.f_code.co_name)
-            tb = tb.tb_next
+        frame_names = [tb.tb_frame.f_code.co_name for tb in _traceback_frames(excinfo.value)]
         assert "_startup_failure" not in frame_names, frame_names
+        assert "_finalize_interrupted_startup" not in frame_names, frame_names
+        _assert_exact_startup_traceback(
+            excinfo.value, entry_func="run_new", entry_lineno=315, tail_func="start"
+        )
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+
+def test_run_resume_startup_keyboard_interrupt_preserves_exact_traceback(tmp_path):
+    """The run_resume() counterpart of the above: the bare `raise` inside
+    run_resume()'s own `except` clause must not add a duplicate
+    `run_resume` frame at the `_finalize_interrupted_startup(...)`/
+    `_startup_failure(...)` call site."""
+    import pytest
+
+    from loop_supervisor.supervisor import Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    supervisor = Supervisor(
+        repo=repo,
+        runner=MagicMock(),
+        git_common_dir=repo.common_dir(),
+        input_provider=MagicMock(),
+        options=_make_options(),
+    )
+    state = supervisor.start_new_run()
+    run_id = state.run_id
+
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+    the_interrupt = KeyboardInterrupt()
+
+    class InterruptingServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            raise the_interrupt
+
+        def stop(self) -> None:
+            pass
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    rt.OpenCodeServer = InterruptingServer
+    try:
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            run_resume(tmp_path / "repo", run_id)
+        assert excinfo.value is the_interrupt
+        frame_names = [tb.tb_frame.f_code.co_name for tb in _traceback_frames(excinfo.value)]
+        assert "_startup_failure" not in frame_names, frame_names
+        assert "_finalize_interrupted_startup" not in frame_names, frame_names
+        _assert_exact_startup_traceback(
+            excinfo.value, entry_func="run_resume", entry_lineno=401, tail_func="start"
+        )
     finally:
         rt.OpenCodeServer = original_oc_server
 
@@ -1430,6 +1510,46 @@ def test_run_new_startup_system_exit_preserves_identity(tmp_path):
         with pytest.raises(SystemExit) as excinfo:
             run_new(tmp_path / "repo", _make_options())
         assert excinfo.value is the_exit
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+
+def test_run_new_startup_system_exit_preserves_exact_traceback(tmp_path):
+    """SystemExit must be preserved with the same exact-traceback
+    guarantee as KeyboardInterrupt: both are direct BaseExceptions
+    handled by the same run_new()/_finalize_interrupted_startup() path."""
+    import pytest
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+    the_exit = SystemExit(2)
+
+    class ExitingServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            raise the_exit
+
+        def stop(self) -> None:
+            pass
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    rt.OpenCodeServer = ExitingServer
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            run_new(tmp_path / "repo", _make_options())
+        assert excinfo.value is the_exit
+        frame_names = [tb.tb_frame.f_code.co_name for tb in _traceback_frames(excinfo.value)]
+        assert "_startup_failure" not in frame_names, frame_names
+        assert "_finalize_interrupted_startup" not in frame_names, frame_names
+        _assert_exact_startup_traceback(
+            excinfo.value, entry_func="run_new", entry_lineno=315, tail_func="start"
+        )
     finally:
         rt.OpenCodeServer = original_oc_server
 
@@ -1466,6 +1586,12 @@ def test_run_new_startup_keyboard_interrupt_with_unresolved_cleanup_has_note(tmp
         with pytest.raises(KeyboardInterrupt) as excinfo:
             run_new(tmp_path / "repo", _make_options())
         assert excinfo.value is the_interrupt
+        frame_names = [tb.tb_frame.f_code.co_name for tb in _traceback_frames(excinfo.value)]
+        assert "_startup_failure" not in frame_names, frame_names
+        assert "_finalize_interrupted_startup" not in frame_names, frame_names
+        _assert_exact_startup_traceback(
+            excinfo.value, entry_func="run_new", entry_lineno=315, tail_func="start"
+        )
     finally:
         rt.OpenCodeServer = original_oc_server
 
