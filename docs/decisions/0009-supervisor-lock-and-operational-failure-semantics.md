@@ -64,6 +64,44 @@ what propagates; the cleanup failure is attached as additional context
 (e.g. appended to the exception message) rather than replacing it. This
 holds in both the headless runtime and the TUI.
 
+This precedence applies to the *complete* outcome of an operation, not
+just its first failure point. In `OpenCodeServer.create_session()`,
+`send_prompt()`, and `_abort_session_bounded()`, the primary outcome is
+not decided until every stage of the request has been evaluated in
+full — transport failure or success, HTTP status, JSON decoding,
+response-shape/session-ID validation, and (for `send_prompt()`)
+assistant-error and text/structured-output extraction. Only once that
+complete outcome is known is the request-local `httpx.Client` closed,
+via a dedicated daemon thread bounded by `_CLIENT_CLOSE_TIMEOUT_SECONDS`
+so a hung or slow `close()` can never reintroduce an unbounded wait. A
+close failure or timeout is attached to the already-decided primary
+exception as a note (`add_note()`) and never replaces it, including when
+the primary is itself a translated `httpx` exception carried as
+`__cause__`, an `HTTPStatusError`-equivalent `AgentInvocationError`, or a
+non-transport failure such as an assistant error discovered only after
+full JSON decoding. If the request succeeds and only the close fails or
+times out, that unconfirmed close is itself raised as
+`OpenCodeCleanupError` (there is no primary to preserve). The same
+precedence governs `OpenCodeServer.__exit__()`: a cleanup failure from
+`stop()` — including `BaseException` subclasses such as
+`KeyboardInterrupt`/`SystemExit` raised during cleanup itself — is
+attached as a note to a pending body exception and never replaces it;
+with no body exception, `stop()`'s own failure propagates unchanged.
+
+The shared, long-lived control client tracked directly on
+`OpenCodeServer` (as opposed to the short-lived, request-local clients
+above) has its own bounded-close ownership state in `stop()`: at most
+one `_BoundedCloseAttempt` is ever in flight for that client at a time.
+A `stop()` call that finds an existing in-progress attempt for the same
+client re-waits on it rather than starting a second concurrent
+`close()`; a `stop()` that fails to even start a close (construction or
+thread-start failure) retains the client for a later retry; a completed
+close exception clears the attempt (permitting one retry) while
+retaining the client; a completed close success clears both. `start()`
+remains rejected while either the client or its close attempt is
+unresolved, so a new lifecycle can never begin while a prior one's
+cleanup is still outstanding.
+
 **TUI app-level exit retries indefinitely until cleanup is confirmed
 clean.** `LoopSupervisorApp._on_exit_app()` requests shutdown on every
 active `RunScreen`, awaits completion, and — if any screen's
