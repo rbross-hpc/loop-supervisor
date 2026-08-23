@@ -143,6 +143,73 @@ def test_missing_executable_raises_startup_error(tmp_path):
         server.start()
 
 
+def test_popen_permission_error_normalized_to_startup_error(tmp_path, monkeypatch):
+    """A PermissionError raised directly by subprocess.Popen() (not just
+    FileNotFoundError) must be normalized to ServerStartupError, with the
+    exact PermissionError object preserved as __cause__."""
+    import subprocess as _subprocess
+
+    config = OpenCodeServerConfig(executable="opencode")
+    server = OpenCodeServer(tmp_path, config)
+
+    the_error = PermissionError("simulated EACCES")
+
+    def _boom_popen(*a, **kw):
+        raise the_error
+
+    monkeypatch.setattr(_subprocess, "Popen", _boom_popen)
+    with pytest.raises(ServerStartupError) as excinfo:
+        server.start()
+    assert excinfo.value.__cause__ is the_error
+
+
+def test_popen_generic_oserror_normalized_to_startup_error(tmp_path, monkeypatch):
+    """A generic OSError subclass raised by subprocess.Popen() must also
+    be normalized to ServerStartupError with exact cause identity, not
+    just FileNotFoundError/PermissionError."""
+    import subprocess as _subprocess
+
+    config = OpenCodeServerConfig(executable="opencode")
+    server = OpenCodeServer(tmp_path, config)
+
+    the_error = OSError("simulated generic OSError")
+
+    def _boom_popen(*a, **kw):
+        raise the_error
+
+    monkeypatch.setattr(_subprocess, "Popen", _boom_popen)
+    with pytest.raises(ServerStartupError) as excinfo:
+        server.start()
+    assert excinfo.value.__cause__ is the_error
+
+
+def test_startup_cleanup_keyboard_interrupt_does_not_replace_primary(tmp_path, monkeypatch):
+    """If OpenCodeServer.start()'s own internal defense-in-depth stop()
+    raises KeyboardInterrupt during startup-failure cleanup, the original
+    startup primary must still be what propagates (annotated with a
+    note), never replaced by the cleanup-time interrupt."""
+    config = _argv_config(FAKE_OPENCODE_MODE="never_ready")
+    config.startup_timeout = 1.0
+    server = _FakeServer(tmp_path, config)
+
+    original_stop = OpenCodeServer.stop
+
+    def _boom_stop(self):
+        # Still perform the real cleanup (so the launcher/process this
+        # test actually spawned is not leaked), but report failure to
+        # the caller exactly as if cleanup itself had raised
+        # KeyboardInterrupt.
+        original_stop(self)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(OpenCodeServer, "stop", _boom_stop)
+    with pytest.raises(ServerStartupError) as excinfo:
+        server.start()
+
+    notes = getattr(excinfo.value, "__notes__", [])
+    assert any("startup cleanup failed" in n for n in notes), notes
+
+
 def test_run_agent_returns_structured_output_as_text(tmp_path):
     response = {"status": "COMPLETE"}
     config = _argv_config(

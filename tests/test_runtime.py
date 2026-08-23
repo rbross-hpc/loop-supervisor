@@ -1003,3 +1003,710 @@ def test_run_new_relative_project_path_uses_canonical_lock_metadata(tmp_path, mo
     record = captured["record"]
     assert record["integration_path"] == str(repo.root)
     assert Path(record["integration_path"]).is_absolute()
+
+
+# --- Step 3: headless cleanup completeness -----------------------------
+
+
+def _flaky_stop_server(*, fail_times: int, stop_exc_factory=None):
+    """Build an OpenCodeServer stand-in whose stop() fails `fail_times`
+    times (raising RuntimeError by default, or whatever
+    `stop_exc_factory()` returns) and then succeeds, recording every
+    stop() call in `.stop_calls`."""
+
+    class FlakyStopServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+            self.stop_calls = 0
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            if self.stop_calls <= fail_times:
+                if stop_exc_factory is not None:
+                    raise stop_exc_factory()
+                raise RuntimeError(f"simulated transient stop failure #{self.stop_calls}")
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    return FlakyStopServer
+
+
+def test_confirm_server_stopped_retries_exact_count_and_backoff(monkeypatch):
+    """_confirm_server_stopped must retry up to _CLEANUP_ATTEMPTS times
+    with the documented bounded backoff between attempts."""
+    import loop_supervisor.runtime as rt
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(rt.time, "sleep", lambda s: sleeps.append(s))
+
+    class AlwaysFailsServer:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            raise RuntimeError(f"fail {self.stop_calls}")
+
+    server = AlwaysFailsServer()
+    outcome = rt._confirm_server_stopped(server)
+
+    assert outcome.confirmed is False
+    assert outcome.attempts == rt._CLEANUP_ATTEMPTS
+    assert server.stop_calls == rt._CLEANUP_ATTEMPTS
+    assert sleeps == [
+        rt._CLEANUP_BACKOFF_SECONDS * (i + 1) for i in range(rt._CLEANUP_ATTEMPTS - 1)
+    ]
+
+
+def test_confirm_server_stopped_succeeds_after_transient_failures(monkeypatch):
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    Server = _flaky_stop_server(fail_times=rt._CLEANUP_ATTEMPTS - 1)
+    server = Server()
+    outcome = rt._confirm_server_stopped(server)
+
+    assert outcome.confirmed is True
+    assert outcome.last_error is None
+    assert server.stop_calls == rt._CLEANUP_ATTEMPTS
+
+
+def test_confirm_server_stopped_never_discards_server_handle(monkeypatch):
+    """Every retry attempt must call stop() again on the exact same
+    server instance -- the handle must never be dropped/replaced between
+    attempts."""
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    seen_instances: list[int] = []
+
+    class TrackedServer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stop(self) -> None:
+            seen_instances.append(id(self))
+            self.calls += 1
+            if self.calls < rt._CLEANUP_ATTEMPTS:
+                raise RuntimeError("transient")
+
+    server = TrackedServer()
+    outcome = rt._confirm_server_stopped(server)
+    assert outcome.confirmed is True
+    assert len(set(seen_instances)) == 1
+    assert seen_instances[0] == id(server)
+
+
+def test_run_new_startup_transient_stop_failure_then_success_releases_lock(tmp_path, monkeypatch):
+    """A startup failure whose defense-in-depth stop() retry fails once
+    and then succeeds must still confirm cleanup and release the lock."""
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.opencode import ServerStartupError
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    original_oc_server = rt.OpenCodeServer
+
+    Server = _flaky_stop_server(fail_times=1)
+
+    class FailingStartServer(Server):
+        def start(self) -> None:
+            raise ServerStartupError("simulated startup failure")
+
+    rt.OpenCodeServer = FailingStartServer
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected RuntimeError_ to be raised")
+        except RuntimeError_:
+            pass
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_run_new_startup_failure_retry_exhaustion_retains_lock(tmp_path, monkeypatch):
+    """A startup failure whose defense-in-depth stop() retries are all
+    exhausted must retain the lock and mention unresolved cleanup."""
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.opencode import ServerStartupError
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    original_oc_server = rt.OpenCodeServer
+
+    class FailingEverythingServer:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        def start(self) -> None:
+            raise ServerStartupError("simulated startup failure")
+
+        def stop(self) -> None:
+            raise RuntimeError("simulated cleanup-retry failure")
+
+    rt.OpenCodeServer = FailingEverythingServer
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected RuntimeError_ to be raised")
+        except RuntimeError_ as exc:
+            assert "cleanup could not be confirmed" in str(exc)
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+    assert _lock_path(repo.common_dir()).exists()
+
+
+def test_run_new_startup_keyboard_interrupt_preserves_identity(tmp_path):
+    """A KeyboardInterrupt raised from server.start() must propagate as
+    the exact same object, never wrapped in RuntimeError_, and must not
+    be persisted as an operational failure."""
+    import pytest
+
+    from loop_supervisor.state import load_state
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+    the_interrupt = KeyboardInterrupt()
+
+    class InterruptingServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            raise the_interrupt
+
+        def stop(self) -> None:
+            pass
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    rt.OpenCodeServer = InterruptingServer
+    try:
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            run_new(tmp_path / "repo", _make_options())
+        assert excinfo.value is the_interrupt
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+    runs = list_run_ids(tmp_path / "repo")
+    assert len(runs) == 1
+    state = load_state(repo.common_dir(), runs[0])
+    # Startup KeyboardInterrupt must not be recorded as an operational
+    # failure: the run remains at its pre-startup phase.
+    assert state.phase != "operational_failure"
+
+
+def test_run_new_startup_system_exit_preserves_identity(tmp_path):
+    import pytest
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+    the_exit = SystemExit(2)
+
+    class ExitingServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            raise the_exit
+
+        def stop(self) -> None:
+            pass
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    rt.OpenCodeServer = ExitingServer
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            run_new(tmp_path / "repo", _make_options())
+        assert excinfo.value is the_exit
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+
+def test_run_new_startup_keyboard_interrupt_with_unresolved_cleanup_has_note(tmp_path):
+    """If cleanup retries are exhausted after a startup KeyboardInterrupt,
+    the exact interrupt object must still propagate, with a retained-lock
+    note attached (not replaced by a RuntimeError_)."""
+    import pytest
+
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+    the_interrupt = KeyboardInterrupt()
+
+    class InterruptingServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            raise the_interrupt
+
+        def stop(self) -> None:
+            raise RuntimeError("simulated cleanup failure")
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    rt.OpenCodeServer = InterruptingServer
+    try:
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            run_new(tmp_path / "repo", _make_options())
+        assert excinfo.value is the_interrupt
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+    notes = getattr(the_interrupt, "__notes__", [])
+    assert any("cleanup" in n.lower() and "retained" in n.lower() for n in notes), notes
+    assert _lock_path(repo.common_dir()).exists()
+
+
+def test_run_new_runner_assignment_failure_still_cleans_started_server(tmp_path):
+    """If the runner-assignment step itself raises, the started server
+    must still be cleaned up and the lock lease governed exactly like a
+    run failure."""
+    from loop_supervisor.supervisor import LoopError, Supervisor
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+    call_log: list[str] = []
+
+    class RecordingServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            call_log.append("server_start")
+
+        def stop(self) -> None:
+            call_log.append("server_stop")
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    class BoomOnRunnerSupervisor(Supervisor):
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, value):
+            if getattr(value, "base_url", None) is not None:
+                raise LoopError("simulated runner-assignment failure")
+            self._runner = value
+
+    rt.OpenCodeServer = RecordingServer
+    original_supervisor = rt.Supervisor
+    rt.Supervisor = BoomOnRunnerSupervisor
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected LoopError to be raised")
+        except LoopError:
+            pass
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        rt.Supervisor = original_supervisor
+
+    assert "server_start" in call_log
+    assert "server_stop" in call_log
+
+
+def test_run_new_successful_run_transient_cleanup_failure_then_success(tmp_path, monkeypatch):
+    """A successful run whose stop() fails transiently and then succeeds
+    on retry must confirm cleanup and release the lock without operator
+    action."""
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.supervisor import Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    original_oc_server = rt.OpenCodeServer
+    Server = _flaky_stop_server(fail_times=1)
+
+    original_run = Supervisor.run
+
+    def _fake_run(self, state):
+        state.phase = "done"
+        return state
+
+    rt.OpenCodeServer = Server
+    Supervisor.run = _fake_run
+    try:
+        run_new(tmp_path / "repo", _make_options())
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_run_new_successful_run_cleanup_exhaustion_retains_lock(tmp_path, monkeypatch):
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.runtime import RuntimeError_
+    from loop_supervisor.supervisor import Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    original_oc_server = rt.OpenCodeServer
+    Server = _flaky_stop_server(fail_times=999)
+
+    original_run = Supervisor.run
+
+    def _fake_run(self, state):
+        state.phase = "done"
+        return state
+
+    rt.OpenCodeServer = Server
+    Supervisor.run = _fake_run
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected RuntimeError_ to be raised")
+        except RuntimeError_ as exc:
+            assert "cleanup could not be confirmed" in str(exc)
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+    assert _lock_path(repo.common_dir()).exists()
+
+
+def test_run_new_failed_run_transient_cleanup_failure_then_success(tmp_path, monkeypatch):
+    """A failed supervisor.run() whose stop() retry succeeds after one
+    transient failure must release the lock even though the run itself
+    failed (the run failure still propagates)."""
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.supervisor import LoopError, Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    original_oc_server = rt.OpenCodeServer
+    Server = _flaky_stop_server(fail_times=1)
+
+    original_run = Supervisor.run
+
+    def _boom_run(self, state):
+        raise LoopError("simulated supervisor failure")
+
+    rt.OpenCodeServer = Server
+    Supervisor.run = _boom_run
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected LoopError to be raised")
+        except LoopError:
+            pass
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_run_new_failed_run_cleanup_exhaustion_retains_exact_primary_with_notes(
+    tmp_path, monkeypatch
+):
+    """A failed supervisor.run() whose cleanup retries are all exhausted
+    must still raise the exact original run exception (not a wrapped
+    RuntimeError_), with a retained-lock note attached, and the lock must
+    remain on disk."""
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.supervisor import LoopError, Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    original_oc_server = rt.OpenCodeServer
+    Server = _flaky_stop_server(fail_times=999)
+
+    original_run = Supervisor.run
+    the_failure = LoopError("simulated supervisor failure")
+
+    def _boom_run(self, state):
+        raise the_failure
+
+    rt.OpenCodeServer = Server
+    Supervisor.run = _boom_run
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected LoopError to be raised")
+        except LoopError as exc:
+            assert exc is the_failure
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+    notes = getattr(the_failure, "__notes__", [])
+    assert any("cleanup" in n.lower() and "retained" in n.lower() for n in notes), notes
+    assert _lock_path(repo.common_dir()).exists()
+
+
+def test_run_new_run_time_keyboard_interrupt_preserves_identity(tmp_path):
+    import pytest
+
+    from loop_supervisor.supervisor import Supervisor
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+
+    class RecordingServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    original_run = Supervisor.run
+    the_interrupt = KeyboardInterrupt()
+
+    def _boom_run(self, state):
+        raise the_interrupt
+
+    rt.OpenCodeServer = RecordingServer
+    Supervisor.run = _boom_run
+    try:
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            run_new(tmp_path / "repo", _make_options())
+        assert excinfo.value is the_interrupt
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+
+def test_run_new_cleanup_time_keyboard_interrupt_does_not_replace_primary(tmp_path):
+    """If supervisor.run() raises an ordinary failure AND server.stop()
+    itself raises KeyboardInterrupt during cleanup, the original run
+    failure must still be what propagates -- the cleanup-time interrupt
+    must never replace it."""
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.supervisor import LoopError, Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+
+    class InterruptingStopServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            raise KeyboardInterrupt()
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    original_run = Supervisor.run
+    the_failure = LoopError("simulated supervisor failure")
+
+    def _boom_run(self, state):
+        raise the_failure
+
+    rt.OpenCodeServer = InterruptingStopServer
+    Supervisor.run = _boom_run
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected LoopError to be raised")
+        except LoopError as exc:
+            assert exc is the_failure
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+    assert _lock_path(repo.common_dir()).exists()
+
+
+def test_run_new_persistence_failure_plus_cleanup_failure(tmp_path, monkeypatch):
+    """If both record_external_failure() and stop() fail during a
+    startup failure, the resulting message must mention both the
+    persistence failure and the unresolved cleanup, and the lock must be
+    retained."""
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.opencode import ServerStartupError
+    from loop_supervisor.runtime import RuntimeError_
+    from loop_supervisor.supervisor import Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    original_oc_server = rt.OpenCodeServer
+
+    class FailingEverythingServer:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        def start(self) -> None:
+            raise ServerStartupError("simulated startup failure")
+
+        def stop(self) -> None:
+            raise RuntimeError("simulated cleanup failure")
+
+    original_record_external_failure = Supervisor.record_external_failure
+
+    def _boom_record_external_failure(self, *a, **kw):
+        raise RuntimeError("simulated persistence failure")
+
+    rt.OpenCodeServer = FailingEverythingServer
+    Supervisor.record_external_failure = _boom_record_external_failure
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected RuntimeError_ to be raised")
+        except RuntimeError_ as exc:
+            message = str(exc)
+            assert "could not be persisted" in message
+            assert "cleanup could not be confirmed" in message
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.record_external_failure = original_record_external_failure
+
+    assert _lock_path(repo.common_dir()).exists()
+
+
+def test_run_new_lock_release_failure_with_existing_primary_attaches_note(tmp_path, monkeypatch):
+    """If the run itself fails (cleanup confirmed OK) and the subsequent
+    lock release also fails, the original run exception must still be
+    what propagates, with a note describing the lock-release failure."""
+    from loop_supervisor.locking import LockError
+    from loop_supervisor.supervisor import LoopError, Supervisor
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+
+    class CleanServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    original_run = Supervisor.run
+    the_failure = LoopError("simulated supervisor failure")
+
+    def _boom_run(self, state):
+        raise the_failure
+
+    original_lock_release = rt._LockLease.release
+
+    def _boom_release(self):
+        raise LockError("simulated lock-release failure")
+
+    rt.OpenCodeServer = CleanServer
+    Supervisor.run = _boom_run
+    monkeypatch.setattr(rt._LockLease, "release", _boom_release)
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected LoopError to be raised")
+        except LoopError as exc:
+            assert exc is the_failure
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+        rt._LockLease.release = original_lock_release
+
+    notes = getattr(the_failure, "__notes__", [])
+    assert any("lock could not be released" in n.lower() for n in notes), notes
+
+
+def test_lock_file_released_only_after_confirmed_cleanup(tmp_path, monkeypatch):
+    """The lock file must remain present at every point before stop()
+    finally confirms success, and only disappear afterward."""
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.supervisor import Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    original_oc_server = rt.OpenCodeServer
+
+    lock_present_during_stop: list[bool] = []
+
+    class ObservingServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+            self.calls = 0
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            self.calls += 1
+            lock_present_during_stop.append(_lock_path(repo.common_dir()).exists())
+            if self.calls == 1:
+                raise RuntimeError("transient")
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    original_run = Supervisor.run
+
+    def _fake_run(self, state):
+        state.phase = "done"
+        return state
+
+    rt.OpenCodeServer = ObservingServer
+    Supervisor.run = _fake_run
+    try:
+        run_new(tmp_path / "repo", _make_options())
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+    assert lock_present_during_stop == [True, True]
+    assert not _lock_path(repo.common_dir()).exists()
