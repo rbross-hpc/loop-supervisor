@@ -209,6 +209,34 @@ def test_popen_generic_oserror_normalized_to_startup_error(tmp_path, monkeypatch
     assert excinfo.value.__cause__ is the_error
 
 
+def test_popen_oserror_with_throwing_str_normalized_to_startup_error(tmp_path, monkeypatch):
+    """An OSError subclass raised by subprocess.Popen() whose __str__
+    itself raises must still be normalized to ServerStartupError with
+    exact cause identity, falling back to a deterministic "unprintable
+    ..." rendering in the wrapper's message rather than letting the
+    broken __str__ escape in its place (which would also mean neither
+    ServerStartupError nor the exact __cause__ was ever established)."""
+    import subprocess as _subprocess
+
+    config = OpenCodeServerConfig(executable="opencode")
+    server = OpenCodeServer(tmp_path, config)
+
+    class _UnprintableOSError(OSError):
+        def __str__(self) -> str:
+            raise RuntimeError("simulated str failure in OSError")
+
+    the_error = _UnprintableOSError("simulated unprintable OSError")
+
+    def _boom_popen(*a, **kw):
+        raise the_error
+
+    monkeypatch.setattr(_subprocess, "Popen", _boom_popen)
+    with pytest.raises(ServerStartupError) as excinfo:
+        server.start()
+    assert excinfo.value.__cause__ is the_error
+    assert "unprintable _UnprintableOSError" in str(excinfo.value)
+
+
 def test_startup_cleanup_keyboard_interrupt_does_not_replace_primary(tmp_path, monkeypatch):
     """If OpenCodeServer.start()'s own internal defense-in-depth stop()
     raises KeyboardInterrupt during startup-failure cleanup, the original

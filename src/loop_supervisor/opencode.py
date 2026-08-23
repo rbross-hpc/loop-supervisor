@@ -602,8 +602,17 @@ class OpenCodeServer:
                     if launcher is not None:
                         self._pending_launcher = launcher
                     if isinstance(exc, OSError):
+                        # Render `exc` via _safe_exception_text() rather than
+                        # an f-string's implicit str() call: an OSError
+                        # subclass with a throwing __str__ must never let
+                        # that failure escape in place of ServerStartupError,
+                        # which would also lose the exact __cause__ identity
+                        # established below (see ADR 0009's primary-error
+                        # precedence, and the analogous fix already applied
+                        # to runtime.py's diagnostic rendering).
                         wrapped = ServerStartupError(
-                            f"failed to start launcher for {self.config.executable!r}: {exc}"
+                            f"failed to start launcher for {self.config.executable!r}: "
+                            f"{_safe_exception_text(exc)}"
                         )
                         wrapped.__cause__ = exc
                         raise wrapped from exc

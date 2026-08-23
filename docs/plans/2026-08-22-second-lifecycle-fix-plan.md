@@ -429,6 +429,41 @@ these fixes must uphold and extend.
       retry/exhaustion edge cases) and the `opencode.py` unprintable-
       `OSError` finding above remain unresolved; this step is not
       complete.**
+
+      The `opencode.py` unprintable-`OSError` finding above was
+      remediated on `fix/step3-oserror-str-safety` (scope limited to this
+      one defect only): `OpenCodeServer.start()`'s `OSError`→
+      `ServerStartupError` normalization now renders the caught `OSError`
+      via the module's existing `_safe_exception_text()` helper instead
+      of an f-string's implicit `str()` call, so an `OSError` subclass
+      with a throwing `__str__` can no longer escape in place of
+      `ServerStartupError` (which would also have lost the exact
+      `__cause__` identity established immediately afterward). Verified
+      directly: a `_UnprintableOSError` raised by a monkeypatched
+      `subprocess.Popen()` now correctly surfaces as `ServerStartupError`
+      with `__cause__ is the_error` and message text
+      `"unprintable _UnprintableOSError"`, instead of the formatting
+      `RuntimeError` from the broken `__str__` escaping in its place (the
+      latter confirmed by temporarily reverting the source change with
+      the new test still present, which fails as expected). Added
+      `test_popen_oserror_with_throwing_str_normalized_to_startup_error`
+      to `tests/test_opencode.py`, alongside the existing
+      `PermissionError`/generic-`OSError` cause-identity tests. Other
+      unsafe `str()`-based exception interpolation sites in `opencode.py`
+      outside `start()`'s `OSError` normalization (e.g.
+      `_parse_anchor_identity()`'s `getpgid` failure message, and various
+      `httpx` request-error messages in `create_session()`/
+      `send_prompt()`/`_abort_session_bounded()`) were identified but are
+      out of scope for this narrowly targeted fix and remain untouched.
+      `runtime.py` and `tui/app.py` were not touched by this remediation.
+      Verification: `test_opencode.py` 144 passed; full `pytest -q` 651
+      passed across three consecutive clean runs; `ruff check .`, `ruff
+      format --check .`, `mypy src`, and `git diff --check` clean.
+
+      **Findings 3–4 (backoff interruption precedence, cleanup-interrupt
+      retry/exhaustion edge cases) remain unresolved, along with the
+      newly identified out-of-scope unsafe-`str()` sites noted above;
+      this step is still not complete.**
 - [x] Step 4 — TUI ownership registry (blocker 2). Implemented on
       `fix/tui-ownership-registry`. `LoopSupervisorApp` now maintains an
       authoritative `_owned_run_screens` registry, populated in
