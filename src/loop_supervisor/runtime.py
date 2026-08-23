@@ -62,6 +62,31 @@ class RuntimeError_(RuntimeError):
     """Raised by the runtime controller for startup/configuration errors."""
 
 
+def _safe_exception_text(error: BaseException | None) -> str:
+    """Render `error` for inclusion in a diagnostic message/note without
+    ever raising itself, even if `error.__str__` raises (e.g. an
+    exception subclass with a broken or adversarial `__str__`). Every
+    diagnostic constructed in this module that interpolates an arbitrary
+    exception — a startup primary, a cleanup/stop() failure, a
+    persistence failure, or a lock-release failure — must render it
+    through this helper rather than an f-string's implicit `str()`/
+    `format()` call, so that a throwing `__str__` can never itself
+    become an escaping exception that replaces (or masks) the actual
+    primary outcome being reported (see ADR 0009's primary-error
+    precedence). Mirrors `opencode._safe_exception_text`, with `None`
+    additionally accepted (rendered as "None") since some callers here
+    pass an optional `_CleanupOutcome.last_error`."""
+    if error is None:
+        return "None"
+    try:
+        return str(error)
+    except BaseException:  # noqa: BLE001 - diagnostic rendering must not escape
+        try:
+            return f"unprintable {type(error).__name__}"
+        except BaseException:  # noqa: BLE001 - use a constant if introspection fails
+            return "unprintable error"
+
+
 @dataclass
 class _CleanupOutcome:
     """Structured result of a bounded server-stop retry sequence. Never
@@ -120,10 +145,17 @@ def _add_note(exc: BaseException, message: str) -> None:
 
 
 def _unresolved_cleanup_message(prefix: str, outcome: _CleanupOutcome) -> str:
+    """Render a retained-lock diagnostic. Never raises, even if
+    `outcome.last_error` has a broken/adversarial `__str__`: it is
+    rendered via `_safe_exception_text` rather than an f-string's
+    implicit `str()` call, since this message is composed while a
+    startup/run primary is already being handled (see _startup_failure,
+    _run_and_stop) and must never itself escape and replace that
+    primary."""
     return (
         f"{prefix} OpenCode server cleanup could not be confirmed "
-        f"({outcome.last_error}) — the repository lock has been retained; verify no "
-        "OpenCode process survives before using --recover-stale-lock"
+        f"({_safe_exception_text(outcome.last_error)}) — the repository lock has been "
+        "retained; verify no OpenCode process survives before using --recover-stale-lock"
     )
 
 
@@ -223,7 +255,8 @@ def _lock_context(
             except LockError as release_exc:
                 _add_note(
                     body_exc,
-                    f"additionally, the repository lock could not be released: {release_exc}",
+                    "additionally, the repository lock could not be released: "
+                    + _safe_exception_text(release_exc),
                 )
         raise
     else:
@@ -388,12 +421,18 @@ def _startup_failure(
 
     KeyboardInterrupt, SystemExit, and any other direct BaseException
     (not an Exception subclass) are never persisted as operational
-    failures and are always re-raised unchanged via a bare `raise`,
-    preserving their exact identity and traceback — they are never
-    wrapped in RuntimeError_. Cleanup notes are attached only if cleanup
-    remains unresolved. A KeyboardInterrupt/SystemExit raised by cleanup
-    itself is never re-raised in place of the startup primary; it is only
-    described in the retained-lock note/message.
+    failures and are always re-raised unchanged via a bare `raise` —
+    executed here while `exc` is still the exception actively being
+    handled in the caller's `except` clause (run_new()/run_resume() call
+    this function from inside their own `except BaseException as exc:`
+    block), so this is a true bare re-raise of the original exception
+    object, not a redispatch that would add this function's own frame to
+    its traceback. Its exact identity and traceback are therefore
+    preserved unchanged — it is never wrapped in RuntimeError_. Cleanup
+    notes are attached only if cleanup remains unresolved. A
+    KeyboardInterrupt/SystemExit raised by cleanup itself is never
+    re-raised in place of the startup primary; it is only described in
+    the retained-lock note/message.
     """
     outcome = _confirm_server_stopped(server)
     if outcome.confirmed:
@@ -402,8 +441,9 @@ def _startup_failure(
     if not isinstance(exc, Exception):
         if not outcome.confirmed:
             _add_note(exc, _unresolved_cleanup_message("startup was interrupted; the", outcome))
-        raise exc
+        raise
 
+    exc_text = _safe_exception_text(exc)
     try:
         supervisor.record_external_failure(state, exc=exc, phase=state.phase)
     except Exception as persist_exc:
@@ -411,37 +451,39 @@ def _startup_failure(
         # prefer surfacing it (it means the operator has no durable record
         # to resume from), but never let it hide an unresolved cleanup
         # failure.
+        persist_exc_text = _safe_exception_text(persist_exc)
+        last_error_text = _safe_exception_text(outcome.last_error)
         if not outcome.confirmed:
             message = (
-                f"failed to start OpenCode server: {exc}; additionally, the failure "
-                f"could not be persisted ({persist_exc}); additionally, OpenCode "
-                f"server cleanup could not be confirmed ({outcome.last_error}) — the "
+                f"failed to start OpenCode server: {exc_text}; additionally, the failure "
+                f"could not be persisted ({persist_exc_text}); additionally, OpenCode "
+                f"server cleanup could not be confirmed ({last_error_text}) — the "
                 "repository lock has been retained; verify no OpenCode process "
                 "survives before using --recover-stale-lock"
             )
         else:
             message = (
-                f"failed to start OpenCode server: {exc}; additionally, the failure "
-                f"could not be persisted ({persist_exc})"
+                f"failed to start OpenCode server: {exc_text}; additionally, the failure "
+                f"could not be persisted ({persist_exc_text})"
             )
         result = RuntimeError_(message)
-        _add_note(result, f"persistence failure: {persist_exc}")
+        _add_note(result, f"persistence failure: {persist_exc_text}")
         if not outcome.confirmed:
             _add_note(result, _unresolved_cleanup_message("startup failed and the", outcome))
         raise result from exc
 
     if not outcome.confirmed:
         message = (
-            f"failed to start OpenCode server: {exc}; additionally, OpenCode server "
-            f"cleanup could not be confirmed ({outcome.last_error}) — the repository lock "
-            "has been retained; verify no OpenCode process survives before using "
-            "--recover-stale-lock"
+            f"failed to start OpenCode server: {exc_text}; additionally, OpenCode server "
+            f"cleanup could not be confirmed ({_safe_exception_text(outcome.last_error)}) — "
+            "the repository lock has been retained; verify no OpenCode process survives "
+            "before using --recover-stale-lock"
         )
         result = RuntimeError_(message)
         _add_note(result, _unresolved_cleanup_message("startup failed and the", outcome))
         raise result from exc
 
-    raise RuntimeError_(f"failed to start OpenCode server: {exc}") from exc
+    raise RuntimeError_(f"failed to start OpenCode server: {exc_text}") from exc
 
 
 def _run_and_stop(

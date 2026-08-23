@@ -238,19 +238,19 @@ these fixes must uphold and extend.
       --check .`, `mypy src`, and `git diff --check` clean. The audit also
       reran 139 OpenCode tests and all 611 tests, confirmed no fixture
       process leaks, and verified Step 1 process ownership was unchanged.
-- [x] Step 3 — headless cleanup completeness (blocker 5). Implemented on
-      `fix/headless-cleanup-completeness`. `runtime.py` now has one shared
-      bounded server-stop retry helper (`_confirm_server_stopped()`,
-      `_CLEANUP_ATTEMPTS = 3` with increasing backoff, never discarding
-      the server handle between attempts) used uniformly for startup
-      failure, the runner handoff, `supervisor.run()` (success and
-      failure), and ordinary post-run cleanup — replacing the four
-      previously separate single-attempt `try/except Exception` cleanup
-      call sites. `run_new()`/`run_resume()` now catch `BaseException`
-      (not just `OpenCodeError`) from `server.start()`; `_startup_failure()`
-      re-raises `KeyboardInterrupt`/`SystemExit` unchanged via a bare
-      `raise` (never wrapped, never persisted as an operational failure),
-      and only ordinary `Exception`s are persisted via
+- [ ] Step 3 — headless cleanup completeness (blocker 5). **Reopened.**
+      Implemented on `fix/headless-cleanup-completeness`. `runtime.py` now
+      has one shared bounded server-stop retry helper
+      (`_confirm_server_stopped()`, `_CLEANUP_ATTEMPTS = 3` with increasing
+      backoff, never discarding the server handle between attempts) used
+      uniformly for startup failure, the runner handoff, `supervisor.run()`
+      (success and failure), and ordinary post-run cleanup — replacing the
+      four previously separate single-attempt `try/except Exception`
+      cleanup call sites. `run_new()`/`run_resume()` now catch
+      `BaseException` (not just `OpenCodeError`) from `server.start()`;
+      `_startup_failure()` re-raises `KeyboardInterrupt`/`SystemExit`
+      unchanged (never wrapped, never persisted as an operational
+      failure), and only ordinary `Exception`s are persisted via
       `record_external_failure()` and wrapped in `RuntimeError_`. The lock
       lease is marked releasable only once `_confirm_server_stopped()`
       actually confirms success; unresolved cleanup/persistence failures
@@ -261,15 +261,11 @@ these fixes must uphold and extend.
       cleaned up exactly like a run failure. `_lock_context()` now
       attaches a lock-release failure as a note on the body exception
       instead of silently discarding it, and still never calls release()
-      while the lease is unreleasable. `OpenCodeServer.start()`'s internal
-      startup-cleanup path now catches `BaseException` (not just
-      `Exception`) from its own `stop()` and uses the existing
-      `_add_cleanup_note()` helper, so a `KeyboardInterrupt`/`SystemExit`
-      from startup cleanup itself can no longer replace the startup
-      primary; all `subprocess.Popen` `OSError` subclasses remain
-      normalized to `ServerStartupError` with exact `__cause__` identity
-      (direct `PermissionError`/generic `OSError` tests added). Step 1
-      process ownership and Step 2 HTTP cleanup semantics are unchanged.
+      while the lease is unreleasable. All `subprocess.Popen` `OSError`
+      subclasses remain normalized to `ServerStartupError` with exact
+      `__cause__` identity (direct `PermissionError`/generic `OSError`
+      tests added). Step 1 process ownership and Step 2 HTTP cleanup
+      semantics are unchanged.
 
       Added 21 new deterministic tests across `test_runtime.py` (exact
       retry count/backoff, transient-failure-then-success and
@@ -281,13 +277,87 @@ these fixes must uphold and extend.
       primary, and lock-file-released-only-after-confirmed-cleanup) and
       `test_opencode.py` (direct `PermissionError`/generic `OSError`
       normalization with exact cause identity, and startup-cleanup
-      `KeyboardInterrupt` not replacing the startup primary). Final
-      verification: `test_opencode.py` 142 passed; `test_runtime.py`/
+      `KeyboardInterrupt` not replacing the startup primary). Verification
+      at that point: `test_opencode.py` 142 passed; `test_runtime.py`/
       `test_cli_runtime.py`/`test_locking.py` 104 passed (246 combined
       with `test_opencode.py`); `test_tui_app.py` 20 passed; full
       `pytest -q` 632 passed across three consecutive clean runs with no
       fixture process leaks; `ruff check .`, `ruff format --check .`,
       `mypy src`, and `git diff --check` clean.
+
+      A subsequent focused read-only audit (scoped to this step, run after
+      Step 4 was implemented) returned **NO-GO**, finding four defects in
+      the implementation above:
+
+      1. `OpenCodeServer.start()` (`raise primary` at the former
+         `opencode.py:651`) and `_startup_failure()` (`raise exc` at the
+         former `runtime.py:405`) redispatched the primary exception by
+         naming it in a `raise <expr>` statement instead of a true bare
+         `raise`, inserting an extra frame into the propagated traceback
+         despite the documented "exact identity and traceback" guarantee.
+         Existing tests asserted exception identity (`is`) but never
+         traceback shape, so this was not caught.
+      2. Several Step 3 diagnostic sites built exception text via plain
+         f-string interpolation (implicit `str()`) before any
+         `add_note()`/message construction — `_unresolved_cleanup_message()`,
+         the `_lock_context()` release-failure note, and
+         `_startup_failure()`'s message composition — so a
+         cleanup/persistence/lock-release exception with a throwing
+         `__str__` could itself escape and replace the primary being
+         reported, violating the same precedence `opencode._safe_exception_text`
+         was already introduced to protect in Step 2.
+      3. `time.sleep()` in `_confirm_server_stopped()`'s inter-attempt
+         backoff is not interruption-safe with respect to
+         `KeyboardInterrupt`/`SystemExit` precedence during the backoff
+         window itself (unresolved).
+      4. Cleanup-time `KeyboardInterrupt`/`SystemExit` retry/exhaustion
+         semantics across the bounded retry loop have edge cases not
+         fully covered by tests (unresolved).
+
+      Findings 1–2 were remediated on `fix/step3-primary-preservation`
+      (scope explicitly limited to these two; findings 3–4 are
+      out of scope for this remediation and remain open, so this step
+      stays reopened/incomplete overall):
+
+      - `OpenCodeServer.start()` was restructured so the entire spawn/
+        readiness sequence runs inside one outer `try`, with a single
+        `except BaseException as primary: ...; raise` at the end that
+        performs startup cleanup and then bare re-raises — never `raise
+        primary` — so the traceback the caller observes is exactly the
+        one produced at the original raise site, with no
+        `OpenCodeServer.start` redispatch frame appended. The `OSError`→
+        `ServerStartupError` normalization now uses `raise wrapped from
+        exc` at the point of the original failure (still inside the
+        `except OSError` handling it), preserving exact `__cause__`
+        identity.
+      - `_startup_failure()`'s direct-`BaseException` branch now uses a
+        bare `raise` (relying on `exc` still being the exception actively
+        handled in the caller's `except BaseException as exc:` block in
+        `run_new()`/`run_resume()`) instead of `raise exc`.
+      - Added `_safe_exception_text()` to `runtime.py` (mirroring
+        `opencode._safe_exception_text`, extended to accept `None` for
+        `_CleanupOutcome.last_error`) and applied it at every Step 3
+        diagnostic site that interpolates an arbitrary exception:
+        `_unresolved_cleanup_message()`, the `_lock_context()`
+        release-failure note, and every message/note built in
+        `_startup_failure()` (startup primary, persistence failure,
+        cleanup `last_error`).
+
+      Added 4 new adversarial tests to `test_runtime.py` (unprintable
+      `__str__` on a startup-cleanup-retry-exhaustion error, an
+      `record_external_failure()` persistence error, a `stop()` error
+      after an otherwise-successful run, and a `_LockLease.release()`
+      failure) confirming the resulting diagnostic falls back to a
+      deterministic `"unprintable <ClassName>"` rendering rather than
+      crashing or leaking the broken `__str__`, plus 2 new traceback-frame
+      tests (`test_opencode.py`, `test_runtime.py`) asserting no
+      cleanup-redispatch frame is present after a startup failure.
+      Verification after this remediation: `test_opencode.py` 143 passed;
+      `test_runtime.py` 175 passed (188 combined with `test_opencode.py`);
+      full `pytest -q` 648 passed across three consecutive clean runs;
+      `ruff check .`, `ruff format --check .`, `mypy src`, and
+      `git diff --check` clean. Step 1/2/4 semantics were not touched.
+      **Findings 3–4 remain unresolved; this step is not complete.**
 - [x] Step 4 — TUI ownership registry (blocker 2). Implemented on
       `fix/tui-ownership-registry`. `LoopSupervisorApp` now maintains an
       authoritative `_owned_run_screens` registry, populated in
