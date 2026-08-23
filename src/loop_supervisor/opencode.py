@@ -535,7 +535,22 @@ class OpenCodeServer:
             pass
 
     def start(self) -> None:
-        primary: BaseException | None = None
+        """Start the launcher/OpenCode process.
+
+        On any startup failure — including a direct `BaseException` such
+        as `KeyboardInterrupt`/`SystemExit` — best-effort cleanup (`stop()`)
+        is attempted and, if it too fails, its failure is attached as a
+        note; the *original* startup exception is then propagated via a
+        bare `raise` from the single outermost `except` clause below, so
+        its exact identity and traceback (not a redispatched copy) is
+        what the caller observes. This mirrors the same primary-error
+        precedence documented on `_close_request_local_client` (see ADR
+        0009): a cleanup failure is never allowed to replace the primary
+        outcome, and re-raising the primary is never done by naming it in
+        a `raise <expr>` statement (which would add this method's own
+        frame to its traceback) — only a bare `raise` inside the `except`
+        block that is still actively handling it.
+        """
         with self._cleanup_lock:
             if any(
                 resource is not None
@@ -563,49 +578,49 @@ class OpenCodeServer:
             env = dict(self.config.env if self.config.env is not None else os.environ)
             event_read_fd, event_write_fd = os.pipe()
             command_read_fd, command_write_fd = os.pipe()
-            launcher: subprocess.Popen[bytes] | None = None
             try:
-                launcher = subprocess.Popen(
-                    [
-                        sys.executable,
-                        _LAUNCHER_SCRIPT,
-                        str(event_write_fd),
-                        str(command_read_fd),
-                        *self._serve_command(port),
-                    ],
-                    cwd=str(self.project_dir),
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                    pass_fds=(event_write_fd, command_read_fd),
-                )
-                self._pending_launcher = launcher
-            except BaseException as exc:
-                if launcher is not None:
-                    self._pending_launcher = launcher
-                if isinstance(exc, OSError):
-                    primary = ServerStartupError(
-                        f"failed to start launcher for {self.config.executable!r}: {exc}"
+                launcher: subprocess.Popen[bytes] | None = None
+                try:
+                    launcher = subprocess.Popen(
+                        [
+                            sys.executable,
+                            _LAUNCHER_SCRIPT,
+                            str(event_write_fd),
+                            str(command_read_fd),
+                            *self._serve_command(port),
+                        ],
+                        cwd=str(self.project_dir),
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        start_new_session=True,
+                        pass_fds=(event_write_fd, command_read_fd),
                     )
-                    primary.__cause__ = exc
-                else:
-                    primary = exc
-            finally:
-                for fd in (event_write_fd, command_read_fd):
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                if launcher is None:
-                    for fd in (event_read_fd, command_write_fd):
+                    self._pending_launcher = launcher
+                except BaseException as exc:
+                    if launcher is not None:
+                        self._pending_launcher = launcher
+                    if isinstance(exc, OSError):
+                        wrapped = ServerStartupError(
+                            f"failed to start launcher for {self.config.executable!r}: {exc}"
+                        )
+                        wrapped.__cause__ = exc
+                        raise wrapped from exc
+                    raise
+                finally:
+                    for fd in (event_write_fd, command_read_fd):
                         try:
                             os.close(fd)
                         except OSError:
                             pass
+                    if launcher is None:
+                        for fd in (event_read_fd, command_write_fd):
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
 
-            if primary is None:
                 assert launcher is not None
                 try:
                     line = self._read_launcher_event(
@@ -630,16 +645,15 @@ class OpenCodeServer:
                         )
                     self._start_stdout_pump(launcher)
                     self._await_ready(launcher)
-                except BaseException as exc:
-                    primary = exc
+                except BaseException:
                     if self._owner is None:
                         for fd in (event_read_fd, command_write_fd):
                             try:
                                 os.close(fd)
                             except OSError:
                                 pass
-
-            if primary is not None:
+                    raise
+            except BaseException as primary:  # noqa: BLE001 - primary must propagate unchanged
                 try:
                     self.stop()
                 except BaseException as cleanup_error:  # noqa: BLE001 - must never replace primary
@@ -648,7 +662,7 @@ class OpenCodeServer:
                         "additionally, startup cleanup failed: ",
                         cleanup_error,
                     )
-                raise primary
+                raise
 
     def _read_launcher_event(
         self,

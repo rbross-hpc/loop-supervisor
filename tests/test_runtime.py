@@ -747,6 +747,61 @@ def test_run_new_successful_run_failed_stop_retains_lock(tmp_path):
     assert _lock_path(repo.common_dir()).exists()
 
 
+def test_run_new_successful_run_failed_stop_with_unprintable_str_retains_lock(tmp_path):
+    """A successful supervisor.run() followed by a server.stop() that
+    raises an exception with a broken/adversarial __str__ must still
+    produce a deterministic RuntimeError_ message (falling back to an
+    "unprintable ..." rendering) rather than crashing while composing
+    the unresolved-cleanup diagnostic."""
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.runtime import RuntimeError_
+    from loop_supervisor.supervisor import Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+
+    class _UnprintableStopError(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("simulated str failure in stop error")
+
+    class FailingStopServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            raise _UnprintableStopError("simulated stop cleanup failure")
+
+        def add_observer(self, obs):
+            pass
+
+    original_run = Supervisor.run
+
+    def _fake_run(self, state):
+        state.phase = "done"
+        return state
+
+    rt.OpenCodeServer = FailingStopServer
+    Supervisor.run = _fake_run
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected RuntimeError_ to be raised")
+        except RuntimeError_ as exc:
+            assert "cleanup could not be confirmed" in str(exc)
+            assert "unprintable _UnprintableStopError" in str(exc)
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+    assert _lock_path(repo.common_dir()).exists()
+
+
 def test_run_new_failed_run_and_failed_stop_preserves_run_exception_and_retains_lock(tmp_path):
     """If supervisor.run() raises AND server.stop() also fails, the
     original run exception must be what propagates, and the lock must be
@@ -1169,6 +1224,101 @@ def test_run_new_startup_failure_retry_exhaustion_retains_lock(tmp_path, monkeyp
     assert _lock_path(repo.common_dir()).exists()
 
 
+def test_run_new_startup_failure_retry_exhaustion_with_unprintable_cleanup_error(
+    tmp_path, monkeypatch
+):
+    """If every defense-in-depth stop() retry after a startup failure
+    raises an exception whose __str__ itself raises, composing the
+    retained-lock diagnostic must not itself crash: it must fall back to
+    a deterministic "unprintable ..." rendering rather than propagating
+    the cleanup exception's own broken __str__ in place of the startup
+    failure."""
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.opencode import ServerStartupError
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    original_oc_server = rt.OpenCodeServer
+
+    class _UnprintableCleanupError(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("simulated str failure in cleanup error")
+
+    class FailingEverythingServer:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        def start(self) -> None:
+            raise ServerStartupError("simulated startup failure")
+
+        def stop(self) -> None:
+            raise _UnprintableCleanupError("unprintable")
+
+    rt.OpenCodeServer = FailingEverythingServer
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected RuntimeError_ to be raised")
+        except RuntimeError_ as exc:
+            assert "cleanup could not be confirmed" in str(exc)
+            assert "unprintable _UnprintableCleanupError" in str(exc)
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+    assert _lock_path(repo.common_dir()).exists()
+
+
+def test_run_new_startup_failure_persistence_error_with_unprintable_str(tmp_path):
+    """If record_external_failure() raises a persistence exception whose
+    __str__ itself raises, the resulting RuntimeError_ message must still
+    be composed successfully (falling back to an "unprintable ..."
+    rendering) rather than letting the broken __str__ escape and replace
+    the startup failure being reported."""
+    from loop_supervisor.opencode import ServerStartupError
+    from loop_supervisor.runtime import RuntimeError_
+
+    _init_repo(tmp_path / "repo")
+
+    import loop_supervisor.runtime as rt
+    import loop_supervisor.supervisor as sup_module
+
+    original_oc_server = rt.OpenCodeServer
+    original_record = sup_module.Supervisor.record_external_failure
+
+    class _UnprintablePersistError(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("simulated str failure in persistence error")
+
+    class FailingOCServer:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        def start(self) -> None:
+            raise ServerStartupError("simulated startup failure")
+
+        def stop(self) -> None:
+            pass
+
+    def _boom_record(self, state, *, exc, phase):
+        raise _UnprintablePersistError("cannot persist")
+
+    rt.OpenCodeServer = FailingOCServer
+    sup_module.Supervisor.record_external_failure = _boom_record
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected RuntimeError_ to be raised")
+        except RuntimeError_ as exc:
+            assert "could not be persisted" in str(exc)
+            assert "unprintable _UnprintablePersistError" in str(exc)
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        sup_module.Supervisor.record_external_failure = original_record
+
+
 def test_run_new_startup_keyboard_interrupt_preserves_identity(tmp_path):
     """A KeyboardInterrupt raised from server.start() must propagate as
     the exact same object, never wrapped in RuntimeError_, and must not
@@ -1210,6 +1360,47 @@ def test_run_new_startup_keyboard_interrupt_preserves_identity(tmp_path):
     # Startup KeyboardInterrupt must not be recorded as an operational
     # failure: the run remains at its pre-startup phase.
     assert state.phase != "operational_failure"
+
+
+def test_run_new_startup_keyboard_interrupt_preserves_exact_traceback(tmp_path):
+    """A KeyboardInterrupt raised from server.start() must propagate with
+    its original traceback: no frame from _startup_failure's own bare
+    `raise` may be inserted, since that would mean the exception was
+    redispatched (`raise exc`) rather than truly bare re-raised."""
+    import pytest
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+    the_interrupt = KeyboardInterrupt()
+
+    class InterruptingServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            raise the_interrupt
+
+        def stop(self) -> None:
+            pass
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    rt.OpenCodeServer = InterruptingServer
+    try:
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            run_new(tmp_path / "repo", _make_options())
+        assert excinfo.value is the_interrupt
+        frame_names = []
+        tb = excinfo.value.__traceback__
+        while tb is not None:
+            frame_names.append(tb.tb_frame.f_code.co_name)
+            tb = tb.tb_next
+        assert "_startup_failure" not in frame_names, frame_names
+    finally:
+        rt.OpenCodeServer = original_oc_server
 
 
 def test_run_new_startup_system_exit_preserves_identity(tmp_path):
@@ -1661,6 +1852,69 @@ def test_run_new_lock_release_failure_with_existing_primary_attaches_note(tmp_pa
 
     notes = getattr(the_failure, "__notes__", [])
     assert any("lock could not be released" in n.lower() for n in notes), notes
+
+
+def test_run_new_lock_release_failure_with_unprintable_str_attaches_safe_note(
+    tmp_path, monkeypatch
+):
+    """If the lock-release failure itself has a broken/adversarial
+    __str__, annotating the primary run failure must not itself crash or
+    let that broken __str__ propagate: the note must fall back to a
+    deterministic "unprintable ..." rendering."""
+    from loop_supervisor.locking import LockError
+    from loop_supervisor.supervisor import LoopError, Supervisor
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+
+    class CleanServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    original_run = Supervisor.run
+    the_failure = LoopError("simulated supervisor failure")
+
+    def _boom_run(self, state):
+        raise the_failure
+
+    class _UnprintableLockError(LockError):
+        def __str__(self) -> str:
+            raise RuntimeError("simulated str failure in lock error")
+
+    original_lock_release = rt._LockLease.release
+
+    def _boom_release(self):
+        raise _UnprintableLockError("simulated lock-release failure")
+
+    rt.OpenCodeServer = CleanServer
+    Supervisor.run = _boom_run
+    monkeypatch.setattr(rt._LockLease, "release", _boom_release)
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected LoopError to be raised")
+        except LoopError as exc:
+            assert exc is the_failure
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+        rt._LockLease.release = original_lock_release
+
+    notes = getattr(the_failure, "__notes__", [])
+    assert any(
+        "lock could not be released" in n.lower() and "unprintable" in n.lower() for n in notes
+    ), notes
 
 
 def test_lock_file_released_only_after_confirmed_cleanup(tmp_path, monkeypatch):

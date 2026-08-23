@@ -74,6 +74,32 @@ def test_server_startup_error_on_early_exit(tmp_path):
     assert server._stdout_thread is None
 
 
+def test_server_startup_failure_traceback_has_no_cleanup_redispatch_frame(tmp_path):
+    """start()'s own internal cleanup (self.stop()) must never insert an
+    extra frame into the propagated traceback: the primary startup
+    failure must be re-raised via a true bare `raise` from inside the
+    `except` clause that is still actively handling it, not via `raise
+    primary`, which would add a frame at that `raise` statement's own
+    line."""
+    config = _argv_config(FAKE_OPENCODE_MODE="never_ready")
+    config.startup_timeout = 1.0
+    server = _FakeServer(tmp_path, config)
+    with pytest.raises(ServerStartupError) as excinfo:
+        server.start()
+    frame_names = []
+    tb = excinfo.value.__traceback__
+    while tb is not None:
+        frame_names.append(tb.tb_frame.f_code.co_name)
+        tb = tb.tb_next
+    # The last frame that raises the ServerStartupError must be the
+    # readiness-waiting internals themselves (e.g. _await_ready /
+    # _read_launcher_event), never `start` appearing *after* one of
+    # those — which would indicate the exception was caught, held in a
+    # variable, and redispatched via `raise primary` rather than bare
+    # re-raised in place.
+    assert frame_names[-1] in ("_await_ready", "_read_launcher_event")
+
+
 def test_server_startup_timeout_when_never_ready(tmp_path):
     config = _argv_config(FAKE_OPENCODE_MODE="never_ready")
     config.startup_timeout = 1.0
