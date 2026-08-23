@@ -46,17 +46,44 @@ leaves every owned resource in place for a subsequent attempt, triggered
 either by the user retrying ("q"/"Return to runs" again) or automatically
 by app-level exit.
 
+Lifecycle ownership registry: ``LoopSupervisorApp`` maintains a strong,
+app-level registry of every lifecycle-owned ``RunScreen``
+(``_owned_run_screens``), populated at the very start of
+``RunScreen.on_mount()`` — before any resource acquisition — and
+consulted instead of Textual's own ``_screen_stacks`` wherever lifecycle
+ownership must be determined. Membership is the sole authority for
+"does this app still own something that must be cleaned up before
+exit": being unmounted or detached from the visible screen stack never
+removes a screen from this registry. A screen is deregistered only once
+it is fully quiescent (initialization and any in-flight ``advance()``
+have both stopped) and its cleanup is confirmed clean
+(``RunScreen.ready_to_finalize``); see ``finalize_run_screen()``, which
+is also the only code path permitted to pop a screen, and does so
+identity-safely (only if that exact screen is still the active one).
+
+An unexpectedly unmounted, unclean screen therefore remains strongly
+reachable and gets its own app-owned automatic retry coordinator
+(``ensure_cleanup_coordinator()`` /
+``_run_screen_cleanup_coordinator()``), started from
+``RunScreen.on_unmount()``: it repeatedly requests shutdown and awaits
+completion, retrying indefinitely on a fixed interval until cleanup is
+confirmed clean, with no interactive UI required. At most one such
+coordinator task runs per screen at a time — ``on_unmount()`` and
+app-level exit draining share the same coordinator rather than each
+starting their own.
+
 ``LoopSupervisorApp`` overrides ``_on_exit_app`` — Textual's single
 dispatch point for every exit path, since ``App.exit()`` only ever posts
-an ``ExitApp`` message — to request shutdown on any active ``RunScreen``,
-asynchronously await its completion (without blocking the Textual event
-loop, so initialization/advance() can still finish and post messages),
-and then repeat that request/await cycle, indefinitely, until every
-active ``RunScreen`` reports ``shutdown_clean``, before allowing the
-underlying ``_on_exit_app`` to proceed. This guarantees the process never
-exits while the repository lock is held or an OpenCode server process
-may still be running, regardless of which of the above paths triggered
-the exit, and regardless of how many attempts cleanup actually takes.
+an ``ExitApp`` message — to repeatedly drain ``_owned_run_screens``:
+ensure every currently-registered screen (mounted or detached) has a
+running cleanup coordinator, wait (with periodic re-checks so screens
+registered while waiting are picked up promptly), and loop until the
+registry is empty, before allowing the underlying ``_on_exit_app`` to
+proceed. This guarantees the process never exits while the repository
+lock is held or an OpenCode server process may still be running,
+regardless of which of the above paths triggered the exit, regardless of
+how many attempts cleanup actually takes, and regardless of whether a
+screen was ever actually visible on the active screen stack.
 """
 
 from __future__ import annotations
@@ -65,6 +92,7 @@ import asyncio
 import queue
 import threading
 from pathlib import Path
+from typing import cast
 
 from rich.markup import escape
 from textual import on
@@ -335,7 +363,7 @@ class RunScreen(Screen):
         # background threads that need to reach the app after that point
         # (notably _shutdown_worker's final pop_screen call) use this
         # cached reference instead of the `self.app` property.
-        self._app_ref: App | None = None
+        self._app_ref: LoopSupervisorApp | None = None
         self._lock: SupervisorLock | None = None
         self._server: OpenCodeServer | None = None
         self._supervisor: Supervisor | None = None
@@ -401,7 +429,15 @@ class RunScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self._app_ref = self.app
+        # Register with the app's lifecycle-ownership registry BEFORE any
+        # resource acquisition (lock, server) begins, and before anything
+        # else in this method runs. Registry membership — not whether this
+        # screen is mounted/visible/in Textual's own screen stack — is
+        # what keeps it strongly reachable and its resources owned for
+        # cleanup purposes; see LoopSupervisorApp.register_run_screen().
+        app = cast(LoopSupervisorApp, self.app)
+        app.register_run_screen(self)
+        self._app_ref = app
         self._reducer = LiveActivityReducer(owner_thread=threading.current_thread())
         self.run_worker(self._initialize, exclusive=False, thread=True)
 
@@ -477,7 +513,12 @@ class RunScreen(Screen):
         Uses the same ownership-preserving routine as normal shutdown, in
         the same order (SSE, then server, then lock), so a failed
         initialization can never discard a still-live worker/process or
-        release the lock on a transient failure."""
+        release the lock on a transient failure. Deliberately does not
+        finalize (deregister/pop) this screen itself: ready_to_finalize
+        requires _init_done_event, which is not set until _initialize()'s
+        finally block runs *after* this method returns — see the
+        finalization check there, which handles both the clean and
+        not-yet-clean cases uniformly with normal shutdown."""
         server = self._server
         if server is not None:
             try:
@@ -833,6 +874,29 @@ class RunScreen(Screen):
         set solely by _cleanup_resources()."""
         return self._shutdown_clean
 
+    @property
+    def ready_to_finalize(self) -> bool:
+        """True only once this screen may safely be deregistered from the
+        app's lifecycle-ownership registry and (if still the active
+        screen) popped.
+
+        Requires all three: initialization has fully finished
+        (``_init_done_event``), no ``advance()`` worker is still in flight
+        (``_advance_done_event``), and the most recent cleanup attempt
+        confirmed every owned resource was released (``shutdown_clean``).
+        A screen that is still initializing, still transitioning, or
+        whose last cleanup attempt left something unresolved (e.g.
+        ``server.stop()`` could not confirm the process exited) is never
+        ready to finalize — it must remain registered so the app-level
+        exit drain (and any automatic retry coordinator) keeps retrying
+        it.
+        """
+        return (
+            self._init_done_event.is_set()
+            and self._advance_done_event.is_set()
+            and self._shutdown_clean
+        )
+
     def action_request_shutdown(self) -> None:
         """Record shutdown intent and start a cleanup attempt if one is
         not already active.
@@ -882,9 +946,23 @@ class RunScreen(Screen):
         for the same cleanup as "q"/on_unmount before the process is
         allowed to actually exit. Does not itself request shutdown or
         start an attempt; the caller must have already called
-        action_request_shutdown() or _maybe_start_shutdown_attempt()."""
+        action_request_shutdown() or _maybe_start_shutdown_attempt().
+
+        Polls with a short bounded wait per executor call, rather than
+        one single unbounded `Event.wait()`, so this coroutine remains
+        promptly cancellable: a plain unbounded wait handed to
+        `run_in_executor()` occupies a real OS thread that keeps running
+        even after the awaiting asyncio Task is cancelled (a blocking
+        `threading.Event.wait()` cannot be interrupted), which can hang
+        the executor's own shutdown/join indefinitely if the event is
+        never set (e.g. this is called against a screen whose shutdown
+        was already "clean" with no attempt actually started/signalled).
+        Bounding each individual wait means a cancellation is observed
+        between polls, within one bound, instead of blocking forever.
+        """
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._shutdown_complete_event.wait)
+        while not self._shutdown_complete_event.is_set():
+            await loop.run_in_executor(None, self._shutdown_complete_event.wait, 0.1)
 
     def _shutdown_worker(self) -> None:
         try:
@@ -1024,23 +1102,29 @@ class RunScreen(Screen):
         #    definitively gone.
         self._cleanup_resources()
 
-        # 6. Only pop the screen on a clean return-to-browser shutdown. If
-        #    cleanup left something unresolved, keep the screen (and its
-        #    diagnostics) rather than implying a clean teardown.
-        if not self._shutdown_clean:
+        # 6. Only finalize (deregister from the app's lifecycle-ownership
+        #    registry, and pop if still the active screen) once this
+        #    screen is fully quiescent and clean. If cleanup left
+        #    something unresolved, keep the screen registered (and its
+        #    diagnostics) rather than implying a clean teardown; the
+        #    registry, not whether this screen is popped, is what
+        #    app-level exit relies on to know cleanup is not yet done.
+        if not self.ready_to_finalize:
             return
 
         app = self._app_ref
         if app is not None:
             try:
-                app.call_from_thread(app.pop_screen)
+                app.call_from_thread(app.finalize_run_screen, self)
             except Exception:
-                # The app may already be exiting (app-level exit awaits this
-                # same completion event from _on_exit_app before the screen
-                # stack is torn down), or this screen may already have been
-                # popped by a concurrent shutdown trigger. Either way, the
-                # lock/server cleanup above has already completed, which is
-                # the only externally-observable guarantee this method makes.
+                # The app may already be exiting (app-level exit's drain
+                # loop finalizes registered screens itself before the
+                # screen stack is torn down), or this screen may already
+                # have been finalized by a concurrent shutdown trigger
+                # (finalize_run_screen() is idempotent). Either way, the
+                # lock/server cleanup above has already completed, which
+                # is the only externally-observable guarantee this method
+                # makes.
                 pass
 
     def _set_banner_safe(self, text: str) -> None:
@@ -1053,21 +1137,32 @@ class RunScreen(Screen):
             pass
 
     def on_unmount(self) -> None:
-        """Safety net only.
+        """Notify the app that this screen has detached, and ensure it
+        keeps getting cleaned up even though it is no longer visible.
 
         Normal shutdown always goes through action_request_shutdown() ->
         _shutdown_worker(), which is the only path permitted to release the
         lock or stop the server, and it does so only after both
-        initialization and any in-flight advance() have fully stopped. If
-        this screen is unmounted without that having happened (e.g. the
-        app is torn down some other way), do not release resources here:
-        doing so could release the lock or stop the server while a
-        background thread is still mutating the repository. Leaving a lock
-        held past process exit is recoverable via --recover-stale-lock;
-        releasing it early while a Git mutation is in flight is not.
+        initialization and any in-flight advance() have fully stopped. This
+        method never releases resources directly: doing so could release
+        the lock or stop the server while a background thread is still
+        mutating the repository. Leaving a lock held past process exit is
+        recoverable via --recover-stale-lock; releasing it early while a
+        Git mutation is in flight is not.
+
+        Unmounting (e.g. via an unexpected pop, or a stack replacement)
+        never removes this screen from the app's lifecycle-ownership
+        registry — only finalize_run_screen() does that, and only once
+        cleanup is confirmed clean. This method's job is only to make sure
+        an app-owned retry coordinator exists for this now-detached screen
+        so it keeps getting cleaned up automatically with no interactive
+        UI available to press "q"/"Return to runs" on.
         """
         if not self._shutdown_requested:
             self.action_request_shutdown()
+        app = self._app_ref
+        if app is not None:
+            app.ensure_cleanup_coordinator(self)
 
 
 class _InvocationObserver:
@@ -1100,6 +1195,28 @@ class LoopSupervisorApp(App):
         super().__init__()
         self._project_root = project_root
         self._recover_stale_lock = recover_stale_lock
+        # Authoritative lifecycle-ownership registry: every RunScreen that
+        # has begun (or is about to begin) acquiring resources, whether or
+        # not it is currently mounted/visible/in Textual's own
+        # _screen_stacks. This — not _screen_stacks — is what
+        # _on_exit_app() consults to decide whether the process may
+        # actually exit. Membership is added in RunScreen.on_mount()
+        # before any resource acquisition, and removed only by
+        # finalize_run_screen() once a screen is fully quiescent and its
+        # cleanup is confirmed clean. All mutation of this registry (and
+        # of _run_screen_cleanup_tasks below) happens on the event-loop
+        # thread: on_mount/on_unmount are Textual callbacks that already
+        # run there, finalize_run_screen() is only ever invoked directly
+        # from the loop or via call_from_thread (which itself runs the
+        # target on the loop), and the coordinator tasks below are
+        # themselves asyncio tasks scheduled on this app's loop.
+        self._owned_run_screens: set[RunScreen] = set()
+        # At most one automatic cleanup/retry coordinator task per
+        # RunScreen. RunScreen.on_unmount() and _on_exit_app()'s drain
+        # loop both call ensure_cleanup_coordinator() rather than each
+        # starting their own worker, so a detached-and-unclean screen is
+        # never retried by two overlapping coordinators at once.
+        self._run_screen_cleanup_tasks: dict[RunScreen, asyncio.Task[None]] = {}
 
     def on_mount(self) -> None:
         self.push_screen(
@@ -1109,6 +1226,116 @@ class LoopSupervisorApp(App):
             )
         )
 
+    def register_run_screen(self, screen: RunScreen) -> None:
+        """Add `screen` to the lifecycle-ownership registry.
+
+        Must be called before that screen acquires any resource (lock,
+        server) — see RunScreen.on_mount(). Idempotent: registering an
+        already-registered screen is a no-op.
+        """
+        self._owned_run_screens.add(screen)
+
+    def ensure_cleanup_coordinator(self, screen: RunScreen) -> None:
+        """Ensure exactly one automatic cleanup/retry coordinator task is
+        running for `screen`.
+
+        A no-op if a coordinator for this exact screen is already running
+        (whether started by a prior on_unmount() or a prior _on_exit_app()
+        drain iteration) — callers never need to check first. If the
+        previous coordinator for this screen has already finished (either
+        because it successfully finalized the screen, or because it
+        failed unexpectedly), a fresh one is started. Never starts a
+        coordinator for a screen that is not (or is no longer)
+        registered — there would be nothing for it to do.
+        """
+        if screen not in self._owned_run_screens:
+            return
+        existing = self._run_screen_cleanup_tasks.get(screen)
+        if existing is not None and not existing.done():
+            return
+        self._run_screen_cleanup_tasks[screen] = asyncio.create_task(
+            self._run_screen_cleanup_coordinator(screen)
+        )
+
+    async def _run_screen_cleanup_coordinator(self, screen: RunScreen) -> None:
+        """Repeatedly request shutdown on `screen` and await completion,
+        retrying indefinitely on a fixed interval until either the screen
+        is finalized (deregistered) or it is no longer registered at all
+        (already finalized by someone else, e.g. a direct "q" press that
+        completed cleanly while this coordinator was between retries).
+
+        Never overlaps with itself: ensure_cleanup_coordinator() guards
+        against a second task being created while this one is still
+        running. A failure anywhere in this coroutine is caught and
+        swallowed rather than propagated — an unexpected exception here
+        must fail closed (the screen stays registered, so a later
+        ensure_cleanup_coordinator() call, e.g. from the next
+        _on_exit_app() drain iteration, starts a fresh attempt) rather
+        than silently abandoning ownership of a possibly-still-live
+        server/lock.
+        """
+        try:
+            while screen in self._owned_run_screens:
+                # Only await completion if shutdown is not already clean.
+                # request_shutdown()/_maybe_start_shutdown_attempt() do
+                # not set _shutdown_complete_event when cleanup already
+                # succeeded (there is no worker to run and signal it) —
+                # awaiting unconditionally here would deadlock on a
+                # screen that reached "already clean" via some path other
+                # than a _shutdown_worker attempt (e.g. cleanup performed
+                # directly by a failed-initialization handler). This
+                # check is the narrow, non-redesigning guard for that
+                # case; the full per-attempt signaling redesign is Step
+                # 5's responsibility, not this one's.
+                if not screen.shutdown_clean:
+                    screen.action_request_shutdown()
+                    await screen.await_shutdown_complete()
+                if screen not in self._owned_run_screens:
+                    return
+                if screen.ready_to_finalize:
+                    self.finalize_run_screen(screen)
+                    return
+                await asyncio.sleep(_SHUTDOWN_RETRY_INTERVAL_SECONDS)
+        except Exception:
+            # Fail closed: leave the screen registered so a subsequent
+            # ensure_cleanup_coordinator() call retries from scratch.
+            pass
+
+    def finalize_run_screen(self, screen: RunScreen) -> None:
+        """Deregister `screen` from the lifecycle-ownership registry, and
+        pop it if (and only if) it is still the exact active screen.
+
+        Must only be called once `screen.ready_to_finalize` is True (both
+        RunScreen._do_shutdown()'s success path and
+        _run_screen_cleanup_coordinator() check this before calling).
+        Idempotent: calling this for a screen that is no longer registered
+        (already finalized by a concurrent path) is a safe no-op.
+
+        Identity-safe by construction: `self.screen` is Textual's actual
+        current top-of-stack screen, so popping only happens when this
+        exact screen object is it. If a different screen has since become
+        active (this one was pushed under something else, or already
+        replaced), nothing is popped — only this screen's registry
+        membership (and thus this app's ownership bookkeeping) is
+        cleared. A detached screen that finalizes late can therefore never
+        pop an unrelated, currently active screen.
+        """
+        if screen not in self._owned_run_screens:
+            return
+        if self.screen is screen:
+            try:
+                self.pop_screen()
+            except Exception:
+                # There may be nothing left to pop to (e.g. this was the
+                # only screen on the stack), or a concurrent path may have
+                # already popped it. Either way, this screen's resources
+                # are already confirmed released (ready_to_finalize
+                # requires shutdown_clean), so deregistering below is
+                # still correct and safe.
+                pass
+        self._owned_run_screens.discard(screen)
+        self._run_screen_cleanup_tasks.pop(screen, None)
+
     async def _on_exit_app(self) -> None:
         """Own every app-level exit path.
 
@@ -1116,45 +1343,45 @@ class LoopSupervisorApp(App):
         and also what a driver posts on SIGINT/SIGTERM) only ever results
         in an ``ExitApp`` message being posted; ``_on_exit_app`` is
         Textual's single dispatch point for it regardless of the trigger.
-        Any active ``RunScreen`` on any screen stack still owns the
-        repository lock and possibly a running OpenCode server, so their
-        orderly shutdown (stop SSE, abort sessions, wait for the
-        in-flight advance() worker, stop the server, release the lock)
-        must complete before the underlying Textual shutdown sequence is
-        allowed to start closing screens and the driver.
+        Every ``RunScreen`` in ``_owned_run_screens`` — mounted or
+        detached, visible or not — still owns the repository lock and
+        possibly a running OpenCode server, so their orderly shutdown
+        (stop SSE, abort sessions, wait for the in-flight advance()
+        worker, stop the server, release the lock) must complete before
+        the underlying Textual shutdown sequence is allowed to start
+        closing screens and the driver. ``_screen_stacks`` is
+        deliberately never consulted here: it reflects Textual's
+        visibility bookkeeping, not lifecycle ownership, and an
+        unexpectedly detached-but-unclean screen would otherwise be
+        invisible to this method entirely (see the ADR 0009 "Detached-
+        screen ownership loss" blocker this registry replaces).
 
-        Awaiting via ``run_in_executor`` keeps the event loop alive and
-        processing messages (``call_from_thread`` calls from the
-        initialization/advance/shutdown worker threads, typed message
-        handlers, etc.) for as long as cleanup needs, rather than
-        blocking it.
-
-        Cleanup is retried automatically, indefinitely, until every
-        active ``RunScreen`` reports ``shutdown_clean``: a single attempt
-        can finish "complete but not clean" (e.g. ``server.stop()``
-        raised because the process could not be confirmed exited), and
-        the underlying Textual shutdown must never be allowed to proceed
-        on top of that — doing so would let the process exit while the
-        repository lock is still held or an OpenCode process may still be
-        alive. There is deliberately no overall timeout here: unresolved
-        child/lock ownership must keep blocking app-level exit rather than
-        being abandoned.
+        Draining is repeated, not a single pass: a coordinator's
+        completion may deregister some screens while leaving others
+        (or newly-registered ones, if a new run was started while exit was
+        already waiting) still owned, so the registry is re-read after
+        every batch of coordinators finishes, and the underlying Textual
+        shutdown is only invoked once it is completely empty. A
+        coordinator that raises is treated as leaving its screen owned
+        (fails closed) rather than as success. There is deliberately no
+        overall timeout here: unresolved child/lock ownership must keep
+        blocking app-level exit rather than being abandoned.
         """
-        run_screens = [
-            screen
-            for stack in self._screen_stacks.values()
-            for screen in stack
-            if isinstance(screen, RunScreen)
-        ]
-        for screen in run_screens:
-            screen.action_request_shutdown()
-        for screen in run_screens:
-            await screen.await_shutdown_complete()
-        while not all(screen.shutdown_clean for screen in run_screens):
-            await asyncio.sleep(_SHUTDOWN_RETRY_INTERVAL_SECONDS)
-            for screen in run_screens:
-                if not screen.shutdown_clean:
-                    screen.action_request_shutdown()
-            for screen in run_screens:
-                await screen.await_shutdown_complete()
+        while self._owned_run_screens:
+            pending = list(self._owned_run_screens)
+            for screen in pending:
+                self.ensure_cleanup_coordinator(screen)
+            tasks = [
+                self._run_screen_cleanup_tasks[screen]
+                for screen in pending
+                if screen in self._run_screen_cleanup_tasks
+            ]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            else:
+                # Every pending screen already had no coordinator to wait
+                # on (e.g. it was deregistered between the snapshot and
+                # ensure_cleanup_coordinator() finding it unregistered) —
+                # avoid a tight busy loop before re-checking the registry.
+                await asyncio.sleep(_SHUTDOWN_RETRY_INTERVAL_SECONDS)
         await super()._on_exit_app()
