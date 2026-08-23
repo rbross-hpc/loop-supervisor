@@ -22,7 +22,12 @@ from loop_supervisor.git import GitRepo
 from loop_supervisor.locking import _lock_path
 from loop_supervisor.state import RunOptions, load_state
 from loop_supervisor.supervisor import PHASE_OPERATIONAL_FAILURE
-from loop_supervisor.tui.app import _SHUTDOWN_RETRY_INTERVAL_SECONDS, LoopSupervisorApp, RunScreen
+from loop_supervisor.tui.app import (
+    _SHUTDOWN_RETRY_INTERVAL_SECONDS,
+    LoopSupervisorApp,
+    RunBrowserScreen,
+    RunScreen,
+)
 
 
 def _run_git(args, cwd):
@@ -614,13 +619,28 @@ async def test_app_exit_retains_lock_when_server_stop_fails(tmp_path, monkeypatc
                 break
             await pilot.pause(0.05)
 
-    assert "server_stop_attempted" in call_log
-    # Attempt finished, but not cleanly: lock and server ownership retained.
-    assert screen_ref["s"]._shutdown_complete_event.is_set()
-    assert screen_ref["s"]._shutdown_clean is False
-    assert _lock_path(repo.common_dir()).exists()
-    assert screen_ref["s"]._server is not None
-    assert screen_ref["s"]._lock is not None
+        # Assert while the screen is still mounted, before the pilot
+        # context exits: once this screen unmounts, its on_unmount() will
+        # start an automatic retry coordinator (see Step 4 -- detached
+        # screens must keep retrying indefinitely), which would otherwise
+        # race these assertions against a fresh in-flight attempt.
+        assert "server_stop_attempted" in call_log
+        # Attempt finished, but not cleanly: lock and server ownership
+        # retained.
+        assert screen.shutdown_clean is False
+        assert _lock_path(repo.common_dir()).exists()
+        assert screen._server is not None
+        assert screen._lock is not None
+
+        # Let the automatic retry coordinator run so this screen actually
+        # finishes its lifecycle (with a permanently-failing stop(), it
+        # will retry forever); stop failing so the test itself can exit
+        # cleanly rather than leaving the pilot teardown to await an
+        # unbounded coordinator.
+        def _eventually_succeeds() -> None:
+            call_log.append("server_stop_attempted")
+
+        screen._server.stop = _eventually_succeeds  # type: ignore[method-assign]
 
 
 @pytest.mark.asyncio
@@ -988,3 +1008,517 @@ class _NullRunner:
 class _NullInput:
     def request(self, *, kind, message, context):
         return None
+
+
+# --- Step 4: TUI ownership registry ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_registration_occurs_before_resource_acquisition(tmp_path, monkeypatch):
+    """The screen must be registered in the app's lifecycle-ownership
+    registry before it acquires any resource (lock/server) -- observed
+    here by checking registration happens strictly before the lock file
+    is created on disk."""
+    repo = _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+    _patch_server(monkeypatch, call_log=call_log)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        # Registration happens synchronously inside on_mount(), before
+        # run_worker() schedules _initialize() on a background thread, so
+        # it must already be true immediately after push_screen()'s
+        # mount dispatch completes on the next pause.
+        await pilot.pause()
+        assert screen in app._owned_run_screens
+
+        for _ in range(50):
+            if screen._state is not None:
+                break
+            await pilot.pause(0.05)
+        screen.action_request_shutdown()
+        for _ in range(50):
+            if not _lock_path(repo.common_dir()).exists():
+                break
+            await pilot.pause(0.05)
+
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+@pytest.mark.asyncio
+async def test_detached_unclean_screen_remains_registered_and_auto_retried(tmp_path, monkeypatch):
+    """A screen that becomes detached (unmounted) while unclean must stay
+    in the registry and get an automatic retry coordinator -- with no
+    interactive "q" press -- that eventually clears it once stop()
+    succeeds."""
+    repo = _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+    stop_calls = {"n": 0}
+
+    class _FailTwiceServer(_FakeServer):
+        def stop(self) -> None:
+            stop_calls["n"] += 1
+            call_log.append("server_stop")
+            if stop_calls["n"] <= 2:
+                raise RuntimeError("simulated stop failure")
+
+    def factory(project_dir, config):
+        return _FailTwiceServer(project_dir, config, call_log=call_log)
+
+    _patch_server(monkeypatch, factory=factory)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        await pilot.pause()
+        for _ in range(50):
+            if screen._state is not None:
+                break
+            await pilot.pause(0.05)
+
+        # Directly pop the screen (simulating an unexpected detach) rather
+        # than requesting shutdown first -- on_unmount() itself must both
+        # request shutdown and start the automatic retry coordinator.
+        app.pop_screen()
+        await pilot.pause()
+
+        assert screen in app._owned_run_screens
+        assert screen not in app.screen_stack
+
+        for _ in range(200):
+            if screen not in app._owned_run_screens:
+                break
+            await pilot.pause(0.05)
+
+    assert screen not in app._owned_run_screens
+    assert not _lock_path(repo.common_dir()).exists()
+    assert stop_calls["n"] >= 3
+
+
+@pytest.mark.asyncio
+async def test_stack_removal_unmount_race_cannot_hide_screen_from_exit(tmp_path, monkeypatch):
+    """A screen popped from the stack (removed from _screen_stacks) while
+    its cleanup is still blocked must still be found and cleaned up by
+    app-level exit -- proving the registry, not _screen_stacks, is
+    authoritative. A blocked advance() worker keeps the screen unclean
+    long enough to observe it missing from every _screen_stacks entry
+    while still present in the registry."""
+    repo = _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+    _patch_server(monkeypatch, call_log=call_log)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        await pilot.pause()
+        for _ in range(50):
+            if screen._state is not None:
+                break
+            await pilot.pause(0.05)
+
+        release_advance = threading.Event()
+        real_advance = screen._supervisor.advance
+
+        def blocked_advance(state):
+            release_advance.wait(timeout=10)
+            return real_advance(state)
+
+        monkeypatch.setattr(screen._supervisor, "advance", blocked_advance)
+        screen._start_advance()
+        await pilot.pause(0.1)
+        assert screen._transitioning is True
+
+        app.pop_screen()
+        await pilot.pause()
+        # Confirm this screen is genuinely gone from Textual's own
+        # bookkeeping, yet still registered and not yet clean (advance()
+        # is still blocked).
+        assert all(screen not in stack for stack in app._screen_stacks.values())
+        assert screen in app._owned_run_screens
+        assert not screen.shutdown_clean
+
+        app.exit()
+        time.sleep(0.2)
+        assert _lock_path(repo.common_dir()).exists()
+
+        release_advance.set()
+        for _ in range(200):
+            if not _lock_path(repo.common_dir()).exists():
+                break
+            await pilot.pause(0.05)
+
+    assert not _lock_path(repo.common_dir()).exists()
+    assert "server_stop" in call_log
+    assert screen not in app._owned_run_screens
+
+
+@pytest.mark.asyncio
+async def test_detached_clean_finalize_does_not_pop_unrelated_active_screen(tmp_path, monkeypatch):
+    """A detached screen that finalizes cleanly after a different screen
+    has since become active must not pop that unrelated active screen --
+    it may only deregister itself."""
+    repo = _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+    _patch_server(monkeypatch, call_log=call_log)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        await pilot.pause()
+        for _ in range(50):
+            if screen._state is not None:
+                break
+            await pilot.pause(0.05)
+
+        # Detach the RunScreen and push an unrelated browser screen in its
+        # place so it becomes the new active screen.
+        app.pop_screen()
+        await pilot.pause()
+        browser = RunBrowserScreen(tmp_path / "repo")
+        app.push_screen(browser)
+        await pilot.pause()
+        assert app.screen is browser
+
+        # The detached screen is still registered; wait for its automatic
+        # coordinator to finalize it.
+        for _ in range(200):
+            if screen not in app._owned_run_screens:
+                break
+            await pilot.pause(0.05)
+
+        # The unrelated active screen must still be exactly the one we
+        # pushed -- finalize_run_screen() must never have popped it.
+        assert app.screen is browser
+
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+@pytest.mark.asyncio
+async def test_detached_lock_release_only_failure_remains_registered_and_retries(
+    tmp_path, monkeypatch
+):
+    """A detached screen whose server.stop() succeeds but whose lock
+    release fails must remain registered (and retried) -- the retry must
+    skip the already-cleared server and retry only the lock release."""
+    repo = _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+    release_calls = {"n": 0}
+
+    _patch_server(monkeypatch, call_log=call_log)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        await pilot.pause()
+        for _ in range(50):
+            if screen._state is not None:
+                break
+            await pilot.pause(0.05)
+
+        original_release = screen._lock.release
+
+        def _flaky_release():
+            release_calls["n"] += 1
+            if release_calls["n"] == 1:
+                raise Exception("simulated transient lock-release failure")
+            return original_release()
+
+        monkeypatch.setattr(screen._lock, "release", _flaky_release)
+
+        app.pop_screen()
+        await pilot.pause()
+        assert screen in app._owned_run_screens
+
+        for _ in range(200):
+            if screen not in app._owned_run_screens:
+                break
+            await pilot.pause(0.05)
+
+    assert screen not in app._owned_run_screens
+    assert not _lock_path(repo.common_dir()).exists()
+    assert release_calls["n"] >= 2
+    # The server must have been stopped exactly once -- the retry must
+    # not re-invoke stop() on an already-cleared server.
+    assert call_log.count("server_stop") == 1
+
+
+@pytest.mark.asyncio
+async def test_app_exit_rechecks_registry_for_screens_added_while_draining(tmp_path, monkeypatch):
+    """A new RunScreen registered while _on_exit_app() is already draining
+    must also be waited on before the underlying Textual exit proceeds."""
+    _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+    stop_calls = {"n": 0}
+
+    class _SlowFirstScreenServer(_FakeServer):
+        def stop(self) -> None:
+            stop_calls["n"] += 1
+            call_log.append("server_stop")
+
+    def factory(project_dir, config):
+        return _SlowFirstScreenServer(project_dir, config, call_log=call_log)
+
+    _patch_server(monkeypatch, factory=factory)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        first = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(first)
+        await pilot.pause()
+        for _ in range(50):
+            if first._state is not None:
+                break
+            await pilot.pause(0.05)
+
+        second_started = threading.Event()
+        real_do_initialize = RunScreen._do_initialize
+
+        def _gate_then_initialize(self):
+            second_started.wait(timeout=10)
+            real_do_initialize(self)
+
+        # Register a second RunScreen but hold its initialization until
+        # after exit has already started draining, so it is only added to
+        # the registry via on_mount() concurrently with the drain loop's
+        # first iteration.
+        second = RunScreen(tmp_path / "repo2", run_id=None)
+        monkeypatch.setattr(second, "_do_initialize", _gate_then_initialize.__get__(second))
+
+        app.exit()
+        app.push_screen(second)
+        # _on_exit_app() runs as part of dispatching the ExitApp message
+        # on the App's own message pump, which therefore cannot process
+        # any further App-level messages (including callbacks driving
+        # pilot.pause()'s idle-wait) until it returns. The pushed screen's
+        # own Mount dispatch runs on its own independent message-pump
+        # task, though, so a plain asyncio.sleep() (not pilot.pause(),
+        # which would itself block on the App's now-busy message pump)
+        # can still observe it completing.
+        for _ in range(50):
+            if second in app._owned_run_screens:
+                break
+            await asyncio.sleep(0.05)
+        assert second in app._owned_run_screens
+        second_started.set()
+
+        for _ in range(200):
+            if not app._owned_run_screens:
+                break
+            await asyncio.sleep(0.05)
+
+    assert not app._owned_run_screens
+
+
+@pytest.mark.asyncio
+async def test_on_unmount_and_exit_drain_share_one_coordinator(tmp_path, monkeypatch):
+    """on_unmount() and _on_exit_app()'s drain loop must not each start
+    their own overlapping coordinator for the same screen -- only one
+    stop() call should ever be in flight at a time."""
+    _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+    concurrent = {"n": 0, "max": 0}
+    lock = threading.Lock()
+
+    class _SlowStopServer(_FakeServer):
+        def stop(self) -> None:
+            with lock:
+                concurrent["n"] += 1
+                concurrent["max"] = max(concurrent["max"], concurrent["n"])
+            call_log.append("server_stop")
+            time.sleep(0.2)
+            with lock:
+                concurrent["n"] -= 1
+
+    def factory(project_dir, config):
+        return _SlowStopServer(project_dir, config, call_log=call_log)
+
+    _patch_server(monkeypatch, factory=factory)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        await pilot.pause()
+        for _ in range(50):
+            if screen._state is not None:
+                break
+            await pilot.pause(0.05)
+
+        app.pop_screen()
+        app.exit()
+        for _ in range(200):
+            if not app._owned_run_screens:
+                break
+            await pilot.pause(0.05)
+
+    assert not app._owned_run_screens
+    assert concurrent["max"] == 1
+
+
+@pytest.mark.asyncio
+async def test_base_exit_never_called_while_registry_non_empty(tmp_path, monkeypatch):
+    """super()._on_exit_app() (the underlying Textual shutdown) must never
+    be invoked while any screen remains in the app's ownership registry,
+    regardless of Textual's own _screen_stacks bookkeeping."""
+    _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+    stop_calls = {"n": 0}
+
+    class _FailOnceServer(_FakeServer):
+        def stop(self) -> None:
+            stop_calls["n"] += 1
+            call_log.append("server_stop")
+            if stop_calls["n"] == 1:
+                raise RuntimeError("simulated transient stop failure")
+
+    def factory(project_dir, config):
+        return _FailOnceServer(project_dir, config, call_log=call_log)
+
+    _patch_server(monkeypatch, factory=factory)
+
+    base_exit_registry_snapshots: list[bool] = []
+    from textual.app import App as _TextualApp
+
+    original_on_exit_app = _TextualApp._on_exit_app
+
+    app_ref: dict[str, LoopSupervisorApp] = {}
+
+    async def _spy_on_exit_app(self):
+        app = app_ref.get("a")
+        base_exit_registry_snapshots.append(bool(app._owned_run_screens) if app else False)
+        await original_on_exit_app(self)
+
+    monkeypatch.setattr(_TextualApp, "_on_exit_app", _spy_on_exit_app)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    app_ref["a"] = app
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        await pilot.pause()
+        for _ in range(50):
+            if screen._state is not None:
+                break
+            await pilot.pause(0.05)
+
+        app.exit()
+        for _ in range(200):
+            if not app._owned_run_screens:
+                break
+            await pilot.pause(0.05)
+
+    assert not app._owned_run_screens
+    assert base_exit_registry_snapshots
+    # Every time the underlying Textual exit sequence actually ran, the
+    # registry must have already been empty.
+    assert all(not is_nonempty for is_nonempty in base_exit_registry_snapshots)
+
+
+@pytest.mark.asyncio
+async def test_registry_membership_clears_only_after_quiescence_and_clean_release(
+    tmp_path, monkeypatch
+):
+    """Registry membership must persist through a blocked advance() worker
+    and a failed stop() -- clearing only once both quiescence
+    (_init_done_event/_advance_done_event) and a clean resource release
+    are achieved simultaneously."""
+    repo = _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+    stop_calls = {"n": 0}
+
+    class _FailOnceServer(_FakeServer):
+        def stop(self) -> None:
+            stop_calls["n"] += 1
+            call_log.append("server_stop")
+            if stop_calls["n"] == 1:
+                raise RuntimeError("simulated transient stop failure")
+
+    def factory(project_dir, config):
+        return _FailOnceServer(project_dir, config, call_log=call_log)
+
+    _patch_server(monkeypatch, factory=factory)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        await pilot.pause()
+        for _ in range(50):
+            if screen._state is not None:
+                break
+            await pilot.pause(0.05)
+
+        release_advance = threading.Event()
+        real_advance = screen._supervisor.advance
+
+        def blocked_advance(state):
+            release_advance.wait(timeout=10)
+            return real_advance(state)
+
+        monkeypatch.setattr(screen._supervisor, "advance", blocked_advance)
+        screen._start_advance()
+        await pilot.pause(0.1)
+        assert screen._transitioning is True
+
+        screen.action_request_shutdown()
+        time.sleep(0.2)
+        # Still registered: advance() has not unwound yet.
+        assert screen in app._owned_run_screens
+        assert not screen.ready_to_finalize
+
+        release_advance.set()
+        for _ in range(50):
+            if screen._shutdown_complete_event.is_set():
+                break
+            await pilot.pause(0.05)
+
+        # First stop() attempt failed: still registered, not ready.
+        assert screen in app._owned_run_screens
+        assert screen.shutdown_clean is False
+
+        # Retry succeeds: now quiescent and clean, so it may finalize.
+        screen.action_request_shutdown()
+        for _ in range(100):
+            if screen not in app._owned_run_screens:
+                break
+            await pilot.pause(0.05)
+
+    assert screen not in app._owned_run_screens
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+@pytest.mark.asyncio
+async def test_no_leftover_cleanup_task_lock_or_server_after_clean_exit(tmp_path, monkeypatch):
+    """After a fully clean app exit, no coordinator task, lock file,
+    server owner, or registry entry may remain."""
+    repo = _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+    _patch_server(monkeypatch, call_log=call_log)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        await pilot.pause()
+        for _ in range(50):
+            if screen._state is not None:
+                break
+            await pilot.pause(0.05)
+
+        app.exit()
+        for _ in range(200):
+            if not _lock_path(repo.common_dir()).exists():
+                break
+            await pilot.pause(0.05)
+
+    assert not _lock_path(repo.common_dir()).exists()
+    assert not app._owned_run_screens
+    assert not app._run_screen_cleanup_tasks
+    assert screen._server is None
+    assert screen._lock is None

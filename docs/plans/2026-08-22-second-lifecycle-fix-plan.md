@@ -288,6 +288,72 @@ these fixes must uphold and extend.
       `pytest -q` 632 passed across three consecutive clean runs with no
       fixture process leaks; `ruff check .`, `ruff format --check .`,
       `mypy src`, and `git diff --check` clean.
-- [ ] Step 4 — TUI ownership registry (blocker 2)
+- [x] Step 4 — TUI ownership registry (blocker 2). Implemented on
+      `fix/tui-ownership-registry`. `LoopSupervisorApp` now maintains an
+      authoritative `_owned_run_screens` registry, populated in
+      `RunScreen.on_mount()` before any resource acquisition (lock/
+      server) and consulted instead of Textual's own `_screen_stacks`
+      wherever lifecycle ownership must be determined. Unmounting never
+      deregisters: `RunScreen.on_unmount()` requests shutdown and starts
+      (or reuses) exactly one app-owned automatic retry coordinator per
+      screen (`ensure_cleanup_coordinator()`/
+      `_run_screen_cleanup_coordinator()`), which retries indefinitely on
+      a fixed interval with no interactive UI required until cleanup is
+      confirmed clean. A screen deregisters only via `finalize_run_screen()`,
+      which requires `RunScreen.ready_to_finalize` (both `_init_done_event`
+      and `_advance_done_event` set, and `shutdown_clean` True) and is
+      identity-safe: it pops only when the screen being finalized is
+      exactly `self.screen`, so a detached screen finalizing late can
+      never pop an unrelated newly-active screen. `_on_exit_app()` was
+      rewritten to repeatedly drain the registry — ensuring a coordinator
+      exists for every currently-registered screen, awaiting them, and
+      re-reading the registry — rather than taking a single
+      `_screen_stacks` snapshot, so screens registered while exit is
+      already waiting (or unexpectedly detached-and-unclean screens) are
+      never invisible to it; the underlying Textual `_on_exit_app()` runs
+      only once the registry is completely empty. `on_unmount()` and the
+      exit-drain loop share exactly one coordinator per screen, so a
+      detached-and-unclean screen is never retried by two overlapping
+      attempts.
+
+      A hang was found and fixed during implementation:
+      `RunScreen.await_shutdown_complete()` previously handed a single
+      unbounded `threading.Event.wait()` to `run_in_executor()`; since
+      that blocking call cannot be interrupted, a coordinator task
+      awaiting it while the event would never be set (e.g. cleanup
+      already completed by another path, such as a failed-initialization
+      handler, with no `_shutdown_worker` attempt to signal it) could
+      occupy a real OS thread indefinitely and hang the executor's own
+      shutdown/join. Remediated by polling with a short bounded wait per
+      executor call instead, so the coroutine remains promptly
+      cancellable. The cleanup coordinator also checks
+      `screen.shutdown_clean` before awaiting completion, rather than
+      awaiting unconditionally, for the same "already clean with nothing
+      to signal" case — deliberately narrow and not a redesign of the
+      reusable `_shutdown_complete_event`, which remains Step 5's
+      responsibility.
+
+      Added 10 new deterministic tests to `test_tui_app.py`: registration
+      before resource acquisition; a detached unclean screen remaining
+      registered and auto-retried with no interactive input; a stack-
+      removal/on_unmount() race (screen absent from every
+      `_screen_stacks` entry while a blocked `advance()` keeps it
+      unclean) not hiding it from app-level exit; a detached clean
+      finalize not popping a newly-active unrelated screen; a detached
+      lock-release-only failure remaining registered and retrying without
+      re-invoking the already-cleared server's `stop()`; app exit
+      rechecking the registry for a screen registered while already
+      draining; `on_unmount()` and exit-drain sharing one coordinator
+      (no overlapping `stop()` calls); base Textual exit never running
+      while the registry is non-empty; registry membership clearing only
+      after quiescence and a clean release; and no leftover coordinator
+      task/lock file/server owner/registry entry after a clean exit.
+      Final verification: `test_tui_app.py` 30 passed (43 consecutive
+      clean runs during hang investigation, plus 3 further consecutive
+      clean runs after the fix); full `pytest -q` 642 passed across three
+      consecutive clean runs with no fixture process leaks; `ruff check .`,
+      `ruff format --check .`, `mypy src`, and `git diff --check` clean.
+      Step 3 headless runtime semantics were not touched. Step 5's
+      per-attempt shutdown/generation redesign was not implemented.
 - [ ] Step 5 — per-attempt shutdown signaling (blocker 1)
 - [ ] Step 6 — documentation and full verification

@@ -141,6 +141,38 @@ OpenCode process may still be alive. The same retry is available
 interactively via "q" / the "Return to runs" button after a failed
 attempt.
 
+**"Active `RunScreen`" means every lifecycle-owned screen, mounted or
+detached — not just those currently in Textual's `_screen_stacks`.**
+`LoopSupervisorApp` maintains its own authoritative registry
+(`_owned_run_screens`), populated in `RunScreen.on_mount()` before any
+resource acquisition and cleared only by `finalize_run_screen()` once a
+screen is fully quiescent (`_init_done_event`/`_advance_done_event` both
+set) and its last cleanup attempt confirmed clean
+(`RunScreen.ready_to_finalize`). Unmounting a screen — whether via normal
+shutdown, an unexpected pop, or a stack replacement — never removes it
+from this registry by itself; `RunScreen.on_unmount()` instead starts (or
+reuses) an app-owned automatic retry coordinator
+(`ensure_cleanup_coordinator()`/`_run_screen_cleanup_coordinator()`) that
+keeps requesting shutdown on a fixed interval, indefinitely, with no
+interactive UI required, until that screen's cleanup is confirmed clean.
+`_on_exit_app()` repeatedly drains this registry — ensuring every
+currently-registered screen has a running coordinator, awaiting them, and
+re-reading the registry — rather than taking a single snapshot of
+`_screen_stacks`, so a screen registered while exit is already waiting
+(or one that became detached-and-unclean) is never invisible to it. The
+underlying Textual `_on_exit_app()` is invoked only once the registry is
+completely empty. `on_unmount()` and the exit-drain loop share exactly
+one coordinator per screen (`ensure_cleanup_coordinator()` is a no-op if
+one is already running), so a detached-and-unclean screen is never
+retried by two overlapping attempts at once.
+
+Finalization is identity-safe: `finalize_run_screen()` only calls
+`pop_screen()` when the screen being finalized is `self.screen` (Textual's
+actual current top-of-stack screen) — never unconditionally. A screen
+that finalizes late, after a different screen has since become active,
+therefore only deregisters itself and never pops the unrelated active
+screen.
+
 ### Operational failure vs terminal failure
 
 Failures are classified into two categories:
