@@ -31,8 +31,6 @@ _EXPECTED_CLI_ERRORS: tuple[type[Exception], ...] = (
 
 _TEMPLATE_MARKERS = ("pyproject.toml", "src/loop_supervisor", ".opencode/agents")
 
-__all__ = ["StdinInputProvider", "build_parser", "main"]
-
 
 def _project_root(path: str | None) -> Path:
     return Path(path).resolve() if path else Path.cwd()
