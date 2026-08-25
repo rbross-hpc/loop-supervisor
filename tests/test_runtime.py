@@ -2267,13 +2267,19 @@ def test_run_new_defaults_to_stdin_input_provider_when_not_supplied(tmp_path):
 # ===================================================================
 # Characterization baseline (pre-RunSession-refactor)
 #
-# These tests pin the EXACT observable cleanup contract of the headless
-# run/resume paths: how many times stop() is attempted, the exact
-# retained-lock diagnostic wording, how many notes are attached, and
-# whether the repository lock survives on disk.
+# These tests pin the observable cleanup contract of the headless
+# run/resume paths: how many times stop() is attempted, the opening
+# clause of the retained-lock diagnostic, how many notes are attached,
+# and whether the repository lock survives on disk.
 #
-# They exist because a previous refactor attempt silently changed all
-# three of those things while the whole suite stayed green: the existing
+# Scope, stated precisely: the diagnostic assertions use startswith(),
+# so they pin the identifying opening clause and the note count, not the
+# full sentence. A change to the trailing operator guidance would not be
+# caught here. That is weaker than "exact wording" (as an earlier version
+# of this comment claimed) but strictly stronger than what it replaced.
+#
+# They exist because a previous refactor attempt silently changed three
+# of these properties while the whole suite stayed green: the existing
 # assertions were substring-based ("cleanup" in note and "retained" in
 # note), which happily matched a *different*, wrong sentence. Anything
 # here that starts failing during a refactor is a behaviour change to be
@@ -3574,10 +3580,15 @@ def test_start_server_call_lineno_locates_the_call(tmp_path):
 #      SupervisorLock.release(), which keeps its ownership token
 #      specifically so callers can retry (locking.py:426-437).
 #
-# Tests that document currently-broken behaviour are marked
-# xfail(strict=True): the suite stays green now, and they flip loudly
-# the moment the fix lands. Tests here without an xfail marker cover
-# behaviour that is already correct but was previously unasserted.
+# Both defects were introduced as strict xfails in the preceding commit
+# and are fixed here, so these now assert the corrected contract:
+#
+#   * every close() that ends with the lock still held reports it, by
+#     raising or (when a primary is unwinding) by annotating that
+#     primary -- a retry is never silently successful;
+#   * a confirmed stop() followed by a failed release lands in the
+#     non-terminal RELEASE_PENDING state, retryable without re-spending
+#     the stop() budget.
 # ===================================================================
 
 
@@ -3607,11 +3618,6 @@ def _retry_server(*, start_exc=None, stop_fails=True, stop_counter=None):
 # --- Defect 1: a failed retry must not look like success --------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Defect 1: _cleanup_note_attached suppresses the outcome of later "
-    "close() retries, so a still-failing retry returns None (runtime.py:764-768)",
-)
 def test_retry_close_after_startup_failure_still_failing_must_raise(tmp_path, monkeypatch):
     """An explicit close() retry whose stop() still fails must report that.
 
@@ -3639,10 +3645,6 @@ def test_retry_close_after_startup_failure_still_failing_must_raise(tmp_path, mo
             session.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Defect 1: same suppression after a body/run failure",
-)
 def test_retry_close_after_body_failure_still_failing_must_raise(tmp_path, monkeypatch):
     import loop_supervisor.runtime as rt
     from loop_supervisor.locking import _lock_path
@@ -3665,10 +3667,6 @@ def test_retry_close_after_body_failure_still_failing_must_raise(tmp_path, monke
             session.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Defect 1: same suppression after a startup interrupt",
-)
 def test_retry_close_after_startup_interrupt_still_failing_must_raise(tmp_path, monkeypatch):
     import loop_supervisor.runtime as rt
     from loop_supervisor.locking import _lock_path
@@ -3734,17 +3732,14 @@ def test_retry_close_after_startup_failure_succeeding_releases_lock(tmp_path, mo
 # --- Defect 2: a failed lock release must stay retryable --------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Defect 2: close() sets CLOSED before raising on release failure "
-    "(runtime.py:796), so the retry no-ops at :748 and the lock is stranded",
-)
 def test_retry_close_after_release_failure_releases_lock(tmp_path):
     """A transient LockError from release() must not strand the lock.
 
     SupervisorLock.release() deliberately retains its ownership token on
     transient failure so the caller can retry; RunSession must not throw
-    that away by making itself terminal."""
+    that away by making itself terminal. The session must land in the
+    non-terminal RELEASE_PENDING state, and the failure must surface as
+    LockError (the type the parent raised on this path)."""
     import loop_supervisor.runtime as rt
     from loop_supervisor.locking import LockError, _lock_path
 
@@ -3765,8 +3760,9 @@ def test_retry_close_after_release_failure_releases_lock(tmp_path):
             session.__enter__()
             session.start_server()
 
-            with pytest.raises(rt.RuntimeError_):
+            with pytest.raises(LockError):
                 session.close()
+            assert session.state is rt.SessionState.RELEASE_PENDING
             assert _lock_path(repo.common_dir()).exists()
 
             # release() would now succeed; the session must let it.
@@ -3774,14 +3770,10 @@ def test_retry_close_after_release_failure_releases_lock(tmp_path):
         finally:
             rt._LockLease.release = original_release
 
+    assert session.state is rt.SessionState.CLOSED
     assert not _lock_path(repo.common_dir()).exists()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Defect 2 variant: __enter__ marks FAILED after a release failure, "
-    "so the still-held lock cannot be retried (runtime.py:581-594, :748)",
-)
 def test_retry_close_after_enter_release_failure_releases_lock(tmp_path):
     """A post-lock __enter__ failure whose release also fails must leave the
     retained lock retryable rather than terminal."""
@@ -3859,18 +3851,17 @@ def test_retry_release_does_not_respend_stop_budget(tmp_path):
             session = rt.new_run_session(repo.root, _make_options())
             session.__enter__()
             session.start_server()
-            with pytest.raises(rt.RuntimeError_):
+            with pytest.raises(LockError):
                 session.close()
+            assert session.state is rt.SessionState.RELEASE_PENDING
             after_first = stop_calls[0]
-            try:
-                session.close()
-            except rt.RuntimeError_:
-                pass
+            session.close()
         finally:
             rt._LockLease.release = original_release
 
     assert after_first == 1, stop_calls
     assert stop_calls[0] == 1, stop_calls
+    assert session.state is rt.SessionState.CLOSED
 
 
 # --- previously unasserted correct behaviour --------------------------
@@ -4033,3 +4024,105 @@ def test_resume_run_session_validation_failure_is_wrapped_and_releases_lock(tmp_
     assert started == []
     assert session.state is rt.SessionState.FAILED
     assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_abort_active_invocations_swallows_base_exception(tmp_path):
+    """The "never raises" contract must be enforced by RunSession itself.
+
+    OpenCodeServer.abort_active_sessions() suppresses only per-session
+    Exceptions, so a KeyboardInterrupt from that call would otherwise
+    escape a shutdown path and replace whatever outcome is being
+    reported."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+
+    class AbortExplodesServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def add_observer(self, obs) -> None:
+            pass
+
+        def abort_active_sessions(self) -> None:
+            raise KeyboardInterrupt()
+
+    with _patched_session_env(repo, server_cls=AbortExplodesServer):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            # Must not propagate.
+            session.abort_active_invocations()
+
+
+def test_release_pending_after_body_failure_annotates_and_stays_retryable(tmp_path):
+    """A release failure while a body exception unwinds must annotate the
+    primary (never replace it) and still leave the lock retryable."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import LockError, _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    the_error = ValueError("body blew up")
+    original_release = rt._LockLease.release
+    fail_once = [True]
+
+    def flaky_release(self):
+        if fail_once[0]:
+            fail_once[0] = False
+            raise LockError("transient release failure")
+        original_release(self)
+
+    with _patched_session_env(repo):
+        rt._LockLease.release = flaky_release
+        try:
+            session = rt.new_run_session(repo.root, _make_options())
+            with pytest.raises(ValueError) as excinfo:
+                with session:
+                    session.start_server()
+                    raise the_error
+
+            assert excinfo.value is the_error
+            assert session.state is rt.SessionState.RELEASE_PENDING
+            assert _lock_path(repo.common_dir()).exists()
+
+            session.close()
+        finally:
+            rt._LockLease.release = original_release
+
+    notes = getattr(the_error, "__notes__", [])
+    assert any("lock could not be released" in n.lower() for n in notes), notes
+    assert session.state is rt.SessionState.CLOSED
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_repeated_close_does_not_double_annotate_primary(tmp_path, monkeypatch):
+    """Note suppression is identity-scoped: a second close() must not
+    annotate the same exception twice, but must still report."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    the_error = ValueError("body blew up")
+
+    with _patched_session_env(repo, server_cls=_retry_server()):
+        session = rt.new_run_session(repo.root, _make_options())
+        with pytest.raises(ValueError):
+            with session:
+                session.start_server()
+                raise the_error
+
+        first_notes = list(getattr(the_error, "__notes__", []))
+        assert len(first_notes) == 1, first_notes
+
+        # An explicit retry reports by raising, and must not re-annotate.
+        with pytest.raises(RuntimeError_):
+            session.close(primary=the_error)
+
+    assert list(getattr(the_error, "__notes__", [])) == first_notes

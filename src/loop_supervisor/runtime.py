@@ -42,12 +42,22 @@ confirmed stop() releases the lock. A primary run/resume/startup failure
 always takes precedence in what is raised; a secondary cleanup failure is
 attached as a note rather than replacing it.
 
-**``close()`` is the single owner of cleanup.** It is the only place that
-confirms stop() and the only place that releases the lock. The startup
-helpers (``_startup_failure``, ``_finalize_interrupted_startup``) only
-persist and annotate; they never touch the lease. Splitting that
-ownership previously caused the documented ``_CLEANUP_ATTEMPTS`` bound to
-be applied twice and a confirmed-clean interrupt to leak its lock.
+**``close()`` owns the lock and the cleanup outcome.** It is the only
+place that releases the lock and the only place that decides what an
+unconfirmed stop() means for the lease. The startup helpers
+(``_startup_failure``, ``_finalize_interrupted_startup``) only persist
+and annotate; they never touch the lease. Splitting *that* ownership
+previously caused a confirmed-clean interrupt to leak its lock.
+
+One qualification, because the earlier wording overstated this:
+``start_server()`` does invoke ``_confirm_cleanup()`` directly on the
+ordinary-``Exception`` startup path, since ``_startup_failure`` must know
+whether the lock was retained in order to word its diagnostic. The
+bounded ``_CLEANUP_ATTEMPTS`` budget is nevertheless spent exactly once
+per failure sequence: that outcome is stashed in ``_pending_cleanup`` and
+consumed by the ``close()`` which ``__exit__`` runs immediately after.
+So stop() confirmation is *initiated* in two places; the retry budget and
+all lease/lock decisions remain single-owner.
 
 ``__exit__`` always calls ``close()``. When a body exception is already
 propagating, any failure from ``close()`` is converted into a note on that
@@ -73,6 +83,7 @@ not claim complete primary-error precedence in every interrupt scenario.
 from __future__ import annotations
 
 import inspect
+import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -169,6 +180,19 @@ def _confirm_server_stopped(server: OpenCodeServer) -> _CleanupOutcome:
         else:
             return _CleanupOutcome(confirmed=True, last_error=None, attempts=attempt + 1)
     return _CleanupOutcome(confirmed=False, last_error=last_error, attempts=_CLEANUP_ATTEMPTS)
+
+
+def _current_exception() -> BaseException | None:
+    """Return the exception currently being handled, if any.
+
+    Used by ``RunSession.close()`` to tell an ``__exit__``-driven call
+    (where the primary is actively unwinding and will carry a note on its
+    own) from an explicit ``close(primary=...)`` made outside that unwind
+    (where the caller learns the outcome only from what ``close()``
+    raises). Getting that distinction wrong is how a failed retry ends up
+    looking like a successful one.
+    """
+    return sys.exc_info()[1]
 
 
 def _add_note(exc: BaseException, message: str) -> None:
@@ -360,9 +384,21 @@ class SessionState(Enum):
                                             ↕
                                         ADVANCING
 
-    ``CLOSED`` and ``FAILED`` are terminal. ``CLEANUP_UNRESOLVED`` means
-    ``server.stop()`` could not be confirmed: the lock is deliberately
-    retained and ``close()`` may be called again to retry.
+    ``CLOSED`` and ``FAILED`` are terminal; every other state permits a
+    further ``close()``.
+
+    Two distinct non-terminal failure states exist because they describe
+    materially different operator situations:
+
+    ``CLEANUP_UNRESOLVED``
+        ``server.stop()`` could not be confirmed. An OpenCode process may
+        still be alive, so the lock is deliberately retained and must not
+        be released. ``close()`` retries the bounded stop().
+
+    ``RELEASE_PENDING``
+        ``server.stop()`` *was* confirmed — no process survives — but
+        releasing the lock failed. Only the release needs retrying;
+        ``close()`` must not spend the stop() budget again.
     """
 
     NEW = "new"
@@ -373,6 +409,7 @@ class SessionState(Enum):
     ADVANCING = "advancing"
     CLOSING = "closing"
     CLEANUP_UNRESOLVED = "cleanup_unresolved"
+    RELEASE_PENDING = "release_pending"
     CLOSED = "closed"
     FAILED = "failed"
 
@@ -438,9 +475,17 @@ class RunSession:
         # and the close() that immediately follows must consume that same
         # result rather than spending the budget a second time.
         self._pending_cleanup: _CleanupOutcome | None = None
-        # True once a retained-lock note/message has already been emitted
-        # for this failure, so close() does not attach a duplicate.
-        self._cleanup_note_attached = False
+        # Exceptions that have already received a retained-lock note, so a
+        # second close() does not annotate the same object twice.
+        #
+        # Deliberately scoped to specific exception *identities* rather
+        # than being a session-wide "already reported" flag. A bare flag
+        # also suppressed the *outcome* of later independent close()
+        # retries, so a retry whose stop() still failed returned None and
+        # was indistinguishable from success while the lock was still
+        # held. Suppression must cover duplicate annotation only, never
+        # whether close() reports failure.
+        self._annotated: list[BaseException] = []
 
     # -- read-only views -------------------------------------------------
 
@@ -471,11 +516,21 @@ class RunSession:
         self._server.add_observer(observer)
 
     def abort_active_invocations(self) -> None:
-        """Best-effort abort of any in-flight agent invocations. Safe to
-        call before startup (no-op) and never raises."""
+        """Best-effort abort of any in-flight agent invocations.
+
+        Safe to call before startup (no-op) and never raises. The guard is
+        real rather than decorative: ``abort_active_sessions()`` suppresses
+        only per-session ``Exception``s, so a ``KeyboardInterrupt`` or a
+        failure outside that inner loop would otherwise escape. Callers
+        use this on shutdown paths where an escaping exception would
+        replace whatever outcome is already being reported.
+        """
         if self._server is None:
             return
-        self._server.abort_active_sessions()
+        try:
+            self._server.abort_active_sessions()
+        except BaseException:  # noqa: BLE001 - best-effort by contract
+            pass
 
     # -- lifecycle -------------------------------------------------------
 
@@ -581,16 +636,22 @@ class RunSession:
         except BaseException as enter_exc:
             # Nothing here can have started an OpenCode process, so the
             # lease is still releasable and the lock must not be stranded.
+            released = True
             if lease.releasable:
                 try:
                     lease.release()
                 except LockError as release_exc:
-                    _add_note(
+                    released = False
+                    self._annotate_once(
                         enter_exc,
                         "additionally, the repository lock could not be released: "
                         + _safe_exception_text(release_exc),
                     )
-            self._state = SessionState.FAILED
+            # A failed release leaves the lock on disk and still owned by
+            # this session, so entry must not be terminal: RELEASE_PENDING
+            # keeps close() able to retry the release. FAILED is correct
+            # only when nothing is still held.
+            self._state = SessionState.FAILED if released else SessionState.RELEASE_PENDING
             raise
 
         self._state = SessionState.READY
@@ -675,10 +736,15 @@ class RunSession:
             # Hand this outcome to the close() that __exit__ is about to
             # run, so the bounded retry budget is spent exactly once.
             self._pending_cleanup = cleanup
-            # _startup_failure has already attached the retained-lock note
-            # to the RuntimeError_ it raises; close() must not add another.
-            self._cleanup_note_attached = not cleanup.confirmed
-            _startup_failure(self._supervisor, self._run_state, self._server, exc, cleanup)
+            try:
+                _startup_failure(self._supervisor, self._run_state, self._server, exc, cleanup)
+            except BaseException as startup_exc:
+                # _startup_failure has already described the retained lock
+                # in the exception it raised; record that identity so the
+                # close() in __exit__ does not annotate it a second time.
+                if not cleanup.confirmed:
+                    self._annotated.append(startup_exc)
+                raise
 
         # Separate stage: a failure here is a runner-handoff failure, not a
         # startup failure, and propagates raw.
@@ -738,6 +804,14 @@ class RunSession:
         * ``server.stop()`` not confirmed — leave the lease unreleasable
           so the lock stays on disk, set ``CLEANUP_UNRESOLVED``, and
           report. Calling ``close()`` again retries the bounded stop().
+        * ``server.stop()`` confirmed but ``release()`` failed — set
+          ``RELEASE_PENDING`` and report. Calling ``close()`` again
+          retries the release **only**, without re-spending the stop()
+          budget.
+
+        Every call that ends with the lock still held reports it, either
+        by raising or (when a primary is unwinding) by annotating that
+        primary. A retry is never silently successful.
 
         ``primary`` is the exception already propagating out of the
         ``with`` body, if any. It selects the retained-lock wording ("the
@@ -753,39 +827,56 @@ class RunSession:
             self._state = SessionState.CLOSED
             return
 
+        state_before_close = self._state
         self._state = SessionState.CLOSING
 
-        if self._server_may_exist and self._server is not None:
+        # Skip stop() entirely when a previous close() already confirmed it
+        # and only the lock release remains outstanding: the bounded retry
+        # budget belongs to cleanup, not to lock release.
+        if (
+            state_before_close is not SessionState.RELEASE_PENDING
+            and self._server_may_exist
+            and self._server is not None
+        ):
             outcome = self._confirm_cleanup()
             if not outcome.confirmed:
                 # Cleanup unresolved: the lease stays unreleasable, so the
                 # lock deliberately remains on disk for --recover-stale-lock.
                 self._state = SessionState.CLEANUP_UNRESOLVED
-                if self._cleanup_note_attached:
-                    # _startup_failure already reported the retained lock in
-                    # the exception it raised; do not duplicate it. That
-                    # exception is still propagating through __exit__.
-                    return
+
+                # Annotate whatever exception is already in flight, then
+                # report. Annotation targets are tracked by identity, so a
+                # repeated close() never double-annotates -- but suppression
+                # applies to the *note* only. Every call still reports the
+                # unresolved outcome, because a caller that gets a silent
+                # return cannot tell a successful retry from a failed one.
                 startup_exc = self._startup_exception
                 if startup_exc is not None:
                     # An operator's interrupt must stay an interrupt: annotate
                     # the exact object rather than wrapping it in RuntimeError_.
-                    self._cleanup_note_attached = True
-                    _add_note(
+                    self._annotate_once(
                         startup_exc,
                         _unresolved_cleanup_message("startup was interrupted; the", outcome),
                     )
-                    return
+                    if primary is startup_exc:
+                        # __exit__ is unwinding that exact interrupt; it
+                        # carries the note and needs nothing raised here.
+                        return
+                    _raise_unresolved_cleanup("startup was interrupted; the", outcome)
+
                 if primary is not None:
-                    # A real run failure is already propagating; it is far
-                    # more actionable than this secondary cleanup detail, so
-                    # annotate it rather than replacing it.
-                    self._cleanup_note_attached = True
-                    _add_note(
+                    self._annotate_once(
                         primary,
                         _unresolved_cleanup_message("the run failed and the", outcome),
                     )
-                    return
+                    if primary is _current_exception():
+                        # __exit__ is unwinding this primary; it carries the
+                        # note. Raising instead would be swallowed anyway.
+                        return
+                    # An explicit close(primary=...) outside the unwind: the
+                    # caller learns the outcome only from what we raise.
+                    _raise_unresolved_cleanup("the run failed and the", outcome)
+
                 _raise_unresolved_cleanup("run completed but", outcome)
             lease.mark_releasable()
 
@@ -793,13 +884,38 @@ class RunSession:
             try:
                 lease.release()
             except LockError as release_exc:
-                self._state = SessionState.CLOSED
-                raise RuntimeError_(
-                    "the repository lock could not be released: "
-                    + _safe_exception_text(release_exc)
-                ) from release_exc
+                # Cleanup is confirmed but the lock is still on disk.
+                # SupervisorLock.release() keeps its ownership token on a
+                # transient failure precisely so this can be retried, so
+                # this state must stay non-terminal.
+                self._state = SessionState.RELEASE_PENDING
+                if primary is not None:
+                    self._annotate_once(
+                        primary,
+                        "additionally, the repository lock could not be released: "
+                        + _safe_exception_text(release_exc),
+                    )
+                    return
+                # Preserve the parent's exception type on this path: an
+                # otherwise-successful operation whose release fails raised
+                # LockError before RunSession existed.
+                raise
 
         self._state = SessionState.CLOSED
+
+    def _annotate_once(self, exc: BaseException, message: str) -> None:
+        """Attach `message` to `exc` unless this session already annotated
+        that exact object.
+
+        Identity-scoped rather than a session-wide flag: repeated
+        ``close()`` calls must not double-annotate the same exception, but
+        must still each report their own outcome.
+        """
+        for seen in self._annotated:
+            if seen is exc:
+                return
+        self._annotated.append(exc)
+        _add_note(exc, message)
 
     def _confirm_cleanup(self) -> _CleanupOutcome:
         """Confirm ``server.stop()``, consuming any outcome already computed
