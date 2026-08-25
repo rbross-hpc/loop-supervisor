@@ -11,6 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .git import GitError, GitRepo
+from .input_providers import StdinInputProvider
 from .locking import LockError
 from .runtime import RuntimeError_, list_run_ids, run_new, run_resume
 from .state import RunOptions
@@ -30,18 +31,7 @@ _EXPECTED_CLI_ERRORS: tuple[type[Exception], ...] = (
 
 _TEMPLATE_MARKERS = ("pyproject.toml", "src/loop_supervisor", ".opencode/agents")
 
-
-class StdinInputProvider:
-    """Interactive input provider that reads from stdin when attached to a TTY."""
-
-    def request(self, *, kind: str, message: str, context: dict) -> str | None:
-        if not sys.stdin.isatty():
-            return None
-        print(f"\n[{kind}] {message}")
-        try:
-            return input("> ")
-        except EOFError:
-            return None
+__all__ = ["StdinInputProvider", "build_parser", "main"]
 
 
 def _project_root(path: str | None) -> Path:
@@ -69,6 +59,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         final = run_new(
             project_root,
             options,
+            input_provider=StdinInputProvider(),
             recover_stale_lock=getattr(args, "recover_stale_lock", False),
         )
     except _EXPECTED_CLI_ERRORS as exc:
@@ -102,6 +93,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         final = run_resume(
             project_root,
             args.run_id,
+            input_provider=StdinInputProvider(),
             recover_stale_lock=getattr(args, "recover_stale_lock", False),
         )
     except _EXPECTED_CLI_ERRORS as exc:

@@ -43,10 +43,11 @@ from pathlib import Path
 from typing import NoReturn
 
 from .git import GitError, GitRepo
+from .input_providers import StdinInputProvider
 from .locking import LockError, SupervisorLock
 from .opencode import OpenCodeServer, OpenCodeServerConfig
 from .state import RunOptions, RunState, StateError, list_runs, load_state, validate_run_id
-from .supervisor import LoopError, Supervisor
+from .supervisor import InputProvider, LoopError, Supervisor
 
 # Bounded retry for confirming OpenCode server cleanup (server.stop()).
 # Applied uniformly to startup failures, successful-run completion, and
@@ -272,12 +273,18 @@ def run_new(
     project_root: Path,
     options: RunOptions,
     *,
+    input_provider: InputProvider | None = None,
     recover_stale_lock: bool = False,
 ) -> RunState:
     """Start a new run from project_root.
 
     Acquires the repository lock, creates and saves the initial state (before
     starting OpenCode), then runs the full headless loop.
+
+    ``input_provider`` defaults to ``StdinInputProvider()`` (interactive,
+    TTY-only) when not supplied, matching prior behavior for callers that
+    do not need to inject a different provider (e.g. the TUI's
+    non-blocking queue-backed provider).
     """
     try:
         repo = GitRepo(project_root)
@@ -285,8 +292,7 @@ def run_new(
         raise RuntimeError_(f"cannot open repository: {exc}") from exc
 
     common_dir = repo.common_dir()
-
-    from .cli import StdinInputProvider
+    provider = input_provider if input_provider is not None else StdinInputProvider()
 
     with _lock_context(
         common_dir,
@@ -302,7 +308,7 @@ def run_new(
             repo=repo,
             runner=_UnstartedRunner(),
             git_common_dir=common_dir,
-            input_provider=StdinInputProvider(),
+            input_provider=provider,
             options=options,
         )
         state = supervisor.start_new_run()
@@ -337,6 +343,7 @@ def run_resume(
     project_root: Path,
     run_id: str,
     *,
+    input_provider: InputProvider | None = None,
     recover_stale_lock: bool = False,
 ) -> RunState:
     """Resume a saved run from project_root.
@@ -344,6 +351,11 @@ def run_resume(
     Acquires the lock first, then loads and validates state inside it, so
     no other process can modify the checkpoint between our load and mutation.
     OpenCode is not started until after validation succeeds.
+
+    ``input_provider`` defaults to ``StdinInputProvider()`` (interactive,
+    TTY-only) when not supplied, matching prior behavior for callers that
+    do not need to inject a different provider (e.g. the TUI's
+    non-blocking queue-backed provider).
     """
     try:
         repo = GitRepo(project_root)
@@ -362,7 +374,7 @@ def run_resume(
     except StateError as exc:
         raise RuntimeError_(f"cannot load run {run_id!r}: {exc}") from exc
 
-    from .cli import StdinInputProvider
+    provider = input_provider if input_provider is not None else StdinInputProvider()
 
     with _lock_context(
         common_dir,
@@ -380,7 +392,7 @@ def run_resume(
             repo=repo,
             runner=_UnstartedRunner(),
             git_common_dir=common_dir,
-            input_provider=StdinInputProvider(),
+            input_provider=provider,
         )
 
         try:

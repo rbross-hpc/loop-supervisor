@@ -6,6 +6,7 @@ Verifies lifecycle ordering: lock → state → server → run → server stop �
 
 from __future__ import annotations
 
+import ast
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -1424,7 +1425,7 @@ def test_run_new_startup_keyboard_interrupt_preserves_exact_traceback(tmp_path):
         assert "_startup_failure" not in frame_names, frame_names
         assert "_finalize_interrupted_startup" not in frame_names, frame_names
         _assert_exact_startup_traceback(
-            excinfo.value, entry_func="run_new", entry_lineno=315, tail_func="start"
+            excinfo.value, entry_func="run_new", entry_lineno=321, tail_func="start"
         )
     finally:
         rt.OpenCodeServer = original_oc_server
@@ -1477,7 +1478,7 @@ def test_run_resume_startup_keyboard_interrupt_preserves_exact_traceback(tmp_pat
         assert "_startup_failure" not in frame_names, frame_names
         assert "_finalize_interrupted_startup" not in frame_names, frame_names
         _assert_exact_startup_traceback(
-            excinfo.value, entry_func="run_resume", entry_lineno=401, tail_func="start"
+            excinfo.value, entry_func="run_resume", entry_lineno=413, tail_func="start"
         )
     finally:
         rt.OpenCodeServer = original_oc_server
@@ -1548,7 +1549,7 @@ def test_run_new_startup_system_exit_preserves_exact_traceback(tmp_path):
         assert "_startup_failure" not in frame_names, frame_names
         assert "_finalize_interrupted_startup" not in frame_names, frame_names
         _assert_exact_startup_traceback(
-            excinfo.value, entry_func="run_new", entry_lineno=315, tail_func="start"
+            excinfo.value, entry_func="run_new", entry_lineno=321, tail_func="start"
         )
     finally:
         rt.OpenCodeServer = original_oc_server
@@ -1590,7 +1591,7 @@ def test_run_new_startup_keyboard_interrupt_with_unresolved_cleanup_has_note(tmp
         assert "_startup_failure" not in frame_names, frame_names
         assert "_finalize_interrupted_startup" not in frame_names, frame_names
         _assert_exact_startup_traceback(
-            excinfo.value, entry_func="run_new", entry_lineno=315, tail_func="start"
+            excinfo.value, entry_func="run_new", entry_lineno=321, tail_func="start"
         )
     finally:
         rt.OpenCodeServer = original_oc_server
@@ -2090,3 +2091,165 @@ def test_lock_file_released_only_after_confirmed_cleanup(tmp_path, monkeypatch):
 
     assert lock_present_during_stop == [True, True]
     assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_runtime_module_has_no_cli_import():
+    """runtime.py must never import from cli.py, at module level or deferred
+    inside a function — cli.py is a presentation module and runtime.py is
+    the shared controller both the CLI and the TUI depend on. A deferred
+    ``from .cli import ...`` inside run_new()/run_resume() would not be
+    caught by a plain module-level import check, so this walks the full
+    AST looking for any import (module-level or nested) whose module name
+    is "cli" or ".cli"."""
+    import loop_supervisor.runtime as rt
+
+    source = Path(rt.__file__).read_text()
+    tree = ast.parse(source, filename=rt.__file__)
+
+    offending: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module in ("cli", ".cli") or (node.module or "").endswith(".cli"):
+                offending.append(f"line {node.lineno}: from {node.module} import ...")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in ("cli", "loop_supervisor.cli"):
+                    offending.append(f"line {node.lineno}: import {alias.name}")
+
+    assert offending == [], f"runtime.py must not import cli.py, found: {offending}"
+
+
+def test_run_new_uses_supplied_input_provider(tmp_path):
+    """run_new() must pass a caller-supplied input_provider straight through
+    to Supervisor rather than always constructing its own
+    StdinInputProvider — this is the seam the TUI (and other future
+    front-ends) needs, so it must be exercised directly rather than only
+    inferred from run_new() no longer importing cli."""
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    received_providers: list[object] = []
+    sentinel_provider = object()
+
+    original_supervisor = rt.Supervisor
+    original_oc_server = rt.OpenCodeServer
+    original_git_repo = rt.GitRepo
+
+    class FakeGitRepo:
+        def __init__(self, *a, **kw):
+            self.root = repo.root
+
+        def common_dir(self):
+            return repo.common_dir()
+
+    class FakeOCServer:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    class SpySupervisor:
+        def __init__(self, *a, **kw):
+            received_providers.append(kw.get("input_provider"))
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "x"
+            state.phase = "done"
+            state.options = _make_options()
+            return state
+
+        def run(self, state):
+            return state
+
+        @property
+        def runner(self):
+            return None
+
+        @runner.setter
+        def runner(self, v):
+            pass
+
+    rt.GitRepo = FakeGitRepo
+    rt.OpenCodeServer = FakeOCServer
+    rt.Supervisor = SpySupervisor
+    try:
+        run_new(tmp_path / "repo", _make_options(), input_provider=sentinel_provider)
+    finally:
+        rt.GitRepo = original_git_repo
+        rt.OpenCodeServer = original_oc_server
+        rt.Supervisor = original_supervisor
+
+    assert received_providers == [sentinel_provider]
+
+
+def test_run_new_defaults_to_stdin_input_provider_when_not_supplied(tmp_path):
+    """When no input_provider is passed, run_new() must fall back to a real
+    StdinInputProvider (preserving prior behavior for existing callers),
+    not None and not some other default."""
+    from loop_supervisor.input_providers import StdinInputProvider
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    received_providers: list[object] = []
+
+    original_supervisor = rt.Supervisor
+    original_oc_server = rt.OpenCodeServer
+    original_git_repo = rt.GitRepo
+
+    class FakeGitRepo:
+        def __init__(self, *a, **kw):
+            self.root = repo.root
+
+        def common_dir(self):
+            return repo.common_dir()
+
+    class FakeOCServer:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    class SpySupervisor:
+        def __init__(self, *a, **kw):
+            received_providers.append(kw.get("input_provider"))
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "x"
+            state.phase = "done"
+            state.options = _make_options()
+            return state
+
+        def run(self, state):
+            return state
+
+        @property
+        def runner(self):
+            return None
+
+        @runner.setter
+        def runner(self, v):
+            pass
+
+    rt.GitRepo = FakeGitRepo
+    rt.OpenCodeServer = FakeOCServer
+    rt.Supervisor = SpySupervisor
+    try:
+        run_new(tmp_path / "repo", _make_options())
+    finally:
+        rt.GitRepo = original_git_repo
+        rt.OpenCodeServer = original_oc_server
+        rt.Supervisor = original_supervisor
+
+    assert len(received_providers) == 1
+    assert isinstance(received_providers[0], StdinInputProvider)
