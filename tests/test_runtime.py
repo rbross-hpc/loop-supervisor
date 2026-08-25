@@ -12,6 +12,8 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from loop_supervisor.git import GitRepo
 from loop_supervisor.runtime import list_run_ids, load_run, run_new, run_resume
 from loop_supervisor.state import RunOptions
@@ -3555,3 +3557,479 @@ def test_start_server_call_lineno_locates_the_call(tmp_path):
         return 1
 
     assert rt._start_server_call_lineno(unrelated) == -1
+
+
+# ===================================================================
+# Phase 2b: retry-path characterization
+#
+# RunSession advertises close() as retryable, but no test exercised a
+# FAILED explicit retry. Two defects hid in that gap (both reproduced
+# against cfe1aca):
+#
+#   1. close() returns None -- indistinguishable from success -- when a
+#      retry's stop() still fails, provided some earlier failure already
+#      attached a retained-lock note.
+#   2. A failed lock release marks the session CLOSED, so every later
+#      close() no-ops while the lock is still on disk. This contradicts
+#      SupervisorLock.release(), which keeps its ownership token
+#      specifically so callers can retry (locking.py:426-437).
+#
+# Tests that document currently-broken behaviour are marked
+# xfail(strict=True): the suite stays green now, and they flip loudly
+# the moment the fix lands. Tests here without an xfail marker cover
+# behaviour that is already correct but was previously unasserted.
+# ===================================================================
+
+
+def _retry_server(*, start_exc=None, stop_fails=True, stop_counter=None):
+    """Server stand-in whose stop() failure mode is fixed for its lifetime."""
+
+    class RetryServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            if start_exc is not None:
+                raise start_exc
+
+        def stop(self) -> None:
+            if stop_counter is not None:
+                stop_counter[0] += 1
+            if stop_fails:
+                raise RuntimeError("simulated stop failure")
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    return RetryServer
+
+
+# --- Defect 1: a failed retry must not look like success --------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Defect 1: _cleanup_note_attached suppresses the outcome of later "
+    "close() retries, so a still-failing retry returns None (runtime.py:764-768)",
+)
+def test_retry_close_after_startup_failure_still_failing_must_raise(tmp_path, monkeypatch):
+    """An explicit close() retry whose stop() still fails must report that.
+
+    Returning None tells a shutdown loop the lock was released when it is
+    still held and an OpenCode process may still be alive."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.opencode import ServerStartupError
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+
+    server_cls = _retry_server(start_exc=ServerStartupError("startup fail"))
+    with _patched_session_env(repo, server_cls=server_cls):
+        session = rt.new_run_session(repo.root, _make_options())
+        with pytest.raises(RuntimeError_):
+            with session:
+                session.start_server()
+
+        assert session.state is rt.SessionState.CLEANUP_UNRESOLVED
+        assert _lock_path(repo.common_dir()).exists()
+
+        with pytest.raises(RuntimeError_):
+            session.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Defect 1: same suppression after a body/run failure",
+)
+def test_retry_close_after_body_failure_still_failing_must_raise(tmp_path, monkeypatch):
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+
+    with _patched_session_env(repo, server_cls=_retry_server()):
+        session = rt.new_run_session(repo.root, _make_options())
+        with pytest.raises(ValueError):
+            with session:
+                session.start_server()
+                raise ValueError("body blew up")
+
+        assert session.state is rt.SessionState.CLEANUP_UNRESOLVED
+        assert _lock_path(repo.common_dir()).exists()
+
+        with pytest.raises(RuntimeError_):
+            session.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Defect 1: same suppression after a startup interrupt",
+)
+def test_retry_close_after_startup_interrupt_still_failing_must_raise(tmp_path, monkeypatch):
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+
+    server_cls = _retry_server(start_exc=KeyboardInterrupt())
+    with _patched_session_env(repo, server_cls=server_cls):
+        session = rt.new_run_session(repo.root, _make_options())
+        with pytest.raises(KeyboardInterrupt):
+            with session:
+                session.start_server()
+
+        assert session.state is rt.SessionState.CLEANUP_UNRESOLVED
+        assert _lock_path(repo.common_dir()).exists()
+
+        with pytest.raises(RuntimeError_):
+            session.close()
+
+
+def test_retry_close_after_startup_failure_succeeding_releases_lock(tmp_path, monkeypatch):
+    """The positive counterpart: once stop() succeeds, the retry must
+    actually release the lock and reach CLOSED. Already correct today."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.opencode import ServerStartupError
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    stop_fails = [True]
+
+    class TogglableServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            raise ServerStartupError("startup fail")
+
+        def stop(self) -> None:
+            if stop_fails[0]:
+                raise RuntimeError("stop fail")
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    with _patched_session_env(repo, server_cls=TogglableServer):
+        session = rt.new_run_session(repo.root, _make_options())
+        with pytest.raises(RuntimeError_):
+            with session:
+                session.start_server()
+
+        assert session.state is rt.SessionState.CLEANUP_UNRESOLVED
+        stop_fails[0] = False
+        session.close()
+
+    assert session.state is rt.SessionState.CLOSED
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+# --- Defect 2: a failed lock release must stay retryable --------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Defect 2: close() sets CLOSED before raising on release failure "
+    "(runtime.py:796), so the retry no-ops at :748 and the lock is stranded",
+)
+def test_retry_close_after_release_failure_releases_lock(tmp_path):
+    """A transient LockError from release() must not strand the lock.
+
+    SupervisorLock.release() deliberately retains its ownership token on
+    transient failure so the caller can retry; RunSession must not throw
+    that away by making itself terminal."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import LockError, _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    original_release = rt._LockLease.release
+    fail_once = [True]
+
+    def flaky_release(self):
+        if fail_once[0]:
+            fail_once[0] = False
+            raise LockError("transient release failure")
+        original_release(self)
+
+    with _patched_session_env(repo):
+        rt._LockLease.release = flaky_release
+        try:
+            session = rt.new_run_session(repo.root, _make_options())
+            session.__enter__()
+            session.start_server()
+
+            with pytest.raises(rt.RuntimeError_):
+                session.close()
+            assert _lock_path(repo.common_dir()).exists()
+
+            # release() would now succeed; the session must let it.
+            session.close()
+        finally:
+            rt._LockLease.release = original_release
+
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Defect 2 variant: __enter__ marks FAILED after a release failure, "
+    "so the still-held lock cannot be retried (runtime.py:581-594, :748)",
+)
+def test_retry_close_after_enter_release_failure_releases_lock(tmp_path):
+    """A post-lock __enter__ failure whose release also fails must leave the
+    retained lock retryable rather than terminal."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import LockError, _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+
+    class BoomSupervisor:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start_new_run(self):
+            raise RuntimeError("state creation failed")
+
+    original_release = rt._LockLease.release
+    fail_once = [True]
+
+    def flaky_release(self):
+        if fail_once[0]:
+            fail_once[0] = False
+            raise LockError("transient release failure")
+        original_release(self)
+
+    with _patched_session_env(repo, supervisor_cls=BoomSupervisor):
+        rt._LockLease.release = flaky_release
+        try:
+            session = rt.new_run_session(repo.root, _make_options())
+            with pytest.raises(RuntimeError, match="state creation failed"):
+                session.__enter__()
+            assert _lock_path(repo.common_dir()).exists()
+
+            session.close()
+        finally:
+            rt._LockLease.release = original_release
+
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_retry_release_does_not_respend_stop_budget(tmp_path):
+    """Retrying a failed lock release must not re-run the already-confirmed
+    server.stop(). Already correct today; pinned because the fix for
+    Defect 2 introduces a new state on exactly this path."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import LockError
+
+    repo = _init_repo(tmp_path / "repo")
+    stop_calls = [0]
+
+    class CountingServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            stop_calls[0] += 1
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    original_release = rt._LockLease.release
+    fail_once = [True]
+
+    def flaky_release(self):
+        if fail_once[0]:
+            fail_once[0] = False
+            raise LockError("transient release failure")
+        original_release(self)
+
+    with _patched_session_env(repo, server_cls=CountingServer):
+        rt._LockLease.release = flaky_release
+        try:
+            session = rt.new_run_session(repo.root, _make_options())
+            session.__enter__()
+            session.start_server()
+            with pytest.raises(rt.RuntimeError_):
+                session.close()
+            after_first = stop_calls[0]
+            try:
+                session.close()
+            except rt.RuntimeError_:
+                pass
+        finally:
+            rt._LockLease.release = original_release
+
+    assert after_first == 1, stop_calls
+    assert stop_calls[0] == 1, stop_calls
+
+
+# --- previously unasserted correct behaviour --------------------------
+
+
+def test_startup_interrupt_traceback_excludes_exit_and_close_frames(tmp_path, monkeypatch):
+    """The startup-interrupt traceback must contain no __exit__/close frame
+    even when close() does substantial cleanup work.
+
+    Behaviour is already correct; nothing asserted it on the interrupt
+    path, which is where the Phase 2 predecessor defect lived."""
+    import loop_supervisor.runtime as rt
+
+    _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+
+    the_interrupt = KeyboardInterrupt()
+    original_oc_server = rt.OpenCodeServer
+    # stop_fails=True so close() runs the full bounded retry before returning.
+    rt.OpenCodeServer = _retry_server(start_exc=the_interrupt, stop_fails=True)
+    try:
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            run_new(tmp_path / "repo", _make_options())
+        assert excinfo.value is the_interrupt
+        frames = [tb.tb_frame.f_code.co_name for tb in _traceback_frames(excinfo.value)]
+        assert "__exit__" not in frames, frames
+        assert "close" not in frames, frames
+        assert "_confirm_cleanup" not in frames, frames
+        assert frames.count("start_server") == 1, frames
+        assert frames[-1] == "start", frames
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+
+def test_resume_run_session_full_lifecycle(tmp_path):
+    """A valid resume driven through the RunSession API directly.
+
+    The Phase 2 suite covered resume only for inert construction and
+    invalid-ID rejection, leaving state loading, Supervisor.resume(),
+    server config from persisted options, and cleanup untested through
+    the new API."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.supervisor import Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    supervisor = Supervisor(
+        repo=repo,
+        runner=MagicMock(),
+        git_common_dir=repo.common_dir(),
+        input_provider=MagicMock(),
+        options=_make_options(),
+    )
+    run_id = supervisor.start_new_run().run_id
+
+    events: list[str] = []
+
+    class RecordingServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+            events.append("construct")
+
+        def start(self) -> None:
+            events.append("start")
+
+        def stop(self) -> None:
+            events.append("stop")
+
+        def add_observer(self, obs) -> None:
+            events.append("add_observer")
+
+        def run_agent(self, **kwargs):
+            return "ok"
+
+    original_oc_server = rt.OpenCodeServer
+    original_run = Supervisor.run
+    original_resume = Supervisor.resume
+
+    def _ok_run(self, state):
+        state.phase = "done"
+        return state
+
+    def _tracked_resume(self, state):
+        events.append("resume")
+        return original_resume(self, state)
+
+    rt.OpenCodeServer = RecordingServer
+    Supervisor.run = _ok_run
+    Supervisor.resume = _tracked_resume
+    try:
+        session = rt.resume_run_session(repo.root, run_id)
+        assert session.state is rt.SessionState.NEW
+        with session:
+            assert session.state is rt.SessionState.READY
+            session.start_server()
+            assert session.state is rt.SessionState.STARTED
+            final = session.run_to_completion()
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+        Supervisor.resume = original_resume
+
+    assert final.run_id == run_id
+    assert final.phase == "done"
+    assert session.state is rt.SessionState.CLOSED
+    # Supervisor.resume() must run (it performs the Git validation that
+    # makes a tampered resume fail closed) and must precede server startup.
+    assert events == ["resume", "construct", "start", "stop"], events
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_resume_run_session_validation_failure_is_wrapped_and_releases_lock(tmp_path):
+    """A resume whose Git validation fails must surface as RuntimeError_,
+    never start a server, and leave no lock behind."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.supervisor import LoopError, Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    supervisor = Supervisor(
+        repo=repo,
+        runner=MagicMock(),
+        git_common_dir=repo.common_dir(),
+        input_provider=MagicMock(),
+        options=_make_options(),
+    )
+    run_id = supervisor.start_new_run().run_id
+
+    started: list[str] = []
+
+    class NeverStartedServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = None
+
+        def start(self) -> None:
+            started.append("start")
+
+        def stop(self) -> None:
+            pass
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    original_oc_server = rt.OpenCodeServer
+    original_resume = Supervisor.resume
+
+    def _boom_resume(self, state):
+        raise LoopError("integration branch moved")
+
+    rt.OpenCodeServer = NeverStartedServer
+    Supervisor.resume = _boom_resume
+    try:
+        session = rt.resume_run_session(repo.root, run_id)
+        with pytest.raises(rt.RuntimeError_, match="resume validation failed"):
+            session.__enter__()
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.resume = original_resume
+
+    assert started == []
+    assert session.state is rt.SessionState.FAILED
+    assert not _lock_path(repo.common_dir()).exists()
