@@ -7,6 +7,7 @@ Verifies lifecycle ordering: lock → state → server → run → server stop �
 from __future__ import annotations
 
 import ast
+import contextlib
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -228,25 +229,22 @@ def test_run_new_server_stops_before_lock_release(tmp_path):
 
     import loop_supervisor.runtime as rt
 
-    original_lock_ctx = rt._lock_context
+    original_release = rt._LockLease.release
 
-    from contextlib import contextmanager
-
-    @contextmanager
-    def patched_lock_ctx(*args, **kwargs):
-        with original_lock_ctx(*args, **kwargs) as lock:
-            yield lock
+    def patched_release(self):
+        original_release(self)
+        call_log.append("lock_released")
         lock_released.append("lock_released")
 
     with _patch_runtime(repo, call_log=call_log):
-        rt._lock_context = patched_lock_ctx
+        rt._LockLease.release = patched_release
         try:
             run_new(tmp_path / "repo", _make_options())
         finally:
-            rt._lock_context = original_lock_ctx
+            rt._LockLease.release = original_release
 
-    call_log.append("lock_released_marker")
-    assert call_log.index("server_stop") < call_log.index("lock_released_marker")
+    assert lock_released == ["lock_released"]
+    assert call_log.index("server_stop") < call_log.index("lock_released")
 
 
 def test_run_resume_loads_state_after_lock_acquisition(tmp_path):
@@ -265,17 +263,14 @@ def test_run_resume_loads_state_after_lock_acquisition(tmp_path):
 
     load_order: list[str] = []
     import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import SupervisorLock
 
-    original_lock_ctx = rt._lock_context
+    original_acquire = SupervisorLock.acquire
     original_load_state = rt.load_state
 
-    from contextlib import contextmanager
-
-    @contextmanager
-    def patched_lock_ctx(*args, **kwargs):
+    def patched_acquire(self):
+        original_acquire(self)
         load_order.append("lock_acquired")
-        with original_lock_ctx(*args, **kwargs) as lock:
-            yield lock
 
     def patched_load_state(common_dir, rid):
         load_order.append("load_state")
@@ -283,7 +278,7 @@ def test_run_resume_loads_state_after_lock_acquisition(tmp_path):
 
     call_log: list[str] = []
     with _patch_runtime(repo, call_log=call_log):
-        rt._lock_context = patched_lock_ctx
+        SupervisorLock.acquire = patched_acquire
         rt.load_state = patched_load_state
         try:
             try:
@@ -291,7 +286,7 @@ def test_run_resume_loads_state_after_lock_acquisition(tmp_path):
             except Exception:
                 pass
         finally:
-            rt._lock_context = original_lock_ctx
+            SupervisorLock.acquire = original_acquire
             rt.load_state = original_load_state
 
     assert load_order.index("lock_acquired") < load_order.index("load_state")
@@ -1043,13 +1038,13 @@ def test_run_new_relative_project_path_uses_canonical_lock_metadata(tmp_path, mo
 
     import loop_supervisor.runtime as rt
 
-    original_run_and_stop = rt._run_and_stop
+    original_run_to_completion = rt.RunSession.run_to_completion
 
-    def _capture(supervisor, state, server, lease):
+    def _capture(self):
         captured["record"] = json.loads(_lock_path(repo.common_dir()).read_text())
-        return original_run_and_stop(supervisor, state, server, lease)
+        return original_run_to_completion(self)
 
-    monkeypatch.setattr(rt, "_run_and_stop", _capture)
+    monkeypatch.setattr(rt.RunSession, "run_to_completion", _capture)
 
     call_log: list[str] = []
     with _patch_runtime(repo, call_log=call_log):
@@ -1425,7 +1420,10 @@ def test_run_new_startup_keyboard_interrupt_preserves_exact_traceback(tmp_path):
         assert "_startup_failure" not in frame_names, frame_names
         assert "_finalize_interrupted_startup" not in frame_names, frame_names
         _assert_exact_startup_traceback(
-            excinfo.value, entry_func="run_new", entry_lineno=321, tail_func="start"
+            excinfo.value,
+            entry_func="run_new",
+            entry_lineno=rt._start_server_call_lineno(rt.run_new),
+            tail_func="start",
         )
     finally:
         rt.OpenCodeServer = original_oc_server
@@ -1478,7 +1476,10 @@ def test_run_resume_startup_keyboard_interrupt_preserves_exact_traceback(tmp_pat
         assert "_startup_failure" not in frame_names, frame_names
         assert "_finalize_interrupted_startup" not in frame_names, frame_names
         _assert_exact_startup_traceback(
-            excinfo.value, entry_func="run_resume", entry_lineno=413, tail_func="start"
+            excinfo.value,
+            entry_func="run_resume",
+            entry_lineno=rt._start_server_call_lineno(rt.run_resume),
+            tail_func="start",
         )
     finally:
         rt.OpenCodeServer = original_oc_server
@@ -1549,7 +1550,10 @@ def test_run_new_startup_system_exit_preserves_exact_traceback(tmp_path):
         assert "_startup_failure" not in frame_names, frame_names
         assert "_finalize_interrupted_startup" not in frame_names, frame_names
         _assert_exact_startup_traceback(
-            excinfo.value, entry_func="run_new", entry_lineno=321, tail_func="start"
+            excinfo.value,
+            entry_func="run_new",
+            entry_lineno=rt._start_server_call_lineno(rt.run_new),
+            tail_func="start",
         )
     finally:
         rt.OpenCodeServer = original_oc_server
@@ -1591,7 +1595,10 @@ def test_run_new_startup_keyboard_interrupt_with_unresolved_cleanup_has_note(tmp
         assert "_startup_failure" not in frame_names, frame_names
         assert "_finalize_interrupted_startup" not in frame_names, frame_names
         _assert_exact_startup_traceback(
-            excinfo.value, entry_func="run_new", entry_lineno=321, tail_func="start"
+            excinfo.value,
+            entry_func="run_new",
+            entry_lineno=rt._start_server_call_lineno(rt.run_new),
+            tail_func="start",
         )
     finally:
         rt.OpenCodeServer = original_oc_server
@@ -2630,3 +2637,921 @@ def test_characterize_runner_handoff_failure_is_raw_and_not_persisted(tmp_path):
     state = load_state(repo.common_dir(), runs[0])
     assert state.phase != "operational_failure"
     assert not _lock_path(repo.common_dir()).exists()
+
+
+# ===================================================================
+# RunSession: direct lifecycle tests
+# ===================================================================
+
+
+@contextlib.contextmanager
+def _patched_session_env(repo, *, server_cls=None, supervisor_cls=None, call_log=None):
+    """Patch GitRepo/OpenCodeServer/Supervisor for the duration of a block.
+
+    Unlike a factory helper, this keeps the patches active while the
+    session is entered and used, which is what RunSession requires.
+    """
+    import loop_supervisor.runtime as rt
+
+    if call_log is None:
+        call_log = []
+
+    class FakeGitRepo:
+        def __init__(self, *a, **kw):
+            self.root = repo.root
+
+        def common_dir(self):
+            return repo.common_dir()
+
+    class DefaultServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            call_log.append("server_start")
+
+        def stop(self):
+            call_log.append("server_stop")
+
+        def add_observer(self, obs):
+            call_log.append("add_observer")
+
+        def abort_active_sessions(self):
+            call_log.append("abort_active_sessions")
+
+    class DefaultSupervisor:
+        def __init__(self, *a, **kw):
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "fake-run"
+            state.phase = "planning"
+            state.options = _make_options()
+            call_log.append("start_new_run")
+            return state
+
+        def resume(self, state):
+            call_log.append("resume")
+            return state
+
+        def advance(self, state):
+            call_log.append("advance")
+            from loop_supervisor.supervisor import AdvanceOutcome, AdvanceStatus
+
+            state.phase = "done"
+            return AdvanceOutcome(
+                status=AdvanceStatus.TERMINAL,
+                state=state,
+                phase_before="planning",
+                phase_after="done",
+            )
+
+        def run(self, state):
+            call_log.append("run")
+            state.phase = "done"
+            return state
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, value):
+            call_log.append("runner_set")
+            self._runner = value
+
+    originals = (rt.GitRepo, rt.OpenCodeServer, rt.Supervisor)
+    rt.GitRepo = FakeGitRepo
+    rt.OpenCodeServer = server_cls or DefaultServer
+    rt.Supervisor = supervisor_cls or DefaultSupervisor
+    try:
+        yield call_log
+    finally:
+        rt.GitRepo, rt.OpenCodeServer, rt.Supervisor = originals
+
+
+# --- state machine: happy path ---------------------------------------
+
+
+def test_run_session_factory_is_inert(tmp_path):
+    """The factory must acquire nothing: no lock on disk, no server."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    session = rt.new_run_session(repo.root, _make_options())
+
+    assert session.state is rt.SessionState.NEW
+    assert session.base_url is None
+    assert session.run_state is None
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_resume_run_session_factory_is_inert(tmp_path):
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    session = rt.resume_run_session(repo.root, "some-run-id")
+
+    assert session.state is rt.SessionState.NEW
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_run_session_state_progression(tmp_path):
+    """NEW -> READY -> STARTED -> CLOSED across a normal lifecycle."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        assert session.state is rt.SessionState.NEW
+        with session:
+            assert session.state is rt.SessionState.READY
+            session.start_server()
+            assert session.state is rt.SessionState.STARTED
+            session.run_to_completion()
+            assert session.state is rt.SessionState.STARTED
+    assert session.state is rt.SessionState.CLOSED
+
+
+def test_run_session_releases_lock_on_success(tmp_path):
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            session.run_to_completion()
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_run_session_base_url_exposed_after_start(tmp_path):
+    """base_url mirrors the server's own attribute, which a real
+    OpenCodeServer only populates once started."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+
+    class RealisticServer:
+        def __init__(self, *a, **kw):
+            self.base_url = None
+
+        def start(self):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def stop(self):
+            self.base_url = None
+
+        def add_observer(self, obs):
+            pass
+
+    with _patched_session_env(repo, server_cls=RealisticServer):
+        session = rt.new_run_session(repo.root, _make_options())
+        assert session.base_url is None
+        with session:
+            assert session.base_url is None
+            session.start_server()
+            assert session.base_url == "http://127.0.0.1:9999"
+
+
+def test_run_session_stops_server_before_releasing_lock(tmp_path):
+    """Ordering invariant: the lock must still exist while stop() runs."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    lock_present_during_stop: list[bool] = []
+
+    class ObservingServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            lock_present_during_stop.append(_lock_path(repo.common_dir()).exists())
+
+        def add_observer(self, obs):
+            pass
+
+    with _patched_session_env(repo, server_cls=ObservingServer):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            session.run_to_completion()
+
+    assert lock_present_during_stop == [True]
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+# --- runner handoff ---------------------------------------------------
+
+
+def test_run_session_start_server_installs_runner(tmp_path):
+    """start_server() must hand the server to the supervisor, otherwise
+    advance() would dispatch against the _UnstartedRunner placeholder."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo) as call_log:
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            assert session._supervisor.runner is session._server
+    assert "runner_set" in call_log
+    assert call_log.index("server_start") < call_log.index("runner_set")
+
+
+def test_run_session_advance_dispatches_against_started_server(tmp_path):
+    """advance() must dispatch against the STARTED SERVER, not the
+    _UnstartedRunner placeholder.
+
+    Uses a supervisor that actually consults its runner (as the real one
+    does via runner.run_agent), so that failing to install the runner in
+    start_server() surfaces here rather than being masked by a fake that
+    ignores the runner entirely."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.supervisor import AdvanceOutcome, AdvanceStatus
+
+    repo = _init_repo(tmp_path / "repo")
+    dispatched_against: list[str] = []
+
+    class RunnerSensitiveSupervisor:
+        def __init__(self, *a, **kw):
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "r"
+            state.phase = "planning"
+            state.options = _make_options()
+            return state
+
+        def advance(self, state):
+            # Mirror the real supervisor: the phase handler invokes the
+            # runner, so an _UnstartedRunner raises LoopError here.
+            self._runner.run_agent(agent="loop-planner")
+            dispatched_against.append(type(self._runner).__name__)
+            state.phase = "done"
+            return AdvanceOutcome(
+                status=AdvanceStatus.TERMINAL,
+                state=state,
+                phase_before="planning",
+                phase_after="done",
+            )
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, v):
+            self._runner = v
+
+    class RunnableServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def add_observer(self, obs):
+            pass
+
+        def run_agent(self, **kwargs):
+            return "ok"
+
+    with _patched_session_env(
+        repo, server_cls=RunnableServer, supervisor_cls=RunnerSensitiveSupervisor
+    ):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            outcome = session.advance()
+
+    assert outcome.status is AdvanceStatus.TERMINAL
+    assert dispatched_against == ["RunnableServer"]
+    assert session.state is rt.SessionState.CLOSED
+
+
+def test_run_session_advance_updates_run_state(tmp_path):
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            outcome = session.advance()
+            assert session.run_state is outcome.state
+
+
+def test_run_session_advance_returns_to_started_on_failure(tmp_path):
+    """A raising advance() must leave the session usable, not stuck in
+    ADVANCING."""
+    import pytest
+
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+
+    class BoomSupervisor:
+        def __init__(self, *a, **kw):
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "r"
+            state.phase = "planning"
+            state.options = _make_options()
+            return state
+
+        def advance(self, state):
+            raise RuntimeError("advance blew up")
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, v):
+            self._runner = v
+
+    with _patched_session_env(repo, supervisor_cls=BoomSupervisor):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            with pytest.raises(RuntimeError, match="advance blew up"):
+                session.advance()
+            assert session.state is rt.SessionState.STARTED
+
+
+# --- state machine: misuse rejection ----------------------------------
+
+
+def test_run_session_cannot_be_entered_twice(tmp_path):
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            with pytest.raises(RuntimeError_, match="only be entered once"):
+                session.__enter__()
+
+
+def test_run_session_start_server_rejected_before_enter(tmp_path):
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    session = rt.new_run_session(repo.root, _make_options())
+    with pytest.raises(RuntimeError_, match="expected 'ready'"):
+        session.start_server()
+
+
+def test_run_session_start_server_rejected_twice(tmp_path):
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            with pytest.raises(RuntimeError_, match="expected 'ready'"):
+                session.start_server()
+
+
+def test_run_session_advance_rejected_before_start_server(tmp_path):
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            with pytest.raises(RuntimeError_, match="expected 'started'"):
+                session.advance()
+
+
+def test_run_session_run_to_completion_rejected_before_start_server(tmp_path):
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            with pytest.raises(RuntimeError_, match="expected 'started'"):
+                session.run_to_completion()
+
+
+def test_run_session_advance_rejected_after_close(tmp_path):
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+        with pytest.raises(RuntimeError_, match="expected 'started'"):
+            session.advance()
+
+
+def test_run_session_close_is_idempotent(tmp_path):
+    """close() after close() must be a harmless no-op, so an explicit
+    close() inside a with-block does not break __exit__."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo) as call_log:
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            session.close()
+            assert session.state is rt.SessionState.CLOSED
+
+    assert call_log.count("server_stop") == 1
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+# --- __enter__ failure points -----------------------------------------
+
+
+def test_run_session_enter_fails_on_unopenable_repo(tmp_path):
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.runtime import RuntimeError_
+
+    session = rt.new_run_session(tmp_path / "not-a-repo", _make_options())
+    with pytest.raises(RuntimeError_, match="cannot open repository"):
+        session.__enter__()
+    assert session.state is rt.SessionState.FAILED
+
+
+def test_run_session_enter_validates_run_id_before_locking(tmp_path):
+    """A crafted resume ID must be rejected with no lock left behind."""
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    session = rt.resume_run_session(repo.root, "../../evil")
+    with pytest.raises(RuntimeError_):
+        session.__enter__()
+
+    assert session.state is rt.SessionState.FAILED
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_run_session_enter_releases_lock_when_state_creation_fails(tmp_path):
+    """__exit__ is never called when __enter__ raises, so __enter__ must
+    release the lock itself on any post-lock failure."""
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+
+    class BoomSupervisor:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start_new_run(self):
+            raise RuntimeError("state creation failed")
+
+    with _patched_session_env(repo, supervisor_cls=BoomSupervisor):
+        session = rt.new_run_session(repo.root, _make_options())
+        with pytest.raises(RuntimeError, match="state creation failed"):
+            session.__enter__()
+
+    assert session.state is rt.SessionState.FAILED
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_run_session_enter_lock_release_failure_attaches_note(tmp_path):
+    """If the post-lock cleanup release() also fails, the original failure
+    must still propagate, with the release failure recorded as a note."""
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import LockError
+
+    repo = _init_repo(tmp_path / "repo")
+
+    class BoomSupervisor:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start_new_run(self):
+            raise RuntimeError("state creation failed")
+
+    original_release = rt._LockLease.release
+
+    def _boom_release(self):
+        raise LockError("release failed")
+
+    with _patched_session_env(repo, supervisor_cls=BoomSupervisor):
+        rt._LockLease.release = _boom_release
+        try:
+            session = rt.new_run_session(repo.root, _make_options())
+            with pytest.raises(RuntimeError, match="state creation failed") as excinfo:
+                session.__enter__()
+        finally:
+            rt._LockLease.release = original_release
+
+    notes = getattr(excinfo.value, "__notes__", [])
+    assert any("lock could not be released" in n.lower() for n in notes), notes
+
+
+def test_run_session_second_session_blocked_while_first_holds_lock(tmp_path):
+    """The lock is real: a second session cannot enter concurrently."""
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import LockError
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        first = rt.new_run_session(repo.root, _make_options())
+        with first:
+            second = rt.new_run_session(repo.root, _make_options())
+            with pytest.raises(LockError):
+                second.__enter__()
+            assert second.state is rt.SessionState.FAILED
+
+
+# --- cleanup ownership and retry --------------------------------------
+
+
+def test_run_session_cleanup_unresolved_is_retryable(tmp_path, monkeypatch):
+    """Unresolved cleanup must leave the session retryable with the lock
+    retained; a later successful close() releases it."""
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    stop_fails = [True]
+
+    class TogglableServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            if stop_fails[0]:
+                raise RuntimeError("stop fail")
+
+        def add_observer(self, obs):
+            pass
+
+    with _patched_session_env(repo, server_cls=TogglableServer):
+        session = rt.new_run_session(repo.root, _make_options())
+        with pytest.raises(RuntimeError_, match="run completed but"):
+            with session:
+                session.start_server()
+                session.run_to_completion()
+
+        assert session.state is rt.SessionState.CLEANUP_UNRESOLVED
+        assert _lock_path(repo.common_dir()).exists()
+
+        stop_fails[0] = False
+        session.close()
+
+    assert session.state is rt.SessionState.CLOSED
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_run_session_cleanup_unresolved_stays_unresolved_on_repeated_failure(tmp_path, monkeypatch):
+    """Retrying close() while stop() keeps failing must keep the lock and
+    stay retryable, never silently transition to CLOSED."""
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+
+    class AlwaysFailStop:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            raise RuntimeError("always fails")
+
+        def add_observer(self, obs):
+            pass
+
+    with _patched_session_env(repo, server_cls=AlwaysFailStop):
+        session = rt.new_run_session(repo.root, _make_options())
+        with pytest.raises(RuntimeError_):
+            with session:
+                session.start_server()
+                session.run_to_completion()
+
+        for _ in range(2):
+            with pytest.raises(RuntimeError_):
+                session.close()
+            assert session.state is rt.SessionState.CLEANUP_UNRESOLVED
+            assert _lock_path(repo.common_dir()).exists()
+            # The lease itself must stay unreleasable: an OpenCode process
+            # may still be alive, and ADR 0009 forbids releasing the lock
+            # before cleanup is confirmed. Asserting only the lock file is
+            # not enough -- it is written at acquire time, so a wrongly
+            # released lease is invisible until something calls release().
+            assert not session._lease.releasable
+
+
+def test_run_session_close_without_start_releases_lock_without_stopping(tmp_path):
+    """A session entered but never started owns no process, so close() must
+    release the lock without calling stop()."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo) as call_log:
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            pass
+
+    assert "server_stop" not in call_log
+    assert session.state is rt.SessionState.CLOSED
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_run_session_body_exception_is_not_replaced_by_cleanup_failure(tmp_path, monkeypatch):
+    """A cleanup failure must never replace a body exception, and must not
+    add an __exit__ frame to it."""
+    import pytest
+
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+
+    class FailStopServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            raise RuntimeError("stop fail")
+
+        def add_observer(self, obs):
+            pass
+
+    the_error = ValueError("body blew up")
+    with _patched_session_env(repo, server_cls=FailStopServer):
+        session = rt.new_run_session(repo.root, _make_options())
+        with pytest.raises(ValueError) as excinfo:
+            with session:
+                session.start_server()
+                raise the_error
+
+    assert excinfo.value is the_error
+    frame_names = [tb.tb_frame.f_code.co_name for tb in _traceback_frames(excinfo.value)]
+    assert "__exit__" not in frame_names, frame_names
+    assert "close" not in frame_names, frame_names
+
+
+def test_run_session_close_raising_does_not_replace_body_exception(tmp_path):
+    """__exit__ must swallow a raising close() when a body exception is
+    already propagating.
+
+    Raising out of __exit__ would both replace the primary and stamp an
+    __exit__ frame onto it. Here the lock release fails, which is the
+    realistic way close() raises on an otherwise-clean shutdown."""
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import LockError
+
+    repo = _init_repo(tmp_path / "repo")
+    the_error = ValueError("body blew up")
+
+    original_release = rt._LockLease.release
+
+    def _boom_release(self):
+        raise LockError("release failed")
+
+    with _patched_session_env(repo):
+        rt._LockLease.release = _boom_release
+        try:
+            session = rt.new_run_session(repo.root, _make_options())
+            with pytest.raises(ValueError) as excinfo:
+                with session:
+                    session.start_server()
+                    raise the_error
+        finally:
+            rt._LockLease.release = original_release
+
+    assert excinfo.value is the_error
+    frame_names = [tb.tb_frame.f_code.co_name for tb in _traceback_frames(excinfo.value)]
+    assert "__exit__" not in frame_names, frame_names
+    notes = getattr(the_error, "__notes__", [])
+    assert any("lock could not be released" in n.lower() for n in notes), notes
+
+
+# --- observers and invocation control ---------------------------------
+
+
+def test_run_session_server_observer_installed_before_start(tmp_path):
+    """A server_observer passed to the factory must be attached before
+    start(), so no early invocation event is missed."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    sentinel = object()
+    events: list[str] = []
+
+    class SpyServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def add_observer(self, obs):
+            events.append(f"add_observer:{obs is sentinel}")
+
+        def start(self):
+            events.append("start")
+
+        def stop(self):
+            pass
+
+    with _patched_session_env(repo, server_cls=SpyServer):
+        session = rt.new_run_session(repo.root, _make_options(), server_observer=sentinel)
+        with session:
+            session.start_server()
+
+    assert events == ["add_observer:True", "start"]
+
+
+def test_run_session_add_observer_rejected_before_enter(tmp_path):
+    import pytest
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    session = rt.new_run_session(repo.root, _make_options())
+    with pytest.raises(RuntimeError_, match="entered session"):
+        session.add_observer(object())
+
+
+def test_run_session_abort_active_invocations_is_safe_before_enter(tmp_path):
+    """Must be a no-op rather than raising, so a UI can call it blindly."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    session = rt.new_run_session(repo.root, _make_options())
+    session.abort_active_invocations()
+
+
+def test_run_session_abort_active_invocations_delegates_to_server(tmp_path):
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo) as call_log:
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            session.abort_active_invocations()
+
+    assert "abort_active_sessions" in call_log
+
+
+# --- input provider plumbing ------------------------------------------
+
+
+def test_run_session_passes_supplied_input_provider(tmp_path):
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    sentinel = object()
+    received: list[object] = []
+
+    class SpySupervisor:
+        def __init__(self, *a, **kw):
+            received.append(kw.get("input_provider"))
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "r"
+            state.phase = "planning"
+            state.options = _make_options()
+            return state
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, v):
+            self._runner = v
+
+    with _patched_session_env(repo, supervisor_cls=SpySupervisor):
+        session = rt.new_run_session(repo.root, _make_options(), input_provider=sentinel)
+        with session:
+            pass
+
+    assert received == [sentinel]
+
+
+def test_run_session_defaults_to_stdin_input_provider(tmp_path):
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.input_providers import StdinInputProvider
+
+    repo = _init_repo(tmp_path / "repo")
+    received: list[object] = []
+
+    class SpySupervisor:
+        def __init__(self, *a, **kw):
+            received.append(kw.get("input_provider"))
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "r"
+            state.phase = "planning"
+            state.options = _make_options()
+            return state
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, v):
+            self._runner = v
+
+    with _patched_session_env(repo, supervisor_cls=SpySupervisor):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            pass
+
+    assert len(received) == 1
+    assert isinstance(received[0], StdinInputProvider)
+
+
+# --- traceback-line helper --------------------------------------------
+
+
+def test_start_server_call_lineno_locates_the_call(tmp_path):
+    """The helper must find the real call line, and must return -1 (not a
+    plausible-looking number) when it cannot, so a stale traceback
+    assertion fails loudly instead of passing vacuously."""
+    import inspect
+
+    import loop_supervisor.runtime as rt
+
+    for func in (rt.run_new, rt.run_resume):
+        lineno = rt._start_server_call_lineno(func)
+        src_lines, start = inspect.getsourcelines(func)
+        assert lineno > 0
+        assert "session.start_server()" in src_lines[lineno - start]
+
+    def unrelated():
+        return 1
+
+    assert rt._start_server_call_lineno(unrelated) == -1
