@@ -2253,3 +2253,380 @@ def test_run_new_defaults_to_stdin_input_provider_when_not_supplied(tmp_path):
 
     assert len(received_providers) == 1
     assert isinstance(received_providers[0], StdinInputProvider)
+
+
+# ===================================================================
+# Characterization baseline (pre-RunSession-refactor)
+#
+# These tests pin the EXACT observable cleanup contract of the headless
+# run/resume paths: how many times stop() is attempted, the exact
+# retained-lock diagnostic wording, how many notes are attached, and
+# whether the repository lock survives on disk.
+#
+# They exist because a previous refactor attempt silently changed all
+# three of those things while the whole suite stayed green: the existing
+# assertions were substring-based ("cleanup" in note and "retained" in
+# note), which happily matched a *different*, wrong sentence. Anything
+# here that starts failing during a refactor is a behaviour change to be
+# reported, not accommodated.
+# ===================================================================
+
+
+def _characterization_server(
+    counter: list[int], *, start_exc: BaseException | None = None, stop_fails: bool = True
+):
+    """OpenCodeServer stand-in that counts every stop() attempt."""
+
+    class CharServer:
+        def __init__(self, *a, **kw) -> None:
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self) -> None:
+            if start_exc is not None:
+                raise start_exc
+
+        def stop(self) -> None:
+            counter[0] += 1
+            if stop_fails:
+                raise RuntimeError("simulated stop failure")
+
+        def add_observer(self, obs) -> None:
+            pass
+
+    return CharServer
+
+
+def test_characterize_startup_failure_stop_attempts_are_bounded(tmp_path, monkeypatch):
+    """A failed server.start() whose stop() also always fails must attempt
+    stop() exactly _CLEANUP_ATTEMPTS times -- not more. The bound is a
+    documented contract; a refactor that confirms cleanup in two different
+    places would silently double it."""
+    from loop_supervisor.opencode import ServerStartupError
+    from loop_supervisor.runtime import RuntimeError_
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    counter = [0]
+    original_oc_server = rt.OpenCodeServer
+    rt.OpenCodeServer = _characterization_server(
+        counter, start_exc=ServerStartupError("simulated startup failure")
+    )
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected RuntimeError_ to be raised")
+        except RuntimeError_:
+            pass
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+    assert counter[0] == rt._CLEANUP_ATTEMPTS
+
+
+def test_characterize_run_failure_stop_attempts_are_bounded(tmp_path, monkeypatch):
+    """Same bound on the run-failure path."""
+    from loop_supervisor.supervisor import LoopError, Supervisor
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    counter = [0]
+    original_oc_server = rt.OpenCodeServer
+    original_run = Supervisor.run
+
+    def _boom_run(self, state):
+        raise LoopError("simulated supervisor failure")
+
+    rt.OpenCodeServer = _characterization_server(counter)
+    Supervisor.run = _boom_run
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected LoopError to be raised")
+        except LoopError:
+            pass
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+    assert counter[0] == rt._CLEANUP_ATTEMPTS
+
+
+def test_characterize_successful_run_stop_attempts_are_bounded(tmp_path, monkeypatch):
+    """Same bound on the successful-run path."""
+    from loop_supervisor.runtime import RuntimeError_
+    from loop_supervisor.supervisor import Supervisor
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    counter = [0]
+    original_oc_server = rt.OpenCodeServer
+    original_run = Supervisor.run
+
+    def _ok_run(self, state):
+        state.phase = "done"
+        return state
+
+    rt.OpenCodeServer = _characterization_server(counter)
+    Supervisor.run = _ok_run
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected RuntimeError_ to be raised")
+        except RuntimeError_:
+            pass
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+    assert counter[0] == rt._CLEANUP_ATTEMPTS
+
+
+def test_characterize_run_failure_unresolved_cleanup_note_exact_wording(tmp_path, monkeypatch):
+    """A failed run with unresolved cleanup attaches EXACTLY ONE note, and
+    that note opens with "the run failed and the ...".
+
+    Asserted on the exact prefix rather than a loose substring: a previous
+    refactor replaced this sentence with one claiming the run "completed",
+    nested inside a close()-during-__exit__ wrapper, and the substring
+    assertions did not notice."""
+    from loop_supervisor.supervisor import LoopError, Supervisor
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    counter = [0]
+    original_oc_server = rt.OpenCodeServer
+    original_run = Supervisor.run
+    the_failure = LoopError("simulated supervisor failure")
+
+    def _boom_run(self, state):
+        raise the_failure
+
+    rt.OpenCodeServer = _characterization_server(counter)
+    Supervisor.run = _boom_run
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected LoopError to be raised")
+        except LoopError as exc:
+            assert exc is the_failure
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+    notes = getattr(the_failure, "__notes__", [])
+    assert len(notes) == 1, notes
+    assert notes[0].startswith("the run failed and the OpenCode server cleanup could not be"), (
+        notes[0]
+    )
+
+
+def test_characterize_startup_failure_unresolved_cleanup_note_exact_wording(tmp_path, monkeypatch):
+    """A failed startup with unresolved cleanup attaches EXACTLY ONE note
+    opening with "startup failed and the ...", and the raised RuntimeError_
+    message itself names the unresolved cleanup."""
+    from loop_supervisor.opencode import ServerStartupError
+    from loop_supervisor.runtime import RuntimeError_
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    counter = [0]
+    original_oc_server = rt.OpenCodeServer
+    rt.OpenCodeServer = _characterization_server(
+        counter, start_exc=ServerStartupError("simulated startup failure")
+    )
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected RuntimeError_ to be raised")
+        except RuntimeError_ as exc:
+            notes = getattr(exc, "__notes__", [])
+            assert len(notes) == 1, notes
+            assert notes[0].startswith(
+                "startup failed and the OpenCode server cleanup could not be"
+            ), notes[0]
+            assert str(exc).startswith("failed to start OpenCode server:"), str(exc)
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+
+def test_characterize_successful_run_unresolved_cleanup_message_exact_wording(
+    tmp_path, monkeypatch
+):
+    """A successful run with unresolved cleanup raises RuntimeError_ whose
+    MESSAGE opens with "run completed but ..." and attaches NO notes (there
+    is no primary exception to annotate)."""
+    from loop_supervisor.runtime import RuntimeError_
+    from loop_supervisor.supervisor import Supervisor
+
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    counter = [0]
+    original_oc_server = rt.OpenCodeServer
+    original_run = Supervisor.run
+
+    def _ok_run(self, state):
+        state.phase = "done"
+        return state
+
+    rt.OpenCodeServer = _characterization_server(counter)
+    Supervisor.run = _ok_run
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected RuntimeError_ to be raised")
+        except RuntimeError_ as exc:
+            assert str(exc).startswith(
+                "run completed but OpenCode server cleanup could not be confirmed"
+            ), str(exc)
+            assert getattr(exc, "__notes__", []) == []
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+
+def test_characterize_startup_keyboard_interrupt_successful_cleanup_releases_lock(tmp_path):
+    """THE REGRESSION GUARD.
+
+    A KeyboardInterrupt from server.start() whose cleanup SUCCEEDS must
+    release the repository lock, attempt stop() exactly once, and attach no
+    notes. No prior test asserted lock state on this path, which is how a
+    refactor that skipped release() on the interrupt path shipped green."""
+    import pytest
+
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    counter = [0]
+    the_interrupt = KeyboardInterrupt()
+    original_oc_server = rt.OpenCodeServer
+    rt.OpenCodeServer = _characterization_server(counter, start_exc=the_interrupt, stop_fails=False)
+    try:
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            run_new(tmp_path / "repo", _make_options())
+        assert excinfo.value is the_interrupt
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+    assert counter[0] == 1
+    assert getattr(the_interrupt, "__notes__", []) == []
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_characterize_startup_system_exit_successful_cleanup_releases_lock(tmp_path):
+    """SystemExit counterpart of the regression guard above."""
+    import pytest
+
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    counter = [0]
+    the_exit = SystemExit(2)
+    original_oc_server = rt.OpenCodeServer
+    rt.OpenCodeServer = _characterization_server(counter, start_exc=the_exit, stop_fails=False)
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            run_new(tmp_path / "repo", _make_options())
+        assert excinfo.value is the_exit
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+    assert counter[0] == 1
+    assert getattr(the_exit, "__notes__", []) == []
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_characterize_startup_interrupt_unresolved_cleanup_retains_lock_with_one_note(tmp_path):
+    """The failed-cleanup counterpart: lock RETAINED, exactly one note
+    opening with "startup was interrupted; the ...", interrupt identity
+    preserved."""
+    import pytest
+
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    counter = [0]
+    the_interrupt = KeyboardInterrupt()
+    original_oc_server = rt.OpenCodeServer
+    rt.OpenCodeServer = _characterization_server(counter, start_exc=the_interrupt, stop_fails=True)
+    try:
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            run_new(tmp_path / "repo", _make_options())
+        assert excinfo.value is the_interrupt
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+    assert counter[0] == rt._CLEANUP_ATTEMPTS
+    notes = getattr(the_interrupt, "__notes__", [])
+    assert len(notes) == 1, notes
+    assert notes[0].startswith(
+        "startup was interrupted; the OpenCode server cleanup could not be"
+    ), notes[0]
+    assert _lock_path(repo.common_dir()).exists()
+
+
+def test_characterize_runner_handoff_failure_is_raw_and_not_persisted(tmp_path):
+    """The runner handoff (supervisor.runner = server) is a DISTINCT stage
+    from startup: its failure propagates raw (not wrapped in RuntimeError_),
+    is NOT persisted as an operational failure, and the lock is released.
+
+    Pinned because the handoff is scheduled to move into start_server();
+    placing it inside the try that routes to _startup_failure would wrap
+    and persist it, silently changing all three properties."""
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.state import load_state
+    from loop_supervisor.supervisor import LoopError, Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    counter = [0]
+    original_oc_server = rt.OpenCodeServer
+    original_supervisor = rt.Supervisor
+
+    class BoomOnRunnerSupervisor(Supervisor):
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, value):
+            if getattr(value, "base_url", None) is not None:
+                raise LoopError("simulated runner-assignment failure")
+            self._runner = value
+
+    rt.OpenCodeServer = _characterization_server(counter, stop_fails=False)
+    rt.Supervisor = BoomOnRunnerSupervisor
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected LoopError to be raised")
+        except LoopError as exc:
+            assert not isinstance(exc, rt.RuntimeError_)
+            assert "simulated runner-assignment failure" in str(exc)
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        rt.Supervisor = original_supervisor
+
+    runs = list_run_ids(tmp_path / "repo")
+    assert len(runs) == 1
+    state = load_state(repo.common_dir(), runs[0])
+    assert state.phase != "operational_failure"
+    assert not _lock_path(repo.common_dir()).exists()
