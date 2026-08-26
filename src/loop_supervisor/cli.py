@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from .git import GitError, GitRepo
 from .input_providers import StdinInputProvider
 from .locking import LockError
+from .phases import PHASE_OPERATIONAL_FAILURE, TERMINAL_PHASES
 from .runtime import RuntimeError_, list_run_ids, run_new, run_resume
 from .state import RunOptions
 from .supervisor import FailurePersistenceError, LoopError
@@ -36,9 +37,73 @@ def _project_root(path: str | None) -> Path:
     return Path(path).resolve() if path else Path.cwd()
 
 
+def _add_step_control_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the mutually exclusive --step/--max-steps session controls.
+
+    These bound how many completed advance() calls a single invocation
+    performs before stopping (even on a non-terminal phase); they are a
+    per-invocation session control, not a run-behavior flag, so they are
+    never persisted into RunOptions and are safe to accept on `resume`
+    (see docs/decisions/0006-resumable-run-options-and-git-checkpoints.md).
+    """
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--step",
+        action="store_true",
+        help="Perform exactly one phase transition, then stop (shorthand for --max-steps 1)",
+    )
+    group.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Stop after N completed phase transitions, even if the run has not finished",
+    )
+
+
+def _resolve_max_steps(args: argparse.Namespace) -> int | None:
+    if getattr(args, "step", False):
+        return 1
+    max_steps: int | None = getattr(args, "max_steps", None)
+    if max_steps is not None and max_steps < 1:
+        raise ValueError("--max-steps must be at least 1")
+    return max_steps
+
+
+# Phases that are terminal-in-effect for reporting purposes: a run stopped
+# in one of these is not "paused" awaiting a resume, it is finished (done),
+# genuinely failed (failed), or already reported its own failure line
+# (operational_failure surfaces via the LoopError path when it carries an
+# error; when it doesn't, the phase alone is not something to resume from
+# in the ordinary sense, but it is also not a pause -- it is an unretryable
+# stop). Neither category should be announced as "paused".
+_NON_PAUSE_PHASES = TERMINAL_PHASES | {PHASE_OPERATIONAL_FAILURE}
+
+
+def _paused_phase_message(phase: str) -> str | None:
+    """Return the "paused at phase X" line for a non-terminal, non-failure
+    stop, or None if the run finished, failed, or hit an unretryable
+    operational failure.
+
+    This does not depend on whether --max-steps/--step was supplied: a run
+    that stops at, e.g., awaiting_input because input was unavailable is
+    just as much a pause as one that stops because its step budget ran
+    out, and both should be reported the same way.
+    """
+    if phase in _NON_PAUSE_PHASES:
+        return None
+    return f"paused at phase {phase}"
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     project_root = _project_root(args.project)
     load_dotenv(project_root / ".env")
+
+    try:
+        max_steps = _resolve_max_steps(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     options = RunOptions(
         max_accepted_tasks=args.max_tasks,
@@ -59,6 +124,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             options,
             input_provider=StdinInputProvider(),
             recover_stale_lock=getattr(args, "recover_stale_lock", False),
+            max_steps=max_steps,
         )
     except _EXPECTED_CLI_ERRORS as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -66,12 +132,21 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     print(f"run_id: {final.run_id}")
     print(f"final phase: {final.phase}")
+    paused = _paused_phase_message(final.phase)
+    if paused is not None:
+        print(paused)
     return 0 if final.phase == "done" else 1
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
     project_root = _project_root(args.project)
     load_dotenv(project_root / ".env")
+
+    try:
+        max_steps = _resolve_max_steps(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     if args.run_id is None:
         try:
@@ -93,12 +168,16 @@ def cmd_resume(args: argparse.Namespace) -> int:
             args.run_id,
             input_provider=StdinInputProvider(),
             recover_stale_lock=getattr(args, "recover_stale_lock", False),
+            max_steps=max_steps,
         )
     except _EXPECTED_CLI_ERRORS as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     print(f"final phase: {final.phase}")
+    paused = _paused_phase_message(final.phase)
+    if paused is not None:
+        print(paused)
     return 0 if final.phase == "done" else 1
 
 
@@ -264,14 +343,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Remove a stale lock from a dead local process and retry",
     )
+    _add_step_control_arguments(run_parser)
     run_parser.set_defaults(func=cmd_run)
 
-    # `resume` deliberately does not accept any run-behavior flags
-    # (limits, worktree root, approval policy, executable, timeouts):
-    # those are immutable and persisted in RunState.options at
-    # `start_new_run()`, and resume reconstructs the supervisor's
-    # behavior entirely from that persisted state, never from CLI
-    # arguments supplied at resume time.
+    # `resume` deliberately does not accept run-behavior flags (limits,
+    # worktree root, approval policy, executable, timeouts): those are
+    # immutable and persisted in RunState.options at `start_new_run()`,
+    # and resume reconstructs the supervisor's behavior entirely from
+    # that persisted state, never from CLI arguments supplied at resume
+    # time. --step/--max-steps are a per-invocation session control, not
+    # a run-behavior flag, and are exempt from that rule (see ADR 0006).
     resume_parser = sub.add_parser("resume", help="Resume a paused run (omit run_id to list)")
     resume_parser.add_argument("--project", default=None, help="Path to the integration repo")
     resume_parser.add_argument("run_id", nargs="?", default=None)
@@ -280,6 +361,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Remove a stale lock from a dead local process and retry",
     )
+    _add_step_control_arguments(resume_parser)
     resume_parser.set_defaults(func=cmd_resume)
 
     tui_parser = sub.add_parser("tui", help="Open the Textual TUI")

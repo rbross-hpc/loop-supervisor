@@ -79,7 +79,7 @@ class _FakeSupervisor:
         self._log.append("resume")
         return state
 
-    def run(self, state: _FakeState) -> _FakeState:
+    def run(self, state: _FakeState, *, max_steps: int | None = None) -> _FakeState:
         self._log.append("run")
         state.phase = self._final_phase
         return state
@@ -160,7 +160,7 @@ def _patch_runtime(repo: GitRepo, *, call_log: list[str], final_phase: str = "do
             call_log.append("resume")
             return state
 
-        def run(self, state):
+        def run(self, state, *, max_steps=None):
             call_log.append("run")
             state.phase = final_phase
             return state
@@ -312,7 +312,7 @@ def test_run_new_uses_runtime_not_supervisor_directly(tmp_path):
             state.options = _make_options()
             return state
 
-        def run(self, state):
+        def run(self, state, *, max_steps=None):
             called.append("run")
             return state
 
@@ -385,7 +385,7 @@ def test_run_resume_uses_runtime_not_supervisor_directly(tmp_path):
             called.append("resume")
             return s
 
-        def run(self, s):
+        def run(self, s, *, max_steps=None):
             called.append("run")
             return s
 
@@ -653,7 +653,7 @@ def test_run_new_supervisor_failure_takes_precedence_over_server_stop_failure(tm
 
     original_run = Supervisor.run
 
-    def _boom_run(self, state):
+    def _boom_run(self, state, *, max_steps=None):
         raise LoopError("simulated supervisor failure")
 
     rt.OpenCodeServer = FailingStopServer
@@ -726,7 +726,7 @@ def test_run_new_successful_run_failed_stop_retains_lock(tmp_path):
 
     original_run = Supervisor.run
 
-    def _fake_run(self, state):
+    def _fake_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
@@ -780,7 +780,7 @@ def test_run_new_successful_run_failed_stop_with_unprintable_str_retains_lock(tm
 
     original_run = Supervisor.run
 
-    def _fake_run(self, state):
+    def _fake_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
@@ -828,7 +828,7 @@ def test_run_new_failed_run_and_failed_stop_preserves_run_exception_and_retains_
 
     original_run = Supervisor.run
 
-    def _boom_run(self, state):
+    def _boom_run(self, state, *, max_steps=None):
         raise LoopError("simulated supervisor failure")
 
     rt.OpenCodeServer = FailingStopServer
@@ -941,7 +941,7 @@ def test_run_resume_successful_run_failed_stop_retains_lock(tmp_path):
 
     original_run = Supervisor.run
 
-    def _fake_run(self, state):
+    def _fake_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
@@ -1042,9 +1042,9 @@ def test_run_new_relative_project_path_uses_canonical_lock_metadata(tmp_path, mo
 
     original_run_to_completion = rt.RunSession.run_to_completion
 
-    def _capture(self):
+    def _capture(self, *, max_steps=None):
         captured["record"] = json.loads(_lock_path(repo.common_dir()).read_text())
-        return original_run_to_completion(self)
+        return original_run_to_completion(self, max_steps=max_steps)
 
     monkeypatch.setattr(rt.RunSession, "run_to_completion", _capture)
 
@@ -1679,7 +1679,7 @@ def test_run_new_successful_run_transient_cleanup_failure_then_success(tmp_path,
 
     original_run = Supervisor.run
 
-    def _fake_run(self, state):
+    def _fake_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
@@ -1708,7 +1708,7 @@ def test_run_new_successful_run_cleanup_exhaustion_retains_lock(tmp_path, monkey
 
     original_run = Supervisor.run
 
-    def _fake_run(self, state):
+    def _fake_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
@@ -1743,7 +1743,7 @@ def test_run_new_failed_run_transient_cleanup_failure_then_success(tmp_path, mon
 
     original_run = Supervisor.run
 
-    def _boom_run(self, state):
+    def _boom_run(self, state, *, max_steps=None):
         raise LoopError("simulated supervisor failure")
 
     rt.OpenCodeServer = Server
@@ -1781,7 +1781,7 @@ def test_run_new_failed_run_cleanup_exhaustion_retains_exact_primary_with_notes(
     original_run = Supervisor.run
     the_failure = LoopError("simulated supervisor failure")
 
-    def _boom_run(self, state):
+    def _boom_run(self, state, *, max_steps=None):
         raise the_failure
 
     rt.OpenCodeServer = Server
@@ -1827,7 +1827,7 @@ def test_run_new_run_time_keyboard_interrupt_preserves_identity(tmp_path):
     original_run = Supervisor.run
     the_interrupt = KeyboardInterrupt()
 
-    def _boom_run(self, state):
+    def _boom_run(self, state, *, max_steps=None):
         raise the_interrupt
 
     rt.OpenCodeServer = RecordingServer
@@ -1870,7 +1870,7 @@ def test_run_new_cleanup_time_keyboard_interrupt_does_not_replace_primary(tmp_pa
     original_run = Supervisor.run
     the_failure = LoopError("simulated supervisor failure")
 
-    def _boom_run(self, state):
+    def _boom_run(self, state, *, max_steps=None):
         raise the_failure
 
     rt.OpenCodeServer = InterruptingStopServer
@@ -1964,7 +1964,7 @@ def test_run_new_lock_release_failure_with_existing_primary_attaches_note(tmp_pa
     original_run = Supervisor.run
     the_failure = LoopError("simulated supervisor failure")
 
-    def _boom_run(self, state):
+    def _boom_run(self, state, *, max_steps=None):
         raise the_failure
 
     original_lock_release = rt._LockLease.release
@@ -2021,7 +2021,7 @@ def test_run_new_lock_release_failure_with_unprintable_str_attaches_safe_note(
     original_run = Supervisor.run
     the_failure = LoopError("simulated supervisor failure")
 
-    def _boom_run(self, state):
+    def _boom_run(self, state, *, max_steps=None):
         raise the_failure
 
     class _UnprintableLockError(LockError):
@@ -2086,7 +2086,7 @@ def test_lock_file_released_only_after_confirmed_cleanup(tmp_path, monkeypatch):
 
     original_run = Supervisor.run
 
-    def _fake_run(self, state):
+    def _fake_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
@@ -2172,7 +2172,7 @@ def test_run_new_uses_supplied_input_provider(tmp_path):
             state.options = _make_options()
             return state
 
-        def run(self, state):
+        def run(self, state, *, max_steps=None):
             return state
 
         @property
@@ -2239,7 +2239,7 @@ def test_run_new_defaults_to_stdin_input_provider_when_not_supplied(tmp_path):
             state.options = _make_options()
             return state
 
-        def run(self, state):
+        def run(self, state, *, max_steps=None):
             return state
 
         @property
@@ -2352,7 +2352,7 @@ def test_characterize_run_failure_stop_attempts_are_bounded(tmp_path, monkeypatc
     original_oc_server = rt.OpenCodeServer
     original_run = Supervisor.run
 
-    def _boom_run(self, state):
+    def _boom_run(self, state, *, max_steps=None):
         raise LoopError("simulated supervisor failure")
 
     rt.OpenCodeServer = _characterization_server(counter)
@@ -2383,7 +2383,7 @@ def test_characterize_successful_run_stop_attempts_are_bounded(tmp_path, monkeyp
     original_oc_server = rt.OpenCodeServer
     original_run = Supervisor.run
 
-    def _ok_run(self, state):
+    def _ok_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
@@ -2421,7 +2421,7 @@ def test_characterize_run_failure_unresolved_cleanup_note_exact_wording(tmp_path
     original_run = Supervisor.run
     the_failure = LoopError("simulated supervisor failure")
 
-    def _boom_run(self, state):
+    def _boom_run(self, state, *, max_steps=None):
         raise the_failure
 
     rt.OpenCodeServer = _characterization_server(counter)
@@ -2491,7 +2491,7 @@ def test_characterize_successful_run_unresolved_cleanup_message_exact_wording(
     original_oc_server = rt.OpenCodeServer
     original_run = Supervisor.run
 
-    def _ok_run(self, state):
+    def _ok_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
@@ -2715,7 +2715,7 @@ def _patched_session_env(repo, *, server_cls=None, supervisor_cls=None, call_log
                 phase_after="done",
             )
 
-        def run(self, state):
+        def run(self, state, *, max_steps=None):
             call_log.append("run")
             state.phase = "done"
             return state
@@ -2854,6 +2854,130 @@ def test_run_session_stops_server_before_releasing_lock(tmp_path):
             session.run_to_completion()
 
     assert lock_present_during_stop == [True]
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_run_session_run_to_completion_passes_max_steps_through(tmp_path):
+    """max_steps must reach Supervisor.run() unchanged; it is a
+    per-invocation session control, never persisted into RunOptions."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    received: list[object] = []
+
+    class RecordingSupervisor:
+        def __init__(self, *a, **kw):
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "fake-run"
+            state.phase = "planning"
+            state.options = _make_options()
+            return state
+
+        def run(self, state, *, max_steps=None):
+            received.append(max_steps)
+            state.phase = "done"
+            return state
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, value):
+            self._runner = value
+
+    with _patched_session_env(repo, supervisor_cls=RecordingSupervisor):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            final = session.run_to_completion(max_steps=3)
+
+    assert received == [3]
+    assert final.phase == "done"
+
+
+def test_run_new_passes_max_steps_through_to_supervisor_run(tmp_path):
+    """The max_steps keyword must reach Supervisor.run() from the module-
+    level run_new() convenience wrapper, not just from RunSession directly."""
+    received: list[object] = []
+    repo = _init_repo(tmp_path / "repo")
+
+    class RecordingSupervisor:
+        def __init__(self, *a, **kw):
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "fake-run"
+            state.phase = "planning"
+            state.options = _make_options()
+            return state
+
+        def run(self, state, *, max_steps=None):
+            received.append(max_steps)
+            state.phase = "done"
+            return state
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, value):
+            self._runner = value
+
+    with _patched_session_env(repo, supervisor_cls=RecordingSupervisor):
+        run_new(repo.root, _make_options(), max_steps=5)
+
+    assert received == [5]
+
+
+def test_run_session_run_to_completion_stops_early_without_error_and_cleans_up(tmp_path):
+    """A run stopped early by max_steps (non-terminal phase) must not raise,
+    and the session's own cleanup (stop the server, release the lock) must
+    still run via the normal __exit__ path."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+
+    class PausingSupervisor:
+        def __init__(self, *a, **kw):
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "fake-run"
+            state.phase = "planning"
+            state.options = _make_options()
+            return state
+
+        def run(self, state, *, max_steps=None):
+            call_log.append(f"run:max_steps={max_steps}")
+            # Simulate stopping one step short of a terminal phase.
+            state.phase = "building"
+            return state
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, value):
+            self._runner = value
+
+    with _patched_session_env(repo, supervisor_cls=PausingSupervisor, call_log=call_log):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            final = session.run_to_completion(max_steps=1)
+
+    assert final.phase == "building"
+    assert "server_stop" in call_log
     assert not _lock_path(repo.common_dir()).exists()
 
 
@@ -3940,7 +4064,7 @@ def test_resume_run_session_full_lifecycle(tmp_path):
     original_run = Supervisor.run
     original_resume = Supervisor.resume
 
-    def _ok_run(self, state):
+    def _ok_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
