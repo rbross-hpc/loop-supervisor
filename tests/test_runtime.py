@@ -4250,3 +4250,210 @@ def test_repeated_close_does_not_double_annotate_primary(tmp_path, monkeypatch):
             session.close(primary=the_error)
 
     assert list(getattr(the_error, "__notes__", [])) == first_notes
+
+
+# --- characterization for TUI-sync work (Phase A) ----------------------
+#
+# These pin two behaviors that no prior test asserted, both load-bearing
+# for upcoming changes:
+#
+#   1. The lock record's `operation` field, which a future `operation=`
+#      constructor parameter must default to preserving exactly.
+#   2. The single-threaded baseline for two races that adding
+#      synchronisation must fix: advance() unconditionally restoring
+#      SessionState.STARTED even when a concurrent close() has moved past
+#      it, and close() releasing the lock without waiting for an
+#      in-flight advance() to finish mutating state.
+#
+# The concurrency tests use a supervisor whose advance() blocks on an
+# Event until the test releases it, so the race window is deterministic
+# rather than timing-dependent.
+
+
+def test_run_session_new_run_lock_operation_is_run(tmp_path):
+    """The lock record for a new run must say operation="run". A future
+    operation= constructor parameter needs this pinned as the default it
+    must continue to produce when the caller does not override it."""
+    import json
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            record = json.loads(_lock_path(repo.common_dir()).read_text())
+            assert record["operation"] == "run"
+
+
+def test_run_session_resume_lock_operation_is_resume(tmp_path):
+    """The lock record for a resume must say operation="resume", the
+    other half of the default operation= must preserve.
+
+    Uses _patched_session_env's DefaultSupervisor (a pass-through resume())
+    since only the lock record is under test here; the real
+    Supervisor.resume() codepath is already covered separately by
+    test_resume_run_session_full_lifecycle."""
+    import json
+
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.supervisor import Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    supervisor = Supervisor(
+        repo=repo,
+        runner=MagicMock(),
+        git_common_dir=repo.common_dir(),
+        input_provider=MagicMock(),
+        options=_make_options(),
+    )
+    run_id = supervisor.start_new_run().run_id
+
+    import loop_supervisor.runtime as rt
+
+    with _patched_session_env(repo):
+        session = rt.resume_run_session(repo.root, run_id)
+        with session:
+            record = json.loads(_lock_path(repo.common_dir()).read_text())
+            assert record["operation"] == "resume"
+
+
+def _blocking_advance_supervisor_cls(release_event, entered_advance_event):
+    """Build a supervisor class whose advance() signals entry, then
+    blocks until the test releases it -- giving a test a deterministic
+    window in which to run a concurrent close()."""
+
+    class BlockingAdvanceSupervisor:
+        def __init__(self, *a, **kw):
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "fake-run"
+            state.phase = "planning"
+            state.options = _make_options()
+            return state
+
+        def advance(self, state):
+            from loop_supervisor.supervisor import AdvanceOutcome, AdvanceStatus
+
+            entered_advance_event.set()
+            release_event.wait(timeout=5)
+            state.phase = "building"
+            return AdvanceOutcome(
+                status=AdvanceStatus.ADVANCED,
+                state=state,
+                phase_before="planning",
+                phase_after="building",
+            )
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, value):
+            self._runner = value
+
+    return BlockingAdvanceSupervisor
+
+
+def test_characterize_single_threaded_advance_does_not_race_close(tmp_path):
+    """Baseline (single-threaded): calling close() only after advance()
+    returns is the only sequence this module currently guarantees is
+    safe. This is not a concurrency test -- it pins that the ordinary,
+    non-concurrent sequence ends in CLOSED with the lock released, as a
+    reference point for the actual race test below."""
+    import threading
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    release_event = threading.Event()
+    entered_advance_event = threading.Event()
+    release_event.set()  # do not block in the single-threaded baseline
+
+    supervisor_cls = _blocking_advance_supervisor_cls(release_event, entered_advance_event)
+    with _patched_session_env(repo, supervisor_cls=supervisor_cls):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            session.advance()
+            assert session.state is rt.SessionState.STARTED
+
+    assert session.state is rt.SessionState.CLOSED
+    assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_characterize_concurrent_close_during_advance_leaves_state_started(tmp_path):
+    """Reproduces the race close() vs. advance() must fix: with no
+    synchronisation, a close() that runs to completion while advance() is
+    still in flight releases the lock (and reaches CLOSED) *before*
+    advance() returns and unconditionally restores SessionState.STARTED
+    -- silently reverting a session that has already released its lock
+    back to what looks like a live, advanceable STARTED state.
+
+    This test pins that this is exactly what happens today (no
+    synchronisation): it must continue to pass, unchanged, right up until
+    the commit that adds locking, at which point it is expected to start
+    failing and must be replaced by a test asserting the fixed ordering
+    (close() waits for advance() to finish before releasing). It exists
+    so that fix has a concrete, reproduced-before-fixed regression to
+    verify against, per this repo's defect-injection-before-acceptance
+    convention.
+    """
+    import threading
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    release_event = threading.Event()
+    entered_advance_event = threading.Event()
+
+    supervisor_cls = _blocking_advance_supervisor_cls(release_event, entered_advance_event)
+    with _patched_session_env(repo, supervisor_cls=supervisor_cls):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+
+            advance_result: list[object] = []
+            advance_thread = threading.Thread(
+                target=lambda: advance_result.append(session.advance())
+            )
+            advance_thread.start()
+            assert entered_advance_event.wait(timeout=5), "advance() never entered"
+
+            # advance() is now blocked inside the supervisor call, with
+            # session.state == ADVANCING. Close while it is still there.
+            session.close()
+            assert session.state is rt.SessionState.CLOSED
+            # Race #2, pinned here: the lock is released even though
+            # advance() has not returned and may still be mutating
+            # Git/state on the blocked thread. Once close() waits for an
+            # in-flight advance() before releasing, this assertion is
+            # expected to start failing at this exact line (the release
+            # would instead happen only after advance_thread.join() below).
+            assert not _lock_path(repo.common_dir()).exists()
+
+            # Let advance() finish. With no synchronisation, its `finally`
+            # equivalent (the success path at runtime.py's advance())
+            # unconditionally sets self._state back to STARTED, clobbering
+            # CLOSED -- even though the lock is already gone.
+            release_event.set()
+            advance_thread.join(timeout=5)
+            assert not advance_thread.is_alive()
+
+            # Assert here, still inside the `with` block: session.state
+            # must be checked before __exit__ runs a second close(), which
+            # would mask the race by closing again from STARTED and
+            # reaching CLOSED a second time, hiding exactly the clobber
+            # this test exists to reproduce.
+            assert session.state is rt.SessionState.STARTED, (
+                "This pins the current (racy) behavior: advance() unconditionally "
+                "overwrites CLOSED with STARTED. Once close()/advance() are made "
+                "mutually exclusive, this assertion is expected to start failing "
+                "and must be replaced by one asserting state stays CLOSED."
+            )
