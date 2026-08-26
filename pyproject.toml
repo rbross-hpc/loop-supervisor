@@ -31,6 +31,18 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# An exception escaping a worker thread (or a __del__/callback, for the
+# unraisable case) is otherwise downgraded to an ignorable warning: a test
+# can pass while its thread silently raised. This let a characterization
+# test in test_runtime.py pass while actually exercising the wrong code
+# path (see the commit fixing it). Not a blanket `filterwarnings =
+# ["error"]": the suite currently emits unrelated ResourceWarnings that
+# would fail it immediately (see docs/plans/2026-08-22-post-lifecycle-fix-
+# backlog.md item 23).
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
 
 [tool.ruff]
 line-length = 100

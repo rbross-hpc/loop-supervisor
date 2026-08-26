@@ -152,6 +152,21 @@ tracked and addressed in follow-up work rather than dropped.
     fakes exercise, and cleanup failures under real process-kill
     scenarios rather than monkeypatched `stop()`.
 
+23. **Investigate 9 hidden `ResourceWarning`s in the full test suite**,
+    found while adding `filterwarnings` for
+    `PytestUnhandledThreadExceptionWarning`/`PytestUnraisableExceptionWarning`
+    (see `pyproject.toml`'s `[tool.pytest.ini_options]`). Surfaced via
+    `pytest tests/ -W always`; not escalated to errors in that change
+    because a blanket `filterwarnings = ["error"]` fails the suite
+    immediately on these. One is substantive:
+    `tests/test_opencode.py::test_start_bounded_close_reports_thread_start_failure`
+    leaks a running subprocess (`ResourceWarning: subprocess NNNNN is
+    still running`) — in a fault-injection test specifically about
+    cleanup behavior, this may indicate a real cleanup gap rather than
+    test sloppiness and should be looked at first. The other two are
+    unclosed-file `ResourceWarning`s attributed to pytest's own
+    `logging`/`python` plugin internals and are likely not ours to fix.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in
