@@ -415,9 +415,15 @@ class SessionState(Enum):
 
 
 class _RunKind(Enum):
-    """Which flavour of session this is. The value is also the lock
-    ``operation`` string, which ``SupervisorLock`` validates against a
-    fixed vocabulary (``run``/``resume``/``tui``)."""
+    """Which flavour of session this is: a new run or a resume.
+
+    Orthogonal to the lock ``operation`` label (see ``RunSession``'s
+    ``operation`` parameter): ``_RunKind`` drives run-id validation and
+    which ``Supervisor`` construction path is used, while ``operation``
+    only labels the lock record for display. The value here is merely
+    the *default* ``operation`` when the caller does not override it.
+    ``SupervisorLock`` validates the resolved operation against a fixed
+    vocabulary (``run``/``resume``/``tui``)."""
 
     NEW = "run"
     RESUME = "resume"
@@ -447,11 +453,22 @@ class RunSession:
         input_provider: InputProvider | None = None,
         recover_stale_lock: bool = False,
         server_observer: InvocationObserver | None = None,
+        operation: str | None = None,
     ) -> None:
         self._project_root = project_root
         self._run_kind = run_kind
         self._options = options
         self._run_id = run_id
+        # Label written into the lock record. Independent of run_kind: a
+        # TUI session resuming a run is still a resume for _run_kind's
+        # purposes (run-id validation, Supervisor construction), but the
+        # lock should say "tui", not "resume". Defaults to run_kind's
+        # value, preserving prior behavior exactly when not overridden.
+        # Validation of the resolved value is SupervisorLock's job (see
+        # its acquire()), not this class's: an invalid operation fails
+        # closed via LockError before anything is written to disk, so
+        # there is no malformed-lock hazard to guard against here.
+        self._operation = operation if operation is not None else run_kind.value
         self._input_provider = input_provider
         self._recover_stale_lock = recover_stale_lock
         self._server_observer = server_observer
@@ -571,7 +588,7 @@ class RunSession:
 
         lock = SupervisorLock(
             common_dir,
-            operation=self._run_kind.value,
+            operation=self._operation,
             run_id=self._run_id if self._run_kind is _RunKind.RESUME else None,
             integration_path=str(repo.root),
             recover_stale=self._recover_stale_lock,
@@ -947,6 +964,7 @@ def new_run_session(
     input_provider: InputProvider | None = None,
     recover_stale_lock: bool = False,
     server_observer: InvocationObserver | None = None,
+    operation: str | None = None,
 ) -> RunSession:
     """Return an inert :class:`RunSession` for a new run.
 
@@ -956,6 +974,10 @@ def new_run_session(
     TTY-only) when not supplied, matching prior behavior for callers that
     do not need to inject a different provider (e.g. the TUI's
     non-blocking queue-backed provider).
+
+    ``operation`` labels the lock record (e.g. ``"tui"`` for a Textual
+    frontend); it defaults to ``"run"``. It does not affect the run
+    itself, only how the lock is reported to other processes/operators.
     """
     return RunSession(
         project_root=project_root,
@@ -964,6 +986,7 @@ def new_run_session(
         input_provider=input_provider,
         recover_stale_lock=recover_stale_lock,
         server_observer=server_observer,
+        operation=operation,
     )
 
 
@@ -974,11 +997,16 @@ def resume_run_session(
     input_provider: InputProvider | None = None,
     recover_stale_lock: bool = False,
     server_observer: InvocationObserver | None = None,
+    operation: str | None = None,
 ) -> RunSession:
     """Return an inert :class:`RunSession` resuming ``run_id``.
 
     Nothing is acquired until the session is entered; the run ID is
     validated during ``__enter__``, before the lock is taken.
+
+    ``operation`` labels the lock record (e.g. ``"tui"`` for a Textual
+    frontend); it defaults to ``"resume"``. It does not affect which run
+    is resumed, only how the lock is reported to other processes/operators.
     """
     return RunSession(
         project_root=project_root,
@@ -987,6 +1015,7 @@ def resume_run_session(
         input_provider=input_provider,
         recover_stale_lock=recover_stale_lock,
         server_observer=server_observer,
+        operation=operation,
     )
 
 

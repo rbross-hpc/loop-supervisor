@@ -4319,6 +4319,85 @@ def test_run_session_resume_lock_operation_is_resume(tmp_path):
             assert record["operation"] == "resume"
 
 
+# --- operation= override (A1) -------------------------------------------
+#
+# operation= is orthogonal to _RunKind: it only labels the lock record,
+# while _RunKind still drives run-id validation and which Supervisor
+# construction path runs. The TUI does both new runs and resumes, so it
+# needs operation="tui" independent of which kind of session it is.
+
+
+def test_run_session_new_run_operation_override_labels_lock_as_tui(tmp_path):
+    """A new run with operation="tui" writes operation="tui" to the lock
+    record, and run_id stays None -- exactly the record app.py's own
+    SupervisorLock construction produces today for a new TUI run
+    (operation="tui", run_id=self._run_id which is None for a new run).
+    This is the parity Phase B's RunSession adoption will depend on."""
+    import json
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options(), operation="tui")
+        with session:
+            record = json.loads(_lock_path(repo.common_dir()).read_text())
+            assert record["operation"] == "tui"
+            assert record["run_id"] is None
+
+
+def test_run_session_resume_operation_override_labels_lock_as_tui(tmp_path):
+    """A resume with operation="tui" writes operation="tui" *and* still
+    carries the real run_id -- proving operation= and _RunKind vary
+    independently. If operation were driving run_id instead of _RunKind,
+    this would regress to run_id=None."""
+    import json
+
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.supervisor import Supervisor
+
+    repo = _init_repo(tmp_path / "repo")
+    supervisor = Supervisor(
+        repo=repo,
+        runner=MagicMock(),
+        git_common_dir=repo.common_dir(),
+        input_provider=MagicMock(),
+        options=_make_options(),
+    )
+    run_id = supervisor.start_new_run().run_id
+
+    import loop_supervisor.runtime as rt
+
+    with _patched_session_env(repo):
+        session = rt.resume_run_session(repo.root, run_id, operation="tui")
+        with session:
+            record = json.loads(_lock_path(repo.common_dir()).read_text())
+            assert record["operation"] == "tui"
+            assert record["run_id"] == run_id
+
+
+def test_run_session_invalid_operation_fails_closed_without_writing_lock(tmp_path):
+    """An operation outside SupervisorLock's fixed vocabulary must fail
+    __enter__ with LockError, leave the session FAILED, and never write a
+    lock file -- validation is delegated entirely to SupervisorLock, whose
+    acquire() validates the prospective record before any filesystem
+    write (locking.py's _validate_lock_record call ahead of
+    _write_lock_file), so there is no window in which a malformed
+    operation reaches disk."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import LockError, _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options(), operation="delete-everything")
+        with pytest.raises(LockError):
+            session.__enter__()
+
+        assert session.state is rt.SessionState.FAILED
+        assert not _lock_path(repo.common_dir()).exists()
+
+
 def _blocking_advance_supervisor_cls(release_event, entered_advance_event):
     """Build a supervisor class whose advance() signals entry, then
     blocks until the test releases it -- giving a test a deterministic
