@@ -4990,3 +4990,303 @@ def test_startup_failure_handoff_is_still_not_retried(tmp_path, monkeypatch):
                 session.start_server()
 
     assert stop_calls[0] == rt._CLEANUP_ATTEMPTS
+
+
+# --- run_to_completion() thread-safety (A3.1) ----------------------------
+#
+# A3 gave advance() a state guard and a quiescence barrier, but
+# run_to_completion() has its own separate code path -- Supervisor.run()
+# loops calling *its own* advance() internally, never going through
+# RunSession.advance() -- so it inherited none of that protection. The
+# module's concurrency contract already claimed run_to_completion() was
+# covered; it was not. These tests close that gap the same way A3 closed
+# advance()'s.
+
+
+def _blocking_run_supervisor_cls(release_event, entered_run_event):
+    """Build a supervisor class whose run() signals entry, then blocks
+    until the test releases it -- the run_to_completion() analogue of
+    _blocking_advance_supervisor_cls."""
+
+    class BlockingRunSupervisor:
+        def __init__(self, *a, **kw):
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "fake-run"
+            state.phase = "planning"
+            state.options = _make_options()
+            return state
+
+        def run(self, state, *, max_steps=None):
+            entered_run_event.set()
+            release_event.wait(timeout=5)
+            state.phase = "done"
+            return state
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, value):
+            self._runner = value
+
+    return BlockingRunSupervisor
+
+
+def test_run_to_completion_clears_the_quiescence_barrier(tmp_path):
+    """Contract test for the gap itself: the barrier must be clear while
+    run_to_completion() is in flight, exactly as it is during advance().
+    This is the assertion whose absence let the gap through -- all of
+    A3's tests exercised advance(), none exercised run_to_completion()."""
+    import threading
+
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    release_event = threading.Event()
+    entered_run_event = threading.Event()
+
+    supervisor_cls = _blocking_run_supervisor_cls(release_event, entered_run_event)
+    with _patched_session_env(repo, supervisor_cls=supervisor_cls):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+
+            run_thread = threading.Thread(target=session.run_to_completion)
+            run_thread.start()
+            try:
+                assert entered_run_event.wait(timeout=5), "run_to_completion() never entered"
+                assert not session._advance_done.is_set(), (
+                    "the quiescence barrier was not cleared during run_to_completion(); "
+                    "a concurrent close() would not wait for it"
+                )
+            finally:
+                release_event.set()
+                run_thread.join(timeout=5)
+
+            assert not run_thread.is_alive()
+            assert session._advance_done.is_set()
+
+
+def test_raising_run_to_completion_still_releases_the_quiescence_barrier(tmp_path):
+    """The run_to_completion() analogue of
+    test_raising_advance_still_releases_the_quiescence_barrier: a failing
+    run_to_completion() must set _advance_done in its finally, or a
+    close() waiting on the barrier would block forever. Without the
+    finally this test hangs rather than fails, so close() is run with a
+    hard timeout on a worker thread, and the barrier is released by hand
+    before asserting so a failed assertion does not itself hang inside
+    __exit__ -> close() -> _advance_done.wait()."""
+    import threading
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+
+    class BoomRunSupervisor:
+        def __init__(self, *a, **kw):
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "fake-run"
+            state.phase = "planning"
+            state.options = _make_options()
+            return state
+
+        def run(self, state, *, max_steps=None):
+            raise RuntimeError("run boom")
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, value):
+            self._runner = value
+
+    with _patched_session_env(repo, supervisor_cls=BoomRunSupervisor):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            with pytest.raises(RuntimeError, match="run boom"):
+                session.run_to_completion()
+
+            barrier_released = session._advance_done.is_set()
+            if not barrier_released:
+                session._advance_done.set()
+            assert barrier_released, (
+                "a raising run_to_completion() left the quiescence barrier clear; any "
+                "close() would now block forever"
+            )
+
+            done = threading.Event()
+
+            def _close() -> None:
+                session.close()
+                done.set()
+
+            t = threading.Thread(target=_close)
+            t.start()
+            assert done.wait(timeout=5), "close() blocked after a raising run_to_completion()"
+            t.join(timeout=5)
+
+        assert session.state is rt.SessionState.CLOSED
+        assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_concurrent_close_during_run_to_completion_waits(tmp_path):
+    """The run_to_completion() analogue of
+    test_concurrent_close_during_advance_waits_and_does_not_clobber_state:
+    close() must not release the lock while a run_to_completion() call is
+    still in flight and could still be mutating Git/state."""
+    import threading
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    release_event = threading.Event()
+    entered_run_event = threading.Event()
+
+    supervisor_cls = _blocking_run_supervisor_cls(release_event, entered_run_event)
+    with _patched_session_env(repo, supervisor_cls=supervisor_cls):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+
+            run_result: list[object] = []
+            run_error: list[BaseException] = []
+
+            def _run_run() -> None:
+                try:
+                    run_result.append(session.run_to_completion())
+                except BaseException as exc:  # noqa: BLE001 - captured for the assert below
+                    run_error.append(exc)
+
+            close_returned = threading.Event()
+            close_error: list[BaseException] = []
+
+            def _run_close() -> None:
+                try:
+                    session.close()
+                except BaseException as exc:  # noqa: BLE001 - captured for the assert below
+                    close_error.append(exc)
+                finally:
+                    close_returned.set()
+
+            run_thread = threading.Thread(target=_run_run)
+            run_thread.start()
+            close_thread = threading.Thread(target=_run_close)
+            try:
+                assert entered_run_event.wait(timeout=5), "run_to_completion() never entered"
+
+                close_thread.start()
+
+                assert not close_returned.wait(timeout=1.0), (
+                    "close() returned while run_to_completion() was still in flight; the "
+                    "lock may have been released with a transition still able to mutate "
+                    "Git/state"
+                )
+                assert _lock_path(repo.common_dir()).exists()
+            finally:
+                release_event.set()
+                run_thread.join(timeout=5)
+                if close_thread.is_alive() or close_thread.ident is not None:
+                    close_thread.join(timeout=5)
+
+            assert not run_thread.is_alive()
+            assert not close_thread.is_alive()
+            assert run_error == [], run_error
+            assert close_error == [], close_error
+            assert len(run_result) == 1
+
+            assert session.state is rt.SessionState.CLOSED
+            assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_run_to_completion_does_not_write_run_state_after_close(tmp_path):
+    """Focused unit form of the run_state write's terminal-aware guard,
+    without the timing setup: a session already driven terminal must not
+    have its run_state overwritten by the tail of a run_to_completion()
+    that was already in flight when close() ran.
+
+    Complements the concurrency test above by pinning the guard itself
+    (_store_run_state_unless_closed) rather than the scenario that
+    motivated it -- calling the actual method under test, the same way
+    test_advance_does_not_resurrect_a_closed_session calls
+    _restore_started_unless_closed() directly, rather than
+    re-implementing the ``if self._state_is(...)`` check inline. An
+    inline reimplementation would pass even if the guard inside
+    run_to_completion() itself were missing or wrong, since it would
+    never call the method it means to be verifying."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            run_state_before = session.run_state
+            session.close()
+            assert session.state is rt.SessionState.CLOSED
+
+            sentinel = MagicMock()
+            sentinel.run_id = "should-not-be-written"
+            with session._state_lock:
+                session._store_run_state_unless_closed(sentinel)
+            assert session.run_state is run_state_before
+            assert session.state is rt.SessionState.CLOSED
+
+
+def test_stop_server_during_blocked_run_to_completion_does_not_deadlock(tmp_path):
+    """The run_to_completion() analogue of
+    test_stop_server_during_blocked_advance_does_not_deadlock: a shutdown
+    thread must be able to stop the server while run_to_completion() is
+    blocked. If _state_lock were held across Supervisor.run(), this would
+    deadlock -- so the call is made on a worker thread with a hard
+    timeout, making a regression a test failure rather than a hung
+    suite."""
+    import threading
+
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    release_event = threading.Event()
+    entered_run_event = threading.Event()
+
+    supervisor_cls = _blocking_run_supervisor_cls(release_event, entered_run_event)
+    with _patched_session_env(repo, supervisor_cls=supervisor_cls) as call_log:
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+
+            run_thread = threading.Thread(target=session.run_to_completion)
+            run_thread.start()
+            try:
+                assert entered_run_event.wait(timeout=5), "run_to_completion() never entered"
+
+                stopped = threading.Event()
+
+                def _stop() -> None:
+                    session.stop_server()
+                    stopped.set()
+
+                stop_thread = threading.Thread(target=_stop)
+                stop_thread.start()
+                assert stopped.wait(timeout=5), (
+                    "stop_server() blocked while run_to_completion() was in flight -- "
+                    "_state_lock is held across Supervisor.run(), which deadlocks the "
+                    "exact escalation stop_server() exists to perform"
+                )
+                stop_thread.join(timeout=5)
+                assert "server_stop" in call_log
+            finally:
+                release_event.set()
+                run_thread.join(timeout=5)
+
+            assert not run_thread.is_alive()

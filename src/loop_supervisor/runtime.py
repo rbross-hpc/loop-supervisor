@@ -936,6 +936,18 @@ class RunSession:
             self._restore_started_unless_closed()
         return outcome
 
+    def _state_is(self, expected: SessionState) -> bool:
+        """True if the state is still exactly ``expected``.
+
+        Caller must hold ``_state_lock``. Used after a long-running call
+        (``advance()``/``run_to_completion()``) has released the lock for
+        the duration of the actual supervisor work, to detect whether a
+        concurrent ``close()`` has since claimed the session -- so the
+        finishing call does not write into, or resurrect, a session it no
+        longer owns.
+        """
+        return self._state is expected
+
     def _restore_started_unless_closed(self) -> None:
         """Return to ``STARTED`` only if this advance() is still the
         session's current activity.
@@ -946,7 +958,7 @@ class RunSession:
         silently resurrecting a session that had already released its
         lock into something that looked live and advanceable.
         """
-        if self._state is SessionState.ADVANCING:
+        if self._state_is(SessionState.ADVANCING):
             self._state = SessionState.STARTED
 
     def run_to_completion(self, *, max_steps: int | None = None) -> RunState:
@@ -960,15 +972,65 @@ class RunSession:
 
         Cleanup is not performed here: the caller's ``with`` block triggers
         ``__exit__`` → ``close()``.
-        """
-        if self._state is not SessionState.STARTED:
-            raise RuntimeError_(f"cannot run in state {self._state.value!r}; expected 'started'")
-        assert self._supervisor is not None
-        assert self._run_state is not None
 
-        final = self._supervisor.run(self._run_state, max_steps=max_steps)
-        self._run_state = final
+        Thread-safety: mirrors ``advance()``'s contract exactly, and for
+        the same reason -- ``Supervisor.run()`` itself loops calling
+        ``advance()`` many times without ever going through
+        ``RunSession.advance()``, so it does not otherwise get any of
+        that method's protection. The supervisor call runs *outside*
+        ``_state_lock`` (holding it here would deadlock ``stop_server()``,
+        more acutely than for a single ``advance()`` since this call can
+        run for the entire remaining session). ``_advance_done`` is
+        cleared for the duration so a concurrent ``close()`` waits for
+        this call to finish before releasing the lock, and is set again
+        in a ``finally`` so a raising call can never strand that waiter.
+
+        Unlike ``advance()``, this method makes no ``SessionState``
+        transition of its own (state remains ``STARTED`` throughout), so
+        there is nothing to restore on the way out. Instead, writing the
+        result back to ``_run_state`` is guarded by the same "still the
+        session's current activity" check: if a concurrent ``close()``
+        has already claimed the session by the time this call returns,
+        the result is still returned to the caller (real work was done)
+        but is not written into a session that no longer owns it.
+        """
+        with self._state_lock:
+            if self._state is not SessionState.STARTED:
+                raise RuntimeError_(
+                    f"cannot run in state {self._state.value!r}; expected 'started'"
+                )
+            assert self._supervisor is not None
+            assert self._run_state is not None
+            supervisor = self._supervisor
+            run_state = self._run_state
+            self._advance_done.clear()
+
+        try:
+            final = supervisor.run(run_state, max_steps=max_steps)
+        finally:
+            # Release the barrier BEFORE reacquiring _state_lock -- same
+            # lock-ordering requirement as advance(): a waiter must never
+            # be able to hold _state_lock while blocked on this event.
+            self._advance_done.set()
+
+        with self._state_lock:
+            self._store_run_state_unless_closed(final)
         return final
+
+    def _store_run_state_unless_closed(self, run_state: RunState) -> None:
+        """Write ``run_state`` back to the session only if it is still the
+        session's current activity.
+
+        Caller must hold ``_state_lock``. Extracted as its own method (as
+        ``_restore_started_unless_closed`` is for ``advance()``'s
+        analogous guard) precisely so it is directly callable and
+        therefore directly testable -- a test that instead re-implements
+        the ``if self._state_is(...)`` check inline can pass even when
+        the guard inside ``run_to_completion()`` itself is missing or
+        wrong, since it never calls the method it means to be verifying.
+        """
+        if self._state_is(SessionState.STARTED):
+            self._run_state = run_state
 
     def close(self, *, primary: BaseException | None = None) -> None:
         """Confirm OpenCode cleanup, then release the lock.
