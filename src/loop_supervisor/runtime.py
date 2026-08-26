@@ -75,9 +75,47 @@ with its exact identity and traceback. ``__exit__`` and ``close()``
 contribute no frames — cleanup work performed inside ``__exit__`` is
 invisible to the traceback as long as it does not itself raise.
 
-Thread-safety: ``RunSession`` is **not yet thread-safe**; it targets
-single-threaded headless use. Synchronisation will be added when the
-Textual TUI needs it.
+Thread-safety: ``RunSession`` may be driven from more than one thread,
+as the Textual TUI does (an ``advance()`` worker thread plus a shutdown
+worker thread; see ADR 0008). Two separate primitives are used, and the
+distinction is load-bearing:
+
+``_state_lock`` (an ``RLock``)
+    Guards the mutable bookkeeping — ``_state``, ``_pending_cleanup``,
+    ``_annotated``, and the lease decisions — and serializes the cleanup
+    paths (``close()`` and ``stop_server()``) against each other.
+    Re-entrant because ``__exit__`` → ``close()`` re-enters legitimately.
+
+    It is deliberately **never** held across ``supervisor.advance()``:
+    doing so would deadlock the very scenario ``stop_server()`` exists
+    for, since a shutdown thread calling ``stop_server()`` to unblock a
+    stuck ``advance()`` would instead block behind that same
+    ``advance()``.
+
+    It *is* held across ``server.stop()``, and that is required rather
+    than incidental. ``OpenCodeServer.stop()`` takes the server's own
+    internal cleanup lock, so both cleanup paths must acquire these two
+    locks in the same order (this one first, the server's second).
+    Releasing ours around ``stop()`` would let ``close()`` and
+    ``stop_server()`` acquire them in opposite orders — a textbook ABBA
+    deadlock.
+
+``_advance_done`` (an ``Event``)
+    A quiescence barrier, not a mutex. ``advance()`` clears it on entry
+    and sets it in a ``finally``; ``close()`` waits on it before
+    touching the lease, so the repository lock is never released while
+    a transition may still be mutating Git/state. The wait is
+    deliberately **unbounded**: there is no safe bound (that hazard is
+    precisely what ADR 0009 exists to prevent) and no Python thread may
+    be force-killed. ``stop_server()`` is the escape hatch for a
+    transition that would otherwise block for its full role timeout.
+
+Concurrency contract: ``close()``, ``stop_server()``, and
+``abort_active_invocations()`` are safe to call from another thread
+while ``advance()``/``run_to_completion()`` is in flight. ``close()``
+will block until that call finishes. Concurrent ``advance()`` calls are
+*not* supported — the state guard rejects the second one, as it does
+single-threaded.
 
 Known limitation: ``_confirm_server_stopped``'s backoff uses
 ``time.sleep()``, which is not interrupt-safe. This module therefore does
@@ -88,6 +126,7 @@ from __future__ import annotations
 
 import inspect
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -496,6 +535,22 @@ class RunSession:
         # and the close() that immediately follows must consume that same
         # result rather than spending the budget a second time.
         self._pending_cleanup: _CleanupOutcome | None = None
+        # Whether an *unconfirmed* _pending_cleanup should be retried by
+        # the next _confirm_cleanup() rather than consumed as-is.
+        #
+        # start_server()'s handoff is not retryable: the close() that
+        # consumes it runs immediately afterwards via __exit__ with
+        # nothing in between, so re-attempting stop() there would simply
+        # spend the documented _CLEANUP_ATTEMPTS budget twice for one
+        # failure sequence.
+        #
+        # stop_server()'s handoff is retryable: an in-flight advance()
+        # typically unwinds between the two calls, and that later attempt
+        # is the one most likely to succeed (it is no longer racing a
+        # blocked HTTP transport). Consuming the stale failure instead
+        # would make close() attempt stop() zero times and declare the
+        # session unresolved on the strength of an obsolete attempt.
+        self._pending_cleanup_retryable = False
         # Exceptions that have already received a retained-lock note, so a
         # second close() does not annotate the same object twice.
         #
@@ -507,6 +562,14 @@ class RunSession:
         # held. Suppression must cover duplicate annotation only, never
         # whether close() reports failure.
         self._annotated: list[BaseException] = []
+
+        # See the module docstring's thread-safety section for why these
+        # are two distinct primitives rather than one mutex.
+        self._state_lock = threading.RLock()
+        # Set == no advance() in flight. Starts set: a session that has
+        # never advanced must not make close() wait.
+        self._advance_done = threading.Event()
+        self._advance_done.set()
 
     # -- read-only views -------------------------------------------------
 
@@ -581,11 +644,11 @@ class RunSession:
         a subsequent (redundant) call must not make ``close()`` believe
         it is unresolved again.
 
-        Callers on a background thread must not assume this makes
-        concurrent use of the session safe: ``RunSession`` is not yet
-        thread-safe (see the module docstring), and calling this while
-        ``advance()`` is in flight on another thread is exactly the kind
-        of concurrent access that is not yet guarded against.
+        Safe to call from another thread while ``advance()`` is in flight
+        — that is its purpose. It serializes against ``close()`` on
+        ``_state_lock`` but never waits for ``advance()`` to finish, since
+        waiting would defeat the point (see the module docstring's
+        thread-safety section).
         """
         # self._server is constructed in __enter__, before server.start()
         # is ever attempted, so `self._server is None` does not mean "not
@@ -593,13 +656,15 @@ class RunSession:
         # "has server.start() been attempted" guard is the same one
         # close() uses: self._server_may_exist (set immediately before
         # start_server() calls server.start()).
-        if self._server is None or not self._server_may_exist:
-            return
-        outcome = _confirm_server_stopped(self._server)
-        pending = self._pending_cleanup
-        if pending is not None and pending.confirmed and not outcome.confirmed:
-            return
-        self._pending_cleanup = outcome
+        with self._state_lock:
+            if self._server is None or not self._server_may_exist:
+                return
+            outcome = _confirm_server_stopped(self._server)
+            pending = self._pending_cleanup
+            if pending is not None and pending.confirmed and not outcome.confirmed:
+                return
+            self._pending_cleanup = outcome
+            self._pending_cleanup_retryable = True
 
     # -- lifecycle -------------------------------------------------------
 
@@ -804,7 +869,10 @@ class RunSession:
             cleanup = self._confirm_cleanup()
             # Hand this outcome to the close() that __exit__ is about to
             # run, so the bounded retry budget is spent exactly once.
+            # Not retryable: that close() follows immediately, with no
+            # opportunity for conditions to have changed in between.
             self._pending_cleanup = cleanup
+            self._pending_cleanup_retryable = False
             try:
                 _startup_failure(self._supervisor, self._run_state, self._server, exc, cleanup)
             except BaseException as startup_exc:
@@ -826,23 +894,60 @@ class RunSession:
         Requires a started server (the supervisor's runner is installed by
         ``start_server()``); calling it earlier would dispatch against the
         ``_UnstartedRunner`` placeholder and fail the run.
-        """
-        if self._state is not SessionState.STARTED:
-            raise RuntimeError_(
-                f"cannot advance in state {self._state.value!r}; expected 'started'"
-            )
-        assert self._supervisor is not None
-        assert self._run_state is not None
 
-        self._state = SessionState.ADVANCING
+        Thread-safety: the supervisor call itself runs *outside*
+        ``_state_lock`` (holding it there would deadlock ``stop_server()``,
+        which exists to unblock exactly this call). ``_advance_done`` is
+        cleared for the duration so a concurrent ``close()`` waits for
+        this transition to finish before releasing the lock, and is set
+        again in a ``finally`` so a raising ``advance()`` can never strand
+        that waiter.
+        """
+        with self._state_lock:
+            if self._state is not SessionState.STARTED:
+                raise RuntimeError_(
+                    f"cannot advance in state {self._state.value!r}; expected 'started'"
+                )
+            assert self._supervisor is not None
+            assert self._run_state is not None
+            supervisor = self._supervisor
+            run_state = self._run_state
+            self._state = SessionState.ADVANCING
+            self._advance_done.clear()
+
         try:
-            outcome = self._supervisor.advance(self._run_state)
+            try:
+                outcome = supervisor.advance(run_state)
+            finally:
+                # Release the barrier BEFORE reacquiring _state_lock, and
+                # in a finally so a raising advance() cannot strand a
+                # waiter. Lock-ordering matters here: a waiter must never
+                # be able to hold _state_lock while blocked on this event
+                # (close() deliberately waits before taking the lock), and
+                # this side must never take the lock before setting it.
+                self._advance_done.set()
         except BaseException:
-            self._state = SessionState.STARTED
+            with self._state_lock:
+                self._restore_started_unless_closed()
             raise
-        self._run_state = outcome.state
-        self._state = SessionState.STARTED
+
+        with self._state_lock:
+            self._run_state = outcome.state
+            self._restore_started_unless_closed()
         return outcome
+
+    def _restore_started_unless_closed(self) -> None:
+        """Return to ``STARTED`` only if this advance() is still the
+        session's current activity.
+
+        Caller must hold ``_state_lock``. Unconditionally assigning
+        ``STARTED`` (as this did before) let a finishing ``advance()``
+        clobber the terminal state written by a concurrent ``close()``,
+        silently resurrecting a session that had already released its
+        lock into something that looked live and advanceable.
+        """
+        if self._state is SessionState.ADVANCING:
+            self._state = SessionState.STARTED
 
     def run_to_completion(self, *, max_steps: int | None = None) -> RunState:
         """Run the supervisor loop to a terminal phase (or until input is
@@ -892,90 +997,104 @@ class RunSession:
         run failed and the ..." versus "run completed but ...") and
         receives the diagnostic as a note, since a cleanup failure must
         never replace a real run failure.
+
+        Thread-safety: if an ``advance()`` is in flight on another thread,
+        this blocks (unboundedly) until it finishes before touching the
+        lease, so the repository lock is never released while a
+        transition may still be mutating Git/state. The wait happens
+        *before* ``_state_lock`` is acquired, so a blocked ``close()``
+        never holds the lock that ``advance()`` needs in order to finish.
         """
-        if self._state in (SessionState.CLOSED, SessionState.FAILED):
-            return
+        # Deliberately outside _state_lock -- see the lock-ordering note
+        # in advance(). Unbounded by design: there is no safe bound, and
+        # stop_server() is the escape hatch for a transition that would
+        # otherwise block for its full role timeout.
+        self._advance_done.wait()
 
-        lease = self._lease
-        if lease is None:
+        with self._state_lock:
+            if self._state in (SessionState.CLOSED, SessionState.FAILED):
+                return
+
+            lease = self._lease
+            if lease is None:
+                self._state = SessionState.CLOSED
+                return
+
+            state_before_close = self._state
+            self._state = SessionState.CLOSING
+
+            # Skip stop() entirely when a previous close() already confirmed
+            # it and only the lock release remains outstanding: the bounded
+            # retry budget belongs to cleanup, not to lock release.
+            if (
+                state_before_close is not SessionState.RELEASE_PENDING
+                and self._server_may_exist
+                and self._server is not None
+            ):
+                outcome = self._confirm_cleanup()
+                if not outcome.confirmed:
+                    # Cleanup unresolved: the lease stays unreleasable, so the
+                    # lock deliberately remains on disk for --recover-stale-lock.
+                    self._state = SessionState.CLEANUP_UNRESOLVED
+
+                    # Annotate whatever exception is already in flight, then
+                    # report. Annotation targets are tracked by identity, so a
+                    # repeated close() never double-annotates -- but suppression
+                    # applies to the *note* only. Every call still reports the
+                    # unresolved outcome, because a caller that gets a silent
+                    # return cannot tell a successful retry from a failed one.
+                    startup_exc = self._startup_exception
+                    if startup_exc is not None:
+                        # An operator's interrupt must stay an interrupt: annotate
+                        # the exact object rather than wrapping it in RuntimeError_.
+                        self._annotate_once(
+                            startup_exc,
+                            _unresolved_cleanup_message("startup was interrupted; the", outcome),
+                        )
+                        if primary is startup_exc:
+                            # __exit__ is unwinding that exact interrupt; it
+                            # carries the note and needs nothing raised here.
+                            return
+                        _raise_unresolved_cleanup("startup was interrupted; the", outcome)
+
+                    if primary is not None:
+                        self._annotate_once(
+                            primary,
+                            _unresolved_cleanup_message("the run failed and the", outcome),
+                        )
+                        if primary is _current_exception():
+                            # __exit__ is unwinding this primary; it carries the
+                            # note. Raising instead would be swallowed anyway.
+                            return
+                        # An explicit close(primary=...) outside the unwind: the
+                        # caller learns the outcome only from what we raise.
+                        _raise_unresolved_cleanup("the run failed and the", outcome)
+
+                    _raise_unresolved_cleanup("run completed but", outcome)
+                lease.mark_releasable()
+
+            if lease.releasable:
+                try:
+                    lease.release()
+                except LockError as release_exc:
+                    # Cleanup is confirmed but the lock is still on disk.
+                    # SupervisorLock.release() keeps its ownership token on a
+                    # transient failure precisely so this can be retried, so
+                    # this state must stay non-terminal.
+                    self._state = SessionState.RELEASE_PENDING
+                    if primary is not None:
+                        self._annotate_once(
+                            primary,
+                            "additionally, the repository lock could not be released: "
+                            + _safe_exception_text(release_exc),
+                        )
+                        return
+                    # Preserve the parent's exception type on this path: an
+                    # otherwise-successful operation whose release fails raised
+                    # LockError before RunSession existed.
+                    raise
+
             self._state = SessionState.CLOSED
-            return
-
-        state_before_close = self._state
-        self._state = SessionState.CLOSING
-
-        # Skip stop() entirely when a previous close() already confirmed it
-        # and only the lock release remains outstanding: the bounded retry
-        # budget belongs to cleanup, not to lock release.
-        if (
-            state_before_close is not SessionState.RELEASE_PENDING
-            and self._server_may_exist
-            and self._server is not None
-        ):
-            outcome = self._confirm_cleanup()
-            if not outcome.confirmed:
-                # Cleanup unresolved: the lease stays unreleasable, so the
-                # lock deliberately remains on disk for --recover-stale-lock.
-                self._state = SessionState.CLEANUP_UNRESOLVED
-
-                # Annotate whatever exception is already in flight, then
-                # report. Annotation targets are tracked by identity, so a
-                # repeated close() never double-annotates -- but suppression
-                # applies to the *note* only. Every call still reports the
-                # unresolved outcome, because a caller that gets a silent
-                # return cannot tell a successful retry from a failed one.
-                startup_exc = self._startup_exception
-                if startup_exc is not None:
-                    # An operator's interrupt must stay an interrupt: annotate
-                    # the exact object rather than wrapping it in RuntimeError_.
-                    self._annotate_once(
-                        startup_exc,
-                        _unresolved_cleanup_message("startup was interrupted; the", outcome),
-                    )
-                    if primary is startup_exc:
-                        # __exit__ is unwinding that exact interrupt; it
-                        # carries the note and needs nothing raised here.
-                        return
-                    _raise_unresolved_cleanup("startup was interrupted; the", outcome)
-
-                if primary is not None:
-                    self._annotate_once(
-                        primary,
-                        _unresolved_cleanup_message("the run failed and the", outcome),
-                    )
-                    if primary is _current_exception():
-                        # __exit__ is unwinding this primary; it carries the
-                        # note. Raising instead would be swallowed anyway.
-                        return
-                    # An explicit close(primary=...) outside the unwind: the
-                    # caller learns the outcome only from what we raise.
-                    _raise_unresolved_cleanup("the run failed and the", outcome)
-
-                _raise_unresolved_cleanup("run completed but", outcome)
-            lease.mark_releasable()
-
-        if lease.releasable:
-            try:
-                lease.release()
-            except LockError as release_exc:
-                # Cleanup is confirmed but the lock is still on disk.
-                # SupervisorLock.release() keeps its ownership token on a
-                # transient failure precisely so this can be retried, so
-                # this state must stay non-terminal.
-                self._state = SessionState.RELEASE_PENDING
-                if primary is not None:
-                    self._annotate_once(
-                        primary,
-                        "additionally, the repository lock could not be released: "
-                        + _safe_exception_text(release_exc),
-                    )
-                    return
-                # Preserve the parent's exception type on this path: an
-                # otherwise-successful operation whose release fails raised
-                # LockError before RunSession existed.
-                raise
-
-        self._state = SessionState.CLOSED
 
     def _annotate_once(self, exc: BaseException, message: str) -> None:
         """Attach `message` to `exc` unless this session already annotated
@@ -992,19 +1111,31 @@ class RunSession:
         _add_note(exc, message)
 
     def _confirm_cleanup(self) -> _CleanupOutcome:
-        """Confirm ``server.stop()``, consuming any outcome already computed
-        during this failure sequence.
+        """Confirm ``server.stop()``, consuming a *confirmed* outcome already
+        computed during this failure sequence.
 
         ``start_server()`` must know whether cleanup succeeded in order to
         word its startup diagnostic correctly, and ``close()`` then runs
         immediately afterwards via ``__exit__``. Without this handoff each
         would spend the full ``_CLEANUP_ATTEMPTS`` budget, doubling the
         documented bound.
+
+        A confirmed pending outcome is always consumed as-is. An
+        *unconfirmed* one is only retried when it was marked retryable
+        (see ``_pending_cleanup_retryable``): ``stop_server()``'s handoff
+        is, because a blocked transition usually unwinds between the two
+        calls and the later attempt is the one likely to succeed;
+        ``start_server()``'s is not, because the consuming ``close()``
+        runs immediately afterwards and retrying there would merely spend
+        the documented ``_CLEANUP_ATTEMPTS`` budget twice for a single
+        failure sequence.
         """
         assert self._server is not None
         pending = self._pending_cleanup
-        if pending is not None:
-            self._pending_cleanup = None
+        retryable = self._pending_cleanup_retryable
+        self._pending_cleanup = None
+        self._pending_cleanup_retryable = False
+        if pending is not None and (pending.confirmed or not retryable):
             return pending
         return _confirm_server_stopped(self._server)
 
