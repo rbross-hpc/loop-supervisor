@@ -901,7 +901,12 @@ class RunSession:
         cleared for the duration so a concurrent ``close()`` waits for
         this transition to finish before releasing the lock, and is set
         again in a ``finally`` so a raising ``advance()`` can never strand
-        that waiter.
+        that waiter. On the way back in, both the ``SessionState``
+        restore and the ``run_state`` write-back are guarded against a
+        concurrent ``close()`` having already claimed the session while
+        this call was in flight: the outcome is still returned to the
+        caller (real work was done), but neither is written into a
+        session that no longer owns it.
         """
         with self._state_lock:
             if self._state is not SessionState.STARTED:
@@ -932,7 +937,7 @@ class RunSession:
             raise
 
         with self._state_lock:
-            self._run_state = outcome.state
+            self._store_run_state_unless_closed(outcome.state)
             self._restore_started_unless_closed()
         return outcome
 
@@ -1021,13 +1026,19 @@ class RunSession:
         """Write ``run_state`` back to the session only if it is still the
         session's current activity.
 
-        Caller must hold ``_state_lock``. Extracted as its own method (as
-        ``_restore_started_unless_closed`` is for ``advance()``'s
-        analogous guard) precisely so it is directly callable and
-        therefore directly testable -- a test that instead re-implements
-        the ``if self._state_is(...)`` check inline can pass even when
-        the guard inside ``run_to_completion()`` itself is missing or
-        wrong, since it never calls the method it means to be verifying.
+        Caller must hold ``_state_lock``. Shared by both ``advance()`` and
+        ``run_to_completion()``, whose supervisor calls each run outside
+        ``_state_lock`` and can therefore return after a concurrent
+        ``close()`` has already claimed the session. Extracted as its own
+        method (as ``_restore_started_unless_closed`` is for the
+        analogous ``SessionState`` guard) precisely so it is directly
+        callable and therefore directly testable -- a test that instead
+        re-implements the ``if self._state_is(...)`` check inline can
+        pass even when the guard inside the caller is missing or wrong,
+        since it never calls the method it means to be verifying. (An
+        earlier version of ``advance()`` wrote ``self._run_state``
+        directly instead of through this method, which meant it lacked
+        this guard even after ``run_to_completion()`` gained it.)
         """
         if self._state_is(SessionState.STARTED):
             self._run_state = run_state

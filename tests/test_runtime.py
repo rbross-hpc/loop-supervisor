@@ -4763,6 +4763,148 @@ def test_advance_does_not_resurrect_a_closed_session(tmp_path):
             assert session.state is rt.SessionState.CLOSED
 
 
+def test_advance_does_not_write_run_state_after_close(tmp_path):
+    """A3.2: the run_state analogue of
+    test_advance_does_not_resurrect_a_closed_session.
+
+    advance()'s SessionState restore was guarded from the start (A3), but
+    its run_state write-back at the same call site was not -- it wrote
+    self._run_state = outcome.state unconditionally, even though
+    run_to_completion() gained the equivalent guard
+    (_store_run_state_unless_closed) in A3.1. Reproduced against the
+    unguarded code: a session already driven CLOSED still had a stale
+    advance() write land in its run_state after the fact. Calls the
+    actual method under test, the same way the SessionState test above
+    calls _restore_started_unless_closed() directly, rather than
+    re-implementing the guard's condition inline."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            run_state_before = session.run_state
+            session.close()
+            assert session.state is rt.SessionState.CLOSED
+
+            sentinel = MagicMock()
+            sentinel.run_id = "should-not-be-written"
+            with session._state_lock:
+                session._store_run_state_unless_closed(sentinel)
+            assert session.run_state is run_state_before
+            assert session.state is rt.SessionState.CLOSED
+
+
+def test_concurrent_close_during_advance_does_not_leak_run_state(tmp_path):
+    """A3.2's end-to-end companion to test_advance_does_not_write_run_
+    state_after_close: the real race, not just the guard in isolation.
+
+    Reproduced against the pre-fix code: with the SessionState restore
+    guarded (A3) but the run_state write unguarded, a close() that
+    completes while advance() is still blocked would still see its
+    result land in session.run_state once advance() finally returned --
+    even though the session was already CLOSED and the lock already
+    released. advance()'s outcome() returns a distinct sentinel state
+    object (unlike _blocking_advance_supervisor_cls's shared-state
+    helper) specifically so a leaked write is unambiguous: run_state
+    identity must be exactly what it was before advance() ever ran.
+    """
+    import threading
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    entered_advance_event = threading.Event()
+    release_event = threading.Event()
+
+    class LeakCheckSupervisor:
+        def __init__(self, *a, **kw):
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "original"
+            state.phase = "planning"
+            state.options = _make_options()
+            return state
+
+        def advance(self, state):
+            from loop_supervisor.supervisor import AdvanceOutcome, AdvanceStatus
+
+            entered_advance_event.set()
+            release_event.wait(timeout=5)
+            sentinel = MagicMock()
+            sentinel.run_id = "leaked-after-close"
+            sentinel.phase = "building"
+            return AdvanceOutcome(
+                status=AdvanceStatus.ADVANCED,
+                state=sentinel,
+                phase_before="planning",
+                phase_after="building",
+            )
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, value):
+            self._runner = value
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo, supervisor_cls=LeakCheckSupervisor):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            run_state_before = session.run_state
+
+            advance_thread = threading.Thread(target=session.advance)
+            advance_thread.start()
+
+            close_returned = threading.Event()
+
+            def _run_close() -> None:
+                session.close()
+                close_returned.set()
+
+            close_thread = threading.Thread(target=_run_close)
+            try:
+                assert entered_advance_event.wait(timeout=5), "advance() never entered"
+
+                close_thread.start()
+
+                # close() must block behind the quiescence barrier (A3):
+                # it must NOT return while advance() is still in flight.
+                # This is what makes the window below real rather than
+                # incidental -- without it, close() could complete before
+                # advance() ever finishes, and the assertion after
+                # release_event.set() would pass for the wrong reason (as
+                # a synchronous, non-threaded session.close() call did in
+                # an earlier version of this test, which passed even
+                # against the unguarded code because it never actually
+                # observed the in-flight window).
+                assert not close_returned.wait(timeout=1.0), (
+                    "close() returned while advance() was still in flight"
+                )
+                assert _lock_path(repo.common_dir()).exists()
+            finally:
+                release_event.set()
+                advance_thread.join(timeout=5)
+                close_thread.join(timeout=5)
+
+            assert not advance_thread.is_alive()
+            assert not close_thread.is_alive()
+            assert session.state is rt.SessionState.CLOSED
+            assert not _lock_path(repo.common_dir()).exists()
+            # The assertion that actually distinguishes fixed from
+            # unfixed: after advance() has returned (post-release, post-
+            # close), run_state must still be exactly what it was before
+            # advance() ever ran -- not the sentinel advance() tried to
+            # write back into a session that no longer owned it.
+            assert session.run_state is run_state_before
+
+
 def test_raising_advance_still_releases_the_quiescence_barrier(tmp_path):
     """A failing advance() must set _advance_done in its finally, or a
     close() waiting on the barrier would block forever. Without the
