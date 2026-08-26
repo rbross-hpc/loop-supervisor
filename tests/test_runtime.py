@@ -4246,10 +4246,233 @@ def test_repeated_close_does_not_double_annotate_primary(tmp_path, monkeypatch):
         assert len(first_notes) == 1, first_notes
 
         # An explicit retry reports by raising, and must not re-annotate.
+        # (the_error is not currently unwinding here -- pytest.raises()
+        # above already caught and released it -- so this exercises the
+        # detached-caller shape, not the __exit__-driven one.)
         with pytest.raises(RuntimeError_):
-            session.close(primary=the_error)
+            session.close(outcome=rt._RunOutcome.FAILED, error=the_error)
 
     assert list(getattr(the_error, "__notes__", [])) == first_notes
+
+
+# --- close()'s outcome/error split (A4) --------------------------------
+#
+# `close()` used to take a single `primary: BaseException | None`
+# parameter that conflated three separate facts: whether the run
+# succeeded, which exception (if any) to annotate, and whether that
+# exception is the one actively unwinding through this call. The tests
+# below pin the two defects that conflation caused (D1, D2), the
+# already-correct behaviour it must continue to preserve, the pure
+# wording function in isolation, and the previously-untested corner
+# where the two ways of asking "is it unwinding" could disagree.
+
+
+def test_close_detached_caller_with_release_failure_raises(tmp_path):
+    """D2: a caller that already caught `error` (it is not the exception
+    currently unwinding) and retries close() explicitly must see the
+    release failure raised, not silently swallowed.
+
+    Before this fix, the release-failure branch returned silently
+    whenever `error` was merely given, regardless of whether it was
+    still unwinding -- so a caller in exactly this shape (the pattern
+    app.py's except-handler cleanup uses) could not tell a failed retry
+    from a successful one."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import LockError, _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    the_error = ValueError("body blew up")
+    original_release = rt._LockLease.release
+
+    def _always_fail_release(self):
+        raise LockError("release still failing")
+
+    with _patched_session_env(repo):
+        rt._LockLease.release = _always_fail_release
+        try:
+            session = rt.new_run_session(repo.root, _make_options())
+            session.__enter__()
+            session.start_server()
+
+            # `the_error` is caught and released here -- by the time
+            # close() is called below, it is no longer unwinding.
+            try:
+                raise the_error
+            except ValueError:
+                pass
+
+            with pytest.raises(LockError):
+                session.close(outcome=rt._RunOutcome.FAILED, error=the_error)
+        finally:
+            rt._LockLease.release = original_release
+
+    assert session.state is rt.SessionState.RELEASE_PENDING
+    assert _lock_path(repo.common_dir()).exists()
+    notes = getattr(the_error, "__notes__", [])
+    assert any("lock could not be released" in n.lower() for n in notes), notes
+
+
+def test_close_outcome_failed_with_no_error_uses_run_failed_wording(tmp_path, monkeypatch):
+    """D1: outcome=FAILED with error=None (a caller that knows the run
+    failed but has nothing further to annotate) must still get the
+    "the run failed and the ..." wording, not "run completed but ...".
+
+    Before this fix, wording was selected from whether `error` was given
+    rather than from an explicit outcome, so this exact shape -- failure
+    without an exception in hand -- was inexpressible and silently
+    reported as success."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+
+    with _patched_session_env(repo, server_cls=_retry_server()):
+        session = rt.new_run_session(repo.root, _make_options())
+        session.__enter__()
+        session.start_server()
+
+        with pytest.raises(RuntimeError_, match="the run failed and the"):
+            session.close(outcome=rt._RunOutcome.FAILED, error=None)
+
+    assert session.state is rt.SessionState.CLEANUP_UNRESOLVED
+
+
+def test_close_exit_success_path_wording_unchanged(tmp_path, monkeypatch):
+    """Regression guard for the split: __exit__ with no body exception
+    must still produce "run completed but ..." with zero notes -- the
+    default outcome/error values must reproduce the old no-argument
+    close() call exactly."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.runtime import RuntimeError_
+    from loop_supervisor.supervisor import Supervisor
+
+    _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    counter = [0]
+    original_oc_server = rt.OpenCodeServer
+    original_run = Supervisor.run
+
+    def _ok_run(self, state, *, max_steps=None):
+        state.phase = "done"
+        return state
+
+    rt.OpenCodeServer = _characterization_server(counter)
+    Supervisor.run = _ok_run
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected RuntimeError_ to be raised")
+        except RuntimeError_ as exc:
+            assert str(exc).startswith(
+                "run completed but OpenCode server cleanup could not be confirmed"
+            ), str(exc)
+            assert getattr(exc, "__notes__", []) == []
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+
+def test_close_exit_failure_path_wording_unchanged(tmp_path, monkeypatch):
+    """Regression guard for the split: __exit__ with a body exception
+    must still produce exactly one "the run failed and the ..." note on
+    that exact exception -- the outcome=FAILED, error=exc_val mapping in
+    __exit__ must reproduce the old close(primary=exc_val) call exactly."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.supervisor import LoopError, Supervisor
+
+    _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    counter = [0]
+    original_oc_server = rt.OpenCodeServer
+    original_run = Supervisor.run
+    the_failure = LoopError("simulated supervisor failure")
+
+    def _boom_run(self, state, *, max_steps=None):
+        raise the_failure
+
+    rt.OpenCodeServer = _characterization_server(counter)
+    Supervisor.run = _boom_run
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected LoopError to be raised")
+        except LoopError as exc:
+            assert exc is the_failure
+    finally:
+        rt.OpenCodeServer = original_oc_server
+        Supervisor.run = original_run
+
+    notes = getattr(the_failure, "__notes__", [])
+    assert len(notes) == 1, notes
+    assert notes[0].startswith("the run failed and the OpenCode server cleanup could not be"), (
+        notes[0]
+    )
+
+
+def test_cleanup_prefix_truth_table():
+    """`_cleanup_prefix` is a pure function of (outcome, startup
+    interrupted); exercise all four combinations directly, without
+    constructing a session. startup_interrupted must take precedence
+    over outcome regardless of outcome's value."""
+    import loop_supervisor.runtime as rt
+
+    assert (
+        rt._cleanup_prefix(rt._RunOutcome.SUCCEEDED, startup_interrupted=False)
+        == "run completed but"
+    )
+    assert (
+        rt._cleanup_prefix(rt._RunOutcome.FAILED, startup_interrupted=False)
+        == "the run failed and the"
+    )
+    assert (
+        rt._cleanup_prefix(rt._RunOutcome.SUCCEEDED, startup_interrupted=True)
+        == "startup was interrupted; the"
+    )
+    assert (
+        rt._cleanup_prefix(rt._RunOutcome.FAILED, startup_interrupted=True)
+        == "startup was interrupted; the"
+    )
+
+
+def test_close_detached_caller_with_startup_interrupt_pending_raises(tmp_path):
+    """The startup-interrupt branch has the same unwinding-vs-given
+    distinction as the release-failure branch (D2), just checked against
+    `self._startup_exception` rather than `error`. Once the interrupt has
+    already been caught elsewhere (it is no longer the exception
+    currently unwinding) and the caller retries close() explicitly, the
+    unresolved-cleanup failure must be raised, not silently swallowed --
+    this is the corner no prior test exercised, where the old
+    parameter-identity check (`primary is startup_exc`) and the
+    currently-unwinding check could disagree: the interrupt object is
+    still the same object, but it is no longer unwinding."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    the_interrupt = KeyboardInterrupt()
+    server_cls = _retry_server(start_exc=the_interrupt, stop_fails=True)
+    with _patched_session_env(repo, server_cls=server_cls):
+        session = rt.new_run_session(repo.root, _make_options())
+        session.__enter__()
+
+        # Caught here, not re-raised into an unwinding `with` body: by
+        # the time close() is called below, the interrupt is no longer
+        # the exception currently unwinding.
+        try:
+            session.start_server()
+            raise AssertionError("expected KeyboardInterrupt to be raised")
+        except KeyboardInterrupt as exc:
+            assert exc is the_interrupt
+
+        assert session._startup_exception is the_interrupt
+
+        with pytest.raises(RuntimeError_, match="startup was interrupted; the"):
+            session.close()
+
+    assert session.state is rt.SessionState.CLEANUP_UNRESOLVED
+    notes = getattr(the_interrupt, "__notes__", [])
+    assert len(notes) == 1, notes
 
 
 # --- characterization for TUI-sync work (Phase A) ----------------------

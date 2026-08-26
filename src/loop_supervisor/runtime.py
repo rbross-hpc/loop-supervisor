@@ -229,11 +229,19 @@ def _current_exception() -> BaseException | None:
     """Return the exception currently being handled, if any.
 
     Used by ``RunSession.close()`` to tell an ``__exit__``-driven call
-    (where the primary is actively unwinding and will carry a note on its
-    own) from an explicit ``close(primary=...)`` made outside that unwind
+    (where ``error`` is actively unwinding and will carry a note on its
+    own) from an explicit ``close(error=...)`` made outside that unwind
     (where the caller learns the outcome only from what ``close()``
     raises). Getting that distinction wrong is how a failed retry ends up
     looking like a successful one.
+
+    Must be read exactly once, at the top of ``close()``, before any
+    nested ``try``/``except`` runs: cleanup helpers (``_confirm_cleanup()``
+    and friends) raise and catch their own exceptions internally, and
+    ``sys.exc_info()`` tracks whichever exception handler is innermost at
+    the moment it is called -- so a second call made from inside one of
+    those nested handlers would report *that* exception instead of the
+    one ``close()`` was actually asked to report against.
     """
     return sys.exc_info()[1]
 
@@ -247,6 +255,26 @@ def _add_note(exc: BaseException, message: str) -> None:
         exc.add_note(message)
     except BaseException:  # noqa: BLE001 - annotating must never replace the primary
         pass
+
+
+def _cleanup_prefix(outcome: _RunOutcome, *, startup_interrupted: bool) -> str:
+    """Choose the retained-lock diagnostic's opening clause.
+
+    A pure function of the two facts that determine it: whether the
+    run/resume succeeded, and (a special case of failure) whether the
+    interruption happened during startup specifically. Kept separate
+    from ``RunSession.close()`` so the mapping can be exercised directly,
+    without constructing a session or triggering an unresolved cleanup.
+
+    ``startup_interrupted`` takes precedence over ``outcome`` because a
+    startup interrupt is itself a kind of failure -- the caller need not
+    (and in practice does not) also pass ``_RunOutcome.FAILED`` for it.
+    """
+    if startup_interrupted:
+        return "startup was interrupted; the"
+    if outcome is _RunOutcome.FAILED:
+        return "the run failed and the"
+    return "run completed but"
 
 
 def _unresolved_cleanup_message(prefix: str, outcome: _CleanupOutcome) -> str:
@@ -470,6 +498,24 @@ class _RunKind(Enum):
 
     NEW = "run"
     RESUME = "resume"
+
+
+class _RunOutcome(Enum):
+    """Did the run/resume this ``close()`` call is concluding succeed or
+    fail? Passed explicitly by the caller rather than inferred from
+    whether an exception object happens to be attached.
+
+    This is deliberately a separate question from "is there an exception
+    to annotate" (see ``close()``'s ``error`` parameter). A caller that
+    caught and already reported an exception before calling ``close()``
+    still knows the run failed, even though it holds nothing further to
+    annotate -- collapsing the two questions into one nullable exception
+    parameter made that case inexpressible and silently produced the
+    wrong retained-lock wording (a "run completed but ..." diagnostic on
+    a run that had, in fact, failed)."""
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
 
 
 class RunSession:
@@ -814,7 +860,7 @@ class RunSession:
             self.close()
             return False
         try:
-            self.close(primary=exc_val)
+            self.close(outcome=_RunOutcome.FAILED, error=exc_val)
         except BaseException as close_exc:  # noqa: BLE001 - must never replace exc_val
             if close_exc is not exc_val:
                 _add_note(exc_val, _safe_exception_text(close_exc))
@@ -1043,7 +1089,12 @@ class RunSession:
         if self._state_is(SessionState.STARTED):
             self._run_state = run_state
 
-    def close(self, *, primary: BaseException | None = None) -> None:
+    def close(
+        self,
+        *,
+        outcome: _RunOutcome = _RunOutcome.SUCCEEDED,
+        error: BaseException | None = None,
+    ) -> None:
         """Confirm OpenCode cleanup, then release the lock.
 
         The single owner of both operations. Behaviour:
@@ -1062,14 +1113,29 @@ class RunSession:
           budget.
 
         Every call that ends with the lock still held reports it, either
-        by raising or (when a primary is unwinding) by annotating that
-        primary. A retry is never silently successful.
+        by raising or (when ``error`` is actively unwinding) by
+        annotating it. A retry is never silently successful.
 
-        ``primary`` is the exception already propagating out of the
-        ``with`` body, if any. It selects the retained-lock wording ("the
-        run failed and the ..." versus "run completed but ...") and
-        receives the diagnostic as a note, since a cleanup failure must
-        never replace a real run failure.
+        Two independent pieces of information, deliberately not folded
+        into one nullable parameter (an earlier design did, and that is
+        what let a failed run with no exception in hand silently report
+        as "run completed"):
+
+        ``outcome``
+            Did the run/resume this call is concluding succeed or fail?
+            Selects the retained-lock wording ("the run failed and the
+            ..." versus "run completed but ..."). The caller declares
+            this; it is not inferred from whether ``error`` is given,
+            because a caller may know the run failed after already
+            having caught and disposed of the exception that says so.
+        ``error``
+            The exception to annotate, if the caller is holding one
+            (regardless of ``outcome`` — an interrupt during an
+            otherwise-successful cleanup retry is still worth attaching
+            a note to). A cleanup failure must never replace a real run
+            failure, so this is always annotated rather than raised
+            when it is the exception actively unwinding through this
+            call.
 
         Thread-safety: if an ``advance()`` is in flight on another thread,
         this blocks (unboundedly) until it finishes before touching the
@@ -1083,6 +1149,36 @@ class RunSession:
         # stop_server() is the escape hatch for a transition that would
         # otherwise block for its full role timeout.
         self._advance_done.wait()
+
+        # Read exactly once, before any nested try/except runs (see
+        # _current_exception()'s docstring for why a second read would be
+        # unsafe).
+        currently_unwinding = _current_exception()
+
+        def _annotate_and_check_unwinding(target: BaseException | None, message: str) -> bool:
+            """Annotate `target` if given, then report whether the
+            caller may return silently (True) or must raise (False) --
+            the one piece of control flow shared by every retained-lock/
+            retained-lease branch in `close()`. True only when `target`
+            is the exception actively unwinding through this exact call;
+            never merely because `target` was given.
+
+            Kept as a boolean rather than performing the raise itself so
+            that each call site's own `raise`/`_raise_...()` still
+            executes directly in `close()`'s frame, matching the no-
+            extra-frames guarantee callers rely on.
+
+            Centralising the *decision* is what fixes the recurring
+            defect: two of the three call sites previously returned
+            silently whenever an exception was merely *given*, rather
+            than checking it was actively *unwinding* -- so a caller
+            retrying `close()` on an exception it had already caught
+            elsewhere (and was no longer unwinding) got a silent return
+            instead of the raise it needed to detect a failed retry.
+            """
+            if target is not None:
+                self._annotate_once(target, message)
+            return target is not None and target is currently_unwinding
 
         with self._state_lock:
             if self._state in (SessionState.CLOSED, SessionState.FAILED):
@@ -1104,46 +1200,29 @@ class RunSession:
                 and self._server_may_exist
                 and self._server is not None
             ):
-                outcome = self._confirm_cleanup()
-                if not outcome.confirmed:
+                outcome_obj = self._confirm_cleanup()
+                if not outcome_obj.confirmed:
                     # Cleanup unresolved: the lease stays unreleasable, so the
                     # lock deliberately remains on disk for --recover-stale-lock.
                     self._state = SessionState.CLEANUP_UNRESOLVED
 
-                    # Annotate whatever exception is already in flight, then
-                    # report. Annotation targets are tracked by identity, so a
-                    # repeated close() never double-annotates -- but suppression
-                    # applies to the *note* only. Every call still reports the
-                    # unresolved outcome, because a caller that gets a silent
-                    # return cannot tell a successful retry from a failed one.
+                    # An operator's interrupt takes the startup-specific
+                    # wording and is annotated over `error`: the interrupt
+                    # itself is the more relevant object to attach a note
+                    # to, and it is what __exit__ will actually be
+                    # unwinding in the production shape.
                     startup_exc = self._startup_exception
-                    if startup_exc is not None:
-                        # An operator's interrupt must stay an interrupt: annotate
-                        # the exact object rather than wrapping it in RuntimeError_.
-                        self._annotate_once(
-                            startup_exc,
-                            _unresolved_cleanup_message("startup was interrupted; the", outcome),
-                        )
-                        if primary is startup_exc:
-                            # __exit__ is unwinding that exact interrupt; it
-                            # carries the note and needs nothing raised here.
-                            return
-                        _raise_unresolved_cleanup("startup was interrupted; the", outcome)
-
-                    if primary is not None:
-                        self._annotate_once(
-                            primary,
-                            _unresolved_cleanup_message("the run failed and the", outcome),
-                        )
-                        if primary is _current_exception():
-                            # __exit__ is unwinding this primary; it carries the
-                            # note. Raising instead would be swallowed anyway.
-                            return
-                        # An explicit close(primary=...) outside the unwind: the
-                        # caller learns the outcome only from what we raise.
-                        _raise_unresolved_cleanup("the run failed and the", outcome)
-
-                    _raise_unresolved_cleanup("run completed but", outcome)
+                    is_startup_interrupt = startup_exc is not None
+                    annotate_target = startup_exc if is_startup_interrupt else error
+                    prefix = _cleanup_prefix(outcome, startup_interrupted=is_startup_interrupt)
+                    message = _unresolved_cleanup_message(prefix, outcome_obj)
+                    if _annotate_and_check_unwinding(annotate_target, message):
+                        # The exception carrying the note is actively
+                        # unwinding through this call; it will surface on
+                        # its own, and raising instead would only be
+                        # swallowed by __exit__ anyway.
+                        return
+                    _raise_unresolved_cleanup(prefix, outcome_obj)
                 lease.mark_releasable()
 
             if lease.releasable:
@@ -1155,12 +1234,11 @@ class RunSession:
                     # transient failure precisely so this can be retried, so
                     # this state must stay non-terminal.
                     self._state = SessionState.RELEASE_PENDING
-                    if primary is not None:
-                        self._annotate_once(
-                            primary,
-                            "additionally, the repository lock could not be released: "
-                            + _safe_exception_text(release_exc),
-                        )
+                    if _annotate_and_check_unwinding(
+                        error,
+                        "additionally, the repository lock could not be released: "
+                        + _safe_exception_text(release_exc),
+                    ):
                         return
                     # Preserve the parent's exception type on this path: an
                     # otherwise-successful operation whose release fails raised
