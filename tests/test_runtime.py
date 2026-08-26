@@ -4634,22 +4634,28 @@ def test_characterize_single_threaded_advance_does_not_race_close(tmp_path):
     assert not _lock_path(repo.common_dir()).exists()
 
 
-def test_characterize_concurrent_close_during_advance_leaves_state_started(tmp_path):
-    """Reproduces the race close() vs. advance() must fix: with no
-    synchronisation, a close() that runs to completion while advance() is
-    still in flight releases the lock (and reaches CLOSED) *before*
-    advance() returns and unconditionally restores SessionState.STARTED
-    -- silently reverting a session that has already released its lock
-    back to what looks like a live, advanceable STARTED state.
+def test_concurrent_close_during_advance_waits_and_does_not_clobber_state(tmp_path):
+    """The fixed ordering for the two races A0 reproduced.
 
-    This test pins that this is exactly what happens today (no
-    synchronisation): it must continue to pass, unchanged, right up until
-    the commit that adds locking, at which point it is expected to start
-    failing and must be replaced by a test asserting the fixed ordering
-    (close() waits for advance() to finish before releasing). It exists
-    so that fix has a concrete, reproduced-before-fixed regression to
-    verify against, per this repo's defect-injection-before-acceptance
-    convention.
+    Replaces test_characterize_concurrent_close_during_advance_leaves_
+    state_started, which deliberately pinned the pre-fix behavior and
+    whose docstring named both assertions expected to flip here:
+
+      Race 1 -- advance() unconditionally restored STARTED on return,
+      clobbering a terminal state a concurrent close() had already
+      written, resurrecting a lock-released session into something that
+      looked live and advanceable. Now advance() only returns to STARTED
+      if it is still the session's current activity.
+
+      Race 2 -- close() released the lock while advance() was still in
+      flight and could still be mutating Git/state. Now close() waits on
+      the quiescence barrier first, so the release is strictly ordered
+      after advance() returns.
+
+    Both are asserted against a deterministic, Event-gated advance() so
+    the ordering is real rather than timing-dependent: the lock is
+    checked to still exist *while* advance() is provably blocked, and
+    only then is advance() released.
     """
     import threading
 
@@ -4666,15 +4672,6 @@ def test_characterize_concurrent_close_during_advance_leaves_state_started(tmp_p
         with session:
             session.start_server()
 
-            # A bare Thread swallows an exception raised by its target
-            # into threading.excepthook (printed, not failing the test),
-            # so advance()'s outcome and any exception are both captured
-            # explicitly. Without advance_error, a raising advance() would
-            # still leave the session STARTED (runtime.py's advance() sets
-            # STARTED in both its success path and its except clause), so
-            # the final assertion below would pass while actually pinning
-            # the *failure* path instead of the success path this test is
-            # named for.
             advance_result: list[object] = []
             advance_error: list[BaseException] = []
 
@@ -4684,43 +4681,312 @@ def test_characterize_concurrent_close_during_advance_leaves_state_started(tmp_p
                 except BaseException as exc:  # noqa: BLE001 - captured for the assert below
                     advance_error.append(exc)
 
+            close_returned = threading.Event()
+            close_error: list[BaseException] = []
+
+            def _run_close() -> None:
+                try:
+                    session.close()
+                except BaseException as exc:  # noqa: BLE001 - captured for the assert below
+                    close_error.append(exc)
+                finally:
+                    close_returned.set()
+
             advance_thread = threading.Thread(target=_run_advance)
+            advance_thread.start()
+            close_thread = threading.Thread(target=_run_close)
+            try:
+                assert entered_advance_event.wait(timeout=5), "advance() never entered"
+
+                # advance() is now blocked inside the supervisor call.
+                # Start a close() that must NOT complete while it is.
+                close_thread.start()
+
+                # Race 2: close() must still be waiting, and crucially the
+                # lock must still be on disk. A bounded negative wait is
+                # the right shape here -- if close() returns while
+                # advance() is provably still blocked, the invariant is
+                # broken no matter how long we waited.
+                assert not close_returned.wait(timeout=1.0), (
+                    "close() returned while advance() was still in flight; the lock "
+                    "may have been released with a transition still able to mutate "
+                    "Git/state"
+                )
+                assert _lock_path(repo.common_dir()).exists()
+            finally:
+                # Always unblock and join both workers, even if an
+                # assertion above failed, so a broken assumption degrades
+                # to a normal test failure rather than leaving threads
+                # running past this test's lifetime.
+                release_event.set()
+                advance_thread.join(timeout=5)
+                if close_thread.is_alive() or close_thread.ident is not None:
+                    close_thread.join(timeout=5)
+
+            assert not advance_thread.is_alive()
+            assert not close_thread.is_alive()
+            assert advance_error == [], advance_error
+            assert close_error == [], close_error
+            assert len(advance_result) == 1
+
+            # Race 1: advance() returned after close() had gone terminal,
+            # and must NOT have resurrected STARTED. Asserted inside the
+            # `with` block, before __exit__ runs a second close() that
+            # would reach CLOSED again and mask a clobber.
+            assert session.state is rt.SessionState.CLOSED
+            # And the release did happen -- once advance() finished.
+            assert not _lock_path(repo.common_dir()).exists()
+
+
+# --- thread-safety and cleanup-retry semantics (A3) ---------------------
+
+
+def test_advance_does_not_resurrect_a_closed_session(tmp_path):
+    """Focused unit form of Race 1, without the timing setup: a session
+    already driven terminal must stay terminal when an advance() that was
+    in flight finishes. Complements the concurrency test above by pinning
+    the guard itself (_restore_started_unless_closed) rather than the
+    scenario that motivated it."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            session.close()
+            assert session.state is rt.SessionState.CLOSED
+
+            # Simulate the tail of an advance() that was already in flight
+            # when close() ran: it must not write STARTED back.
+            session._restore_started_unless_closed()
+            assert session.state is rt.SessionState.CLOSED
+
+
+def test_raising_advance_still_releases_the_quiescence_barrier(tmp_path):
+    """A failing advance() must set _advance_done in its finally, or a
+    close() waiting on the barrier would block forever. Without the
+    finally this test hangs rather than fails, so close() is run with a
+    hard timeout on a worker thread."""
+    import threading
+
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+
+    class BoomAdvanceSupervisor:
+        def __init__(self, *a, **kw):
+            self._runner = None
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "fake-run"
+            state.phase = "planning"
+            state.options = _make_options()
+            return state
+
+        def advance(self, state):
+            raise RuntimeError("advance boom")
+
+        @property
+        def runner(self):
+            return self._runner
+
+        @runner.setter
+        def runner(self, value):
+            self._runner = value
+
+    with _patched_session_env(repo, supervisor_cls=BoomAdvanceSupervisor):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            with pytest.raises(RuntimeError, match="advance boom"):
+                session.advance()
+
+            barrier_released = session._advance_done.is_set()
+            if not barrier_released:
+                # Release it by hand before asserting. Otherwise the
+                # AssertionError below would unwind through __exit__ ->
+                # close() -> _advance_done.wait(), which blocks forever on
+                # the very defect being reported -- turning a clean test
+                # failure into a hung suite.
+                session._advance_done.set()
+            assert barrier_released, (
+                "a raising advance() left the quiescence barrier clear; any close() "
+                "would now block forever"
+            )
+
+            done = threading.Event()
+
+            def _close() -> None:
+                session.close()
+                done.set()
+
+            t = threading.Thread(target=_close)
+            t.start()
+            assert done.wait(timeout=5), "close() blocked after a raising advance()"
+            t.join(timeout=5)
+
+        assert session.state is rt.SessionState.CLOSED
+        assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_stop_server_during_blocked_advance_does_not_deadlock(tmp_path):
+    """The scenario stop_server() exists for, and the direct check that
+    _state_lock is not over-scoped: a shutdown thread must be able to
+    stop the server while advance() is blocked. If _state_lock were held
+    across supervisor.advance(), this would deadlock -- so the call is
+    made on a worker thread with a hard timeout, making a regression a
+    test failure rather than a hung suite."""
+    import threading
+
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    release_event = threading.Event()
+    entered_advance_event = threading.Event()
+
+    supervisor_cls = _blocking_advance_supervisor_cls(release_event, entered_advance_event)
+    with _patched_session_env(repo, supervisor_cls=supervisor_cls) as call_log:
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+
+            advance_thread = threading.Thread(target=session.advance)
             advance_thread.start()
             try:
                 assert entered_advance_event.wait(timeout=5), "advance() never entered"
 
-                # advance() is now blocked inside the supervisor call, with
-                # session.state == ADVANCING. Close while it is still there.
-                session.close()
-                assert session.state is rt.SessionState.CLOSED
-                # Race #2, pinned here: the lock is released even though
-                # advance() has not returned and may still be mutating
-                # Git/state on the blocked thread. Once close() waits for
-                # an in-flight advance() before releasing, this assertion
-                # is expected to start failing at this exact line (the
-                # release would instead happen only after
-                # advance_thread.join() below).
-                assert not _lock_path(repo.common_dir()).exists()
+                stopped = threading.Event()
+
+                def _stop() -> None:
+                    session.stop_server()
+                    stopped.set()
+
+                stop_thread = threading.Thread(target=_stop)
+                stop_thread.start()
+                assert stopped.wait(timeout=5), (
+                    "stop_server() blocked while advance() was in flight -- _state_lock "
+                    "is held across supervisor.advance(), which deadlocks the exact "
+                    "escalation stop_server() exists to perform"
+                )
+                stop_thread.join(timeout=5)
+                assert "server_stop" in call_log
             finally:
-                # Always unblock and join the worker, even if an assertion
-                # above failed, so a broken assumption degrades to a
-                # normal test failure rather than an unjoined thread left
-                # running past this test's lifetime.
                 release_event.set()
                 advance_thread.join(timeout=5)
 
             assert not advance_thread.is_alive()
-            assert advance_error == [], advance_error
-            assert len(advance_result) == 1
 
-            # Assert here, still inside the `with` block: session.state
-            # must be checked before __exit__ runs a second close(), which
-            # would mask the race by closing again from STARTED and
-            # reaching CLOSED a second time, hiding exactly the clobber
-            # this test exists to reproduce.
-            assert session.state is rt.SessionState.STARTED, (
-                "This pins the current (racy) behavior: advance() unconditionally "
-                "overwrites CLOSED with STARTED. Once close()/advance() are made "
-                "mutually exclusive, this assertion is expected to start failing "
-                "and must be replaced by one asserting state stays CLOSED."
-            )
+
+def test_unconfirmed_stop_server_is_retried_by_close(tmp_path, monkeypatch):
+    """An unconfirmed stop_server() must NOT make the following close()
+    skip its own attempt.
+
+    stop_server() is typically called precisely because a transition was
+    still blocked; the retry that matters happens after that transition
+    unwinds, when stop() is no longer racing a live HTTP transport.
+    Consuming the stale failure instead made close() call stop() zero
+    times and report the session unresolved on the strength of an attempt
+    already known to be obsolete."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    stop_calls = [0]
+    fail_until = [rt._CLEANUP_ATTEMPTS]
+
+    class RecoveringServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            stop_calls[0] += 1
+            if stop_calls[0] <= fail_until[0]:
+                raise RuntimeError("stop fail")
+
+        def add_observer(self, obs):
+            pass
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo, server_cls=RecoveringServer):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            session.stop_server()
+            assert stop_calls[0] == rt._CLEANUP_ATTEMPTS
+            # The blocking condition clears, exactly as it would once a
+            # stuck advance() unwinds.
+            fail_until[0] = 0
+            session.close()
+
+        assert stop_calls[0] == rt._CLEANUP_ATTEMPTS + 1, (
+            "close() did not retry stop() after an unconfirmed stop_server(); it "
+            "consumed the stale failed outcome instead"
+        )
+        assert session.state is rt.SessionState.CLOSED
+        assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_confirmed_stop_server_is_still_not_retried_by_close(tmp_path):
+    """The other side of the retry rule: a *confirmed* stop_server()
+    outcome is still consumed as-is, so the budget-spent-once handoff A2
+    established is not lost to the fix above."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo) as call_log:
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            session.stop_server()
+            session.close()
+
+        assert call_log.count("server_stop") == 1
+        assert session.state is rt.SessionState.CLOSED
+
+
+def test_startup_failure_handoff_is_still_not_retried(tmp_path, monkeypatch):
+    """start_server()'s handoff must remain non-retryable even though
+    stop_server()'s is retryable: the close() that consumes it runs
+    immediately afterwards via __exit__, so retrying there would spend
+    the documented _CLEANUP_ATTEMPTS budget twice for one failure
+    sequence.
+
+    This is the distinction the retryable flag encodes; an earlier
+    version of the fix keyed the decision off confirmed-ness alone and
+    doubled the startup budget to 6, which the pre-existing
+    test_characterize_startup_failure_stop_attempts_are_bounded caught."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.opencode import ServerStartupError
+    from loop_supervisor.runtime import RuntimeError_
+
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    stop_calls = [0]
+
+    class FailingStartServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            raise ServerStartupError("simulated startup failure")
+
+        def stop(self):
+            stop_calls[0] += 1
+            raise RuntimeError("stop fail")
+
+        def add_observer(self, obs):
+            pass
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo, server_cls=FailingStartServer):
+        session = rt.new_run_session(repo.root, _make_options())
+        with pytest.raises(RuntimeError_):
+            with session:
+                session.start_server()
+
+    assert stop_calls[0] == rt._CLEANUP_ATTEMPTS
