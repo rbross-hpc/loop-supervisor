@@ -4391,7 +4391,11 @@ def test_run_session_invalid_operation_fails_closed_without_writing_lock(tmp_pat
     repo = _init_repo(tmp_path / "repo")
     with _patched_session_env(repo):
         session = rt.new_run_session(repo.root, _make_options(), operation="delete-everything")
-        with pytest.raises(LockError):
+        # match= pins that this is the metadata-rejection LockError, not
+        # some other LockError (e.g. lock-already-held) that happens to
+        # reach the same FAILED state through the same code path -- see
+        # test_run_session_second_session_blocked_while_first_holds_lock.
+        with pytest.raises(LockError, match="invalid operation"):
             session.__enter__()
 
         assert session.state is rt.SessionState.FAILED
