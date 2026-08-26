@@ -182,7 +182,11 @@ def test_cmd_run_paused_message_printed_to_stdout_on_early_stop(tmp_path, monkey
     assert captured.err == ""
 
 
-def test_cmd_run_no_paused_message_when_max_steps_not_set(tmp_path, monkeypatch, capsys):
+def test_cmd_run_paused_message_printed_even_without_max_steps(tmp_path, monkeypatch, capsys):
+    """A genuine pause (e.g. awaiting_input from an unavailable input
+    provider) must be announced the same way whether or not --max-steps
+    caused the stop: the message follows the outcome, not the flag."""
+
     class FakeState:
         run_id = "run-123"
         phase = "building"
@@ -192,7 +196,41 @@ def test_cmd_run_no_paused_message_when_max_steps_not_set(tmp_path, monkeypatch,
 
     assert rc == 1
     captured = capsys.readouterr()
-    assert "paused at phase" not in captured.out
+    assert "paused at phase building" in captured.out
+
+
+@pytest.mark.parametrize("phase", ["failed", "operational_failure"])
+def test_cmd_run_no_paused_message_on_failure_phases(tmp_path, monkeypatch, capsys, phase):
+    """failed and operational_failure are not pauses: the run did not stop
+    awaiting further input or a step budget, it stopped because it failed.
+    Labeling either as "paused" would be misleading, even though the exit
+    code (1) is the same as a genuine pause."""
+
+    class FakeState:
+        run_id = "run-123"
+        phase = "unset"
+
+    FakeState.phase = phase
+
+    monkeypatch.setattr(cli_mod, "run_new", lambda *a, **k: FakeState())
+    rc = cli_mod.cmd_run(_run_args(tmp_path, max_steps=3))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "paused" not in captured.out
+
+
+def test_cmd_run_no_paused_message_on_done(tmp_path, monkeypatch, capsys):
+    class FakeState:
+        run_id = "run-123"
+        phase = "done"
+
+    monkeypatch.setattr(cli_mod, "run_new", lambda *a, **k: FakeState())
+    rc = cli_mod.cmd_run(_run_args(tmp_path, max_steps=3))
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "paused" not in captured.out
 
 
 def test_cmd_resume_passes_max_steps_through(tmp_path, monkeypatch):
@@ -286,6 +324,45 @@ def test_cmd_resume_paused_message_printed_to_stdout_on_early_stop(tmp_path, mon
     captured = capsys.readouterr()
     assert "paused at phase building" in captured.out
     assert captured.err == ""
+
+
+def test_cmd_resume_paused_message_printed_even_without_max_steps(tmp_path, monkeypatch, capsys):
+    class FakeState:
+        phase = "building"
+
+    monkeypatch.setattr(cli_mod, "run_resume", lambda *a, **k: FakeState())
+    rc = cli_mod.cmd_resume(_resume_args(tmp_path))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "paused at phase building" in captured.out
+
+
+@pytest.mark.parametrize("phase", ["failed", "operational_failure"])
+def test_cmd_resume_no_paused_message_on_failure_phases(tmp_path, monkeypatch, capsys, phase):
+    class FakeState:
+        phase = "unset"
+
+    FakeState.phase = phase
+
+    monkeypatch.setattr(cli_mod, "run_resume", lambda *a, **k: FakeState())
+    rc = cli_mod.cmd_resume(_resume_args(tmp_path, max_steps=2))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "paused" not in captured.out
+
+
+def test_cmd_resume_no_paused_message_on_done(tmp_path, monkeypatch, capsys):
+    class FakeState:
+        phase = "done"
+
+    monkeypatch.setattr(cli_mod, "run_resume", lambda *a, **k: FakeState())
+    rc = cli_mod.cmd_resume(_resume_args(tmp_path, max_steps=2))
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "paused" not in captured.out
 
 
 def test_build_parser_rejects_step_and_max_steps_together_for_run():

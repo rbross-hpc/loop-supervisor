@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from .git import GitError, GitRepo
 from .input_providers import StdinInputProvider
 from .locking import LockError
+from .phases import PHASE_OPERATIONAL_FAILURE, TERMINAL_PHASES
 from .runtime import RuntimeError_, list_run_ids, run_new, run_resume
 from .state import RunOptions
 from .supervisor import FailurePersistenceError, LoopError
@@ -69,6 +70,31 @@ def _resolve_max_steps(args: argparse.Namespace) -> int | None:
     return max_steps
 
 
+# Phases that are terminal-in-effect for reporting purposes: a run stopped
+# in one of these is not "paused" awaiting a resume, it is finished (done),
+# genuinely failed (failed), or already reported its own failure line
+# (operational_failure surfaces via the LoopError path when it carries an
+# error; when it doesn't, the phase alone is not something to resume from
+# in the ordinary sense, but it is also not a pause -- it is an unretryable
+# stop). Neither category should be announced as "paused".
+_NON_PAUSE_PHASES = TERMINAL_PHASES | {PHASE_OPERATIONAL_FAILURE}
+
+
+def _paused_phase_message(phase: str) -> str | None:
+    """Return the "paused at phase X" line for a non-terminal, non-failure
+    stop, or None if the run finished, failed, or hit an unretryable
+    operational failure.
+
+    This does not depend on whether --max-steps/--step was supplied: a run
+    that stops at, e.g., awaiting_input because input was unavailable is
+    just as much a pause as one that stops because its step budget ran
+    out, and both should be reported the same way.
+    """
+    if phase in _NON_PAUSE_PHASES:
+        return None
+    return f"paused at phase {phase}"
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     project_root = _project_root(args.project)
     load_dotenv(project_root / ".env")
@@ -106,8 +132,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     print(f"run_id: {final.run_id}")
     print(f"final phase: {final.phase}")
-    if max_steps is not None and final.phase not in ("done", "failed"):
-        print(f"paused at phase {final.phase}")
+    paused = _paused_phase_message(final.phase)
+    if paused is not None:
+        print(paused)
     return 0 if final.phase == "done" else 1
 
 
@@ -148,8 +175,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
         return 1
 
     print(f"final phase: {final.phase}")
-    if max_steps is not None and final.phase not in ("done", "failed"):
-        print(f"paused at phase {final.phase}")
+    paused = _paused_phase_message(final.phase)
+    if paused is not None:
+        print(paused)
     return 0 if final.phase == "done" else 1
 
 
