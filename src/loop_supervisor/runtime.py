@@ -775,9 +775,14 @@ class RunSession:
         self._state = SessionState.STARTED
         return outcome
 
-    def run_to_completion(self) -> RunState:
+    def run_to_completion(self, *, max_steps: int | None = None) -> RunState:
         """Run the supervisor loop to a terminal phase (or until input is
-        unavailable), delegating to ``Supervisor.run()``.
+        unavailable, or ``max_steps`` completed advances have been taken),
+        delegating to ``Supervisor.run()``.
+
+        ``max_steps`` is a per-invocation session control, not a persisted
+        run option: it is never written into ``RunState.options`` and does
+        not survive into a later resume.
 
         Cleanup is not performed here: the caller's ``with`` block triggers
         ``__exit__`` → ``close()``.
@@ -787,7 +792,7 @@ class RunSession:
         assert self._supervisor is not None
         assert self._run_state is not None
 
-        final = self._supervisor.run(self._run_state)
+        final = self._supervisor.run(self._run_state, max_steps=max_steps)
         self._run_state = final
         return final
 
@@ -1007,6 +1012,7 @@ def run_new(
     *,
     input_provider: InputProvider | None = None,
     recover_stale_lock: bool = False,
+    max_steps: int | None = None,
 ) -> RunState:
     """Start a new run from project_root.
 
@@ -1017,6 +1023,10 @@ def run_new(
     TTY-only) when not supplied, matching prior behavior for callers that
     do not need to inject a different provider (e.g. the TUI's
     non-blocking queue-backed provider).
+
+    ``max_steps`` is a per-invocation session control (see
+    ``RunSession.run_to_completion``), not part of the persisted
+    ``RunOptions``.
     """
     session = new_run_session(
         project_root,
@@ -1026,7 +1036,7 @@ def run_new(
     )
     with session:
         session.start_server()
-        return session.run_to_completion()
+        return session.run_to_completion(max_steps=max_steps)
 
 
 def run_resume(
@@ -1035,6 +1045,7 @@ def run_resume(
     *,
     input_provider: InputProvider | None = None,
     recover_stale_lock: bool = False,
+    max_steps: int | None = None,
 ) -> RunState:
     """Resume a saved run from project_root.
 
@@ -1046,6 +1057,10 @@ def run_resume(
     TTY-only) when not supplied, matching prior behavior for callers that
     do not need to inject a different provider (e.g. the TUI's
     non-blocking queue-backed provider).
+
+    ``max_steps`` is a per-invocation session control (see
+    ``RunSession.run_to_completion``), not part of the persisted
+    ``RunOptions``.
     """
     session = resume_run_session(
         project_root,
@@ -1055,7 +1070,7 @@ def run_resume(
     )
     with session:
         session.start_server()
-        return session.run_to_completion()
+        return session.run_to_completion(max_steps=max_steps)
 
 
 def list_run_ids(project_root: Path) -> list[str]:

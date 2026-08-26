@@ -9,6 +9,7 @@ from loop_supervisor.state import RunOptions
 from loop_supervisor.supervisor import (
     PHASE_AWAITING_INPUT,
     PHASE_DONE,
+    PHASE_PLANNING,
     LoopError,
     Supervisor,
     _default_run_options,
@@ -226,6 +227,118 @@ def test_happy_path_accept_then_complete(tmp_path):
     assert final.phase == PHASE_DONE
     assert final.accepted_task_count == 1
     assert (repo.root / "change-1.txt").exists()
+
+
+def test_run_max_steps_none_matches_unbounded_default(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(), _planner_complete()],
+            "loop-builder": [_builder(status="COMPLETE")],
+            "loop-auditor": [_auditor(disposition="ACCEPT")],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    final = supervisor.run(state, max_steps=None)
+
+    assert final.phase == PHASE_DONE
+    assert final.accepted_task_count == 1
+
+
+def test_run_max_steps_stops_before_terminal_without_error(tmp_path):
+    # The happy path above takes exactly 8 advance() calls to reach `done`
+    # (planning -> creating_worktree -> building -> auditing -> merging ->
+    # cleanup_worktree -> cleanup_branch -> planning -> done). Capping at 7
+    # must stop one step short, mid-flight, with no error raised.
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(), _planner_complete()],
+            "loop-builder": [_builder(status="COMPLETE")],
+            "loop-auditor": [_auditor(disposition="ACCEPT")],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    final = supervisor.run(state, max_steps=7)
+
+    assert final.phase == PHASE_PLANNING
+    assert final.phase != PHASE_DONE
+
+
+def test_run_max_steps_one_performs_exactly_one_advance(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(), _planner_complete()],
+            "loop-builder": [_builder(status="COMPLETE")],
+            "loop-auditor": [_auditor(disposition="ACCEPT")],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    final = supervisor.run(state, max_steps=1)
+
+    assert final.phase == "creating_worktree"
+    planner_calls = [c for c in runner.calls if c[0] == "loop-planner"]
+    assert len(planner_calls) == 1
+
+
+def test_run_max_steps_exact_terminal_count_completes_normally(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(), _planner_complete()],
+            "loop-builder": [_builder(status="COMPLETE")],
+            "loop-auditor": [_auditor(disposition="ACCEPT")],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    final = supervisor.run(state, max_steps=8)
+
+    assert final.phase == PHASE_DONE
+
+
+def test_run_max_steps_counts_input_required_as_a_step(tmp_path):
+    # A BLOCKED builder makes advance() return INPUT_REQUIRED without a
+    # phase transition (building -> awaiting_input). That call must still
+    # consume one unit of the step budget: if it didn't, max_steps=3 would
+    # under-count and call advance() a 4th time (attempting to resolve the
+    # pending question against an empty input queue) instead of stopping
+    # exactly at the INPUT_REQUIRED call.
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="BLOCKED", open_concerns=["need clarification"])],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner, input_provider=ScriptedInput([]))
+    state = supervisor.start_new_run()
+
+    advance_calls = []
+    original_advance = supervisor.advance
+
+    def counting_advance(state):
+        advance_calls.append(state.phase)
+        return original_advance(state)
+
+    supervisor.advance = counting_advance
+
+    # planning -> creating_worktree -> building(INPUT_REQUIRED) is 3 steps.
+    final = supervisor.run(state, max_steps=3)
+
+    assert final.phase == PHASE_AWAITING_INPUT
+    assert len(advance_calls) == 3
+    builder_calls = [c for c in runner.calls if c[0] == "loop-builder"]
+    assert len(builder_calls) == 1
+
+
+def test_run_max_steps_zero_returns_state_immediately_without_advancing(tmp_path):
+    runner = ScriptedRunner({"loop-planner": [_planner_ready(), _planner_complete()]})
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    final = supervisor.run(state, max_steps=0)
+
+    assert final.phase == PHASE_PLANNING
+    assert runner.calls == []
 
 
 def test_project_complete_immediately(tmp_path):

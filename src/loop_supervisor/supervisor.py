@@ -694,13 +694,26 @@ class Supervisor:
 
     # -- compatibility loop over advance() ------------------------------
 
-    def run(self, state: RunState) -> RunState:
+    def run(self, state: RunState, *, max_steps: int | None = None) -> RunState:
         """Compatibility loop: runs advance() repeatedly until terminal, input
-        unavailable, or an error. Re-raises LoopError-originated failures to
-        preserve existing headless CLI behavior."""
+        unavailable, the step budget is exhausted, or an error. Re-raises
+        LoopError-originated failures to preserve existing headless CLI
+        behavior.
+
+        ``max_steps`` counts completed ``advance()`` calls, including ones
+        that return ``INPUT_REQUIRED`` (which loops back without a phase
+        transition). ``None`` (the default) means unbounded, matching prior
+        behavior exactly. When the budget is exhausted before a terminal
+        phase is reached, the current (non-terminal) state is returned
+        without error, the same as ``INPUT_UNAVAILABLE``.
+        """
+        steps_taken = 0
         while state.phase not in _TERMINAL_PHASES:
+            if max_steps is not None and steps_taken >= max_steps:
+                return state
             outcome = self.advance(state)
             state = outcome.state
+            steps_taken += 1
             if outcome.status == AdvanceStatus.INPUT_UNAVAILABLE:
                 return state
             if outcome.status == AdvanceStatus.TERMINAL:

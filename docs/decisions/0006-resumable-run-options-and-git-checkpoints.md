@@ -33,9 +33,20 @@ underneath it.
   retries; role timeout; worktree root; decision-approval policy; and
   the OpenCode executable/startup timeout. `resume` reconstructs the
   supervisor entirely from these persisted options. The `resume` CLI
-  subcommand does not accept any run-behavior flags at all — only
-  `--project` and the run ID — so there is no way to accidentally
-  override a running task's limits from the command line.
+  subcommand does not accept any *run-behavior* flags — flags that would
+  change what the supervisor does or how it decides task outcomes — so
+  there is no way to accidentally override a running task's limits from
+  the command line.
+
+  This excludes *session controls*: per-invocation flags that bound how
+  much of the persisted, already-decided run a single CLI invocation
+  performs, without influencing any decision the supervisor makes.
+  `--recover-stale-lock` was the first of these; `--step`/`--max-steps`
+  (added after this ADR — stop after N completed phase transitions, for
+  interactive single-stepping) is the second. Both are accepted on
+  `resume` as well as `run`, and neither is written into `RunOptions` or
+  persisted in `RunState`: a resumed run has no memory of how many steps
+  a prior invocation asked for.
 - `RunState` also persists Git checkpoints refreshed on every phase
   transition: the integration branch's expected `HEAD` and a full
   working-tree status snapshot, and, whenever a task worktree is active,
