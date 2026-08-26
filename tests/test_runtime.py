@@ -4402,6 +4402,170 @@ def test_run_session_invalid_operation_fails_closed_without_writing_lock(tmp_pat
         assert not _lock_path(repo.common_dir()).exists()
 
 
+# --- stop_server() (A2) --------------------------------------------------
+#
+# stop_server() lets a caller force a bounded server.stop() attempt ahead
+# of close(), without releasing the lock -- for breaking a blocked
+# in-flight advance() call by tearing down its HTTP transport. Reuses the
+# same _pending_cleanup handoff start_server() already relies on, so the
+# bounded _CLEANUP_ATTEMPTS budget is spent once, not twice.
+#
+# Concurrency (calling this from another thread while advance() is
+# in-flight, its actual intended use) is deliberately not tested here:
+# RunSession is not thread-safe until A3, so a concurrency test now would
+# pin pre-fix racy behavior and need rewriting the moment A3 lands --
+# exactly the churn the A0 race test already accepted deliberately for a
+# different race. Single-threaded contract only.
+
+
+def test_stop_server_before_startup_is_a_noop(tmp_path):
+    """Calling stop_server() before start_server() must not raise and must
+    not touch the server (there isn't one yet)."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo) as call_log:
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.stop_server()
+            assert "server_stop" not in call_log
+
+
+def test_stop_server_retains_the_lock(tmp_path):
+    """stop_server() must never release the lock -- only close() does,
+    per the module's single-owner contract. This is what makes it safe to
+    call as an escalation ahead of the eventual close(): retaining the
+    lock while the server is stopped is always ADR-0009-safe, unlike
+    releasing it before a confirmed stop."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            session.stop_server()
+            assert _lock_path(repo.common_dir()).exists()
+            assert session.state is rt.SessionState.STARTED
+
+
+def test_stop_server_confirmed_outcome_is_consumed_once_by_close(tmp_path):
+    """A confirmed stop_server() must hand its outcome to close() via
+    _pending_cleanup, so close() does not call server.stop() again --
+    the same budget-spent-once handoff start_server() already relies on
+    for its own failure path."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo) as call_log:
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            session.stop_server()
+            assert call_log.count("server_stop") == 1
+            session.close()
+
+        assert call_log.count("server_stop") == 1
+        assert session.state is rt.SessionState.CLOSED
+        assert not _lock_path(repo.common_dir()).exists()
+
+
+def test_stop_server_never_raises_on_failure(tmp_path, monkeypatch):
+    """A server.stop() that always fails must not escape stop_server():
+    the caller (a shutdown path) must be able to proceed to wait for the
+    advance() worker regardless. The failure is not lost -- close()
+    reports it via the usual CLEANUP_UNRESOLVED path afterwards."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+    from loop_supervisor.runtime import RuntimeError_
+
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+
+    class AlwaysFailingServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            raise RuntimeError("stop fail")
+
+        def add_observer(self, obs):
+            pass
+
+    with _patched_session_env(repo, server_cls=AlwaysFailingServer):
+        session = rt.new_run_session(repo.root, _make_options())
+        with pytest.raises(RuntimeError_, match="run completed but"):
+            with session:
+                session.start_server()
+                session.stop_server()  # must not raise
+                session.run_to_completion()
+
+        assert session.state is rt.SessionState.CLEANUP_UNRESOLVED
+        assert _lock_path(repo.common_dir()).exists()
+
+
+def test_stop_server_is_idempotent(tmp_path):
+    """Two consecutive stop_server() calls must not double-spend the
+    cleanup budget or corrupt the pending-outcome handoff."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo) as call_log:
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            session.stop_server()
+            session.stop_server()
+            assert call_log.count("server_stop") == 2
+            session.close()
+
+        assert call_log.count("server_stop") == 2
+        assert session.state is rt.SessionState.CLOSED
+
+
+def test_stop_server_does_not_clobber_a_confirmed_outcome_with_a_later_failure(tmp_path):
+    """Once stop_server() has confirmed cleanup, a later (redundant)
+    stop_server() call that fails must not overwrite that confirmed
+    outcome -- otherwise close() would believe cleanup is unresolved for
+    a session whose server has already been definitively stopped."""
+    import loop_supervisor.runtime as rt
+    from loop_supervisor.locking import _lock_path
+
+    stop_calls = [0]
+
+    class FlakyAfterFirstStop:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            stop_calls[0] += 1
+            if stop_calls[0] > 1:
+                raise RuntimeError("stop fail on second call")
+
+        def add_observer(self, obs):
+            pass
+
+    repo = _init_repo(tmp_path / "repo")
+    with _patched_session_env(repo, server_cls=FlakyAfterFirstStop):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            session.start_server()
+            session.stop_server()  # confirms (stop_calls -> 1)
+            session.stop_server()  # fails every retry (stop_calls -> 4)
+            session.close()
+
+        assert session.state is rt.SessionState.CLOSED
+        assert not _lock_path(repo.common_dir()).exists()
+
+
 def _blocking_advance_supervisor_cls(release_event, entered_advance_event):
     """Build a supervisor class whose advance() signals entry, then
     blocks until the test releases it -- giving a test a deterministic

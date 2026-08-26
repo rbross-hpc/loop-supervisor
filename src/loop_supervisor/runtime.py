@@ -52,12 +52,16 @@ previously caused a confirmed-clean interrupt to leak its lock.
 One qualification, because the earlier wording overstated this:
 ``start_server()`` does invoke ``_confirm_cleanup()`` directly on the
 ordinary-``Exception`` startup path, since ``_startup_failure`` must know
-whether the lock was retained in order to word its diagnostic. The
-bounded ``_CLEANUP_ATTEMPTS`` budget is nevertheless spent exactly once
-per failure sequence: that outcome is stashed in ``_pending_cleanup`` and
-consumed by the ``close()`` which ``__exit__`` runs immediately after.
-So stop() confirmation is *initiated* in two places; the retry budget and
-all lease/lock decisions remain single-owner.
+whether the lock was retained in order to word its diagnostic. Likewise,
+``stop_server()`` lets a caller force a bounded stop() attempt ahead of
+``close()`` — e.g. to break a blocked in-flight ``advance()`` call by
+tearing down its HTTP transport, without releasing the lock. In both
+cases the bounded ``_CLEANUP_ATTEMPTS`` budget is spent exactly once per
+failure sequence: the outcome is stashed in ``_pending_cleanup`` and
+consumed by the next ``close()``. So stop() confirmation is *initiated*
+in three places (``start_server()``, ``stop_server()``, and ``close()``
+itself when nothing pending exists); the retry budget and all lease/lock
+decisions remain single-owner in ``close()``.
 
 ``__exit__`` always calls ``close()``. When a body exception is already
 propagating, any failure from ``close()`` is converted into a note on that
@@ -548,6 +552,54 @@ class RunSession:
             self._server.abort_active_sessions()
         except BaseException:  # noqa: BLE001 - best-effort by contract
             pass
+
+    def stop_server(self) -> None:
+        """Force a bounded ``server.stop()`` attempt ahead of ``close()``.
+
+        For breaking a blocked in-flight ``advance()`` call: an OpenCode
+        role invocation can block for up to its configured timeout, and
+        stopping the server tears down the HTTP transport underneath it,
+        letting the caller's ``advance()`` thread unwind with an error
+        instead of waiting out the full timeout. This does **not** release
+        the lock and does not touch the lease — only ``close()`` ever does
+        either, per the module's single-owner contract. Deliberately more
+        conservative than what it replaces: retaining the lock while the
+        server is stopped is always safe under ADR 0009; only releasing it
+        *before* a confirmed stop would not be.
+
+        Safe to call before startup (no-op) and never raises, matching
+        ``abort_active_invocations()``'s contract: this is meant for
+        shutdown paths where an escaping exception would replace whatever
+        outcome is already being reported. The bounded
+        ``_CLEANUP_ATTEMPTS`` retry is spent here and the result is
+        stashed in ``_pending_cleanup``, so the ``close()`` that follows
+        consumes it instead of spending the budget a second time — the
+        same handoff ``start_server()`` already relies on.
+
+        A previously confirmed pending outcome is never overwritten by a
+        later failed attempt: once cleanup is known to have succeeded,
+        a subsequent (redundant) call must not make ``close()`` believe
+        it is unresolved again.
+
+        Callers on a background thread must not assume this makes
+        concurrent use of the session safe: ``RunSession`` is not yet
+        thread-safe (see the module docstring), and calling this while
+        ``advance()`` is in flight on another thread is exactly the kind
+        of concurrent access that is not yet guarded against.
+        """
+        # self._server is constructed in __enter__, before server.start()
+        # is ever attempted, so `self._server is None` does not mean "not
+        # started yet" -- it only means "not entered at all". The correct
+        # "has server.start() been attempted" guard is the same one
+        # close() uses: self._server_may_exist (set immediately before
+        # start_server() calls server.start()).
+        if self._server is None or not self._server_may_exist:
+            return
+        outcome = _confirm_server_stopped(self._server)
+        pending = self._pending_cleanup
+        if pending is not None and pending.confirmed and not outcome.confirmed:
+            return
+        self._pending_cleanup = outcome
 
     # -- lifecycle -------------------------------------------------------
 
