@@ -87,14 +87,25 @@ releases the lock or touches the lease — only `close()` does either,
 matching the single-owner rule above — so calling it is always safe in
 the direction that matters: retaining the lock while the server has been
 stopped is ADR-compliant, but releasing the lock before a *confirmed*
-stop would not be. Each `stop_server()`/`start_server()` failure spends
-its own `_CLEANUP_ATTEMPTS` budget and stashes the outcome for the
-`close()` that follows to consume instead of re-spending it, so a single
-session can call `server.stop()` more than `_CLEANUP_ATTEMPTS` times
-across multiple such sequences (an operator forcing repeated
-`stop_server()` calls, each retried up to `_CLEANUP_ATTEMPTS` times, is
-the ordinary case). A confirmed outcome, once recorded, is never
-overwritten by a later failing attempt.
+stop would not be.
+
+The handoff into the `close()` that follows treats a `start_server()`
+failure and a `stop_server()` call differently, and the difference is
+deliberate rather than an oversight. A `start_server()` failure's
+outcome is *consumed as-is* by the immediately following `close()`
+(via `__exit__`) even if unconfirmed: retrying there would merely spend
+the documented `_CLEANUP_ATTEMPTS` budget a second time for the same
+failure sequence, since no time has passed for conditions to change. An
+unconfirmed `stop_server()` outcome, by contrast, is *retried* by the
+next `close()` rather than trusted as final: a blocked transition
+usually unwinds in the interval between the two calls, so the later
+attempt made by `close()` is the one likely to actually confirm cleanup.
+This is precisely why a single session can call
+`server.stop()` more than `_CLEANUP_ATTEMPTS` times in its lifetime: an
+operator forcing repeated `stop_server()` calls, each retried up to
+`_CLEANUP_ATTEMPTS` times, is the ordinary case, not an edge case. A
+*confirmed* outcome, once recorded by either path, is always consumed
+as-is and never retried or overwritten by a later failing attempt.
 
 ### Concurrency and the quiescence barrier
 
