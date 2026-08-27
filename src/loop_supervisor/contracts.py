@@ -22,8 +22,27 @@ class ContractError(ValueError):
 def _parse_json_object(raw: str) -> dict[str, Any]:
     """Parse `raw` as a single JSON object, rejecting anything else.
 
-    Tolerates a single leading/trailing markdown code fence since models
-    occasionally wrap JSON in ```json ... ``` despite instructions not to.
+    Tolerates two specific model habits, both despite explicit
+    instructions not to do them:
+
+    - A single leading/trailing markdown code fence (```json ... ```)
+      wrapping the entire output.
+    - A leading prose preamble before the object (e.g. "Confirmed: ...
+      Here is the plan:\n\n{...}"), by decoding from the first '{' in
+      the text once whole-text parsing fails. This also covers a
+      preamble followed by a fenced object (the fence's own opening
+      ```` ```json ```` line is skipped over the same way other prose
+      is; only its closing ``` needs explicit tolerance, since it is
+      the sole content left after the object).
+
+    Deliberately does NOT tolerate: trailing content after the object
+    (other than a bare leftover fence closer), a second object anywhere
+    in the text, or a preamble that itself contains an unrelated '{'.
+    In each of those cases the first '{' either fails to decode as a
+    complete object or leaves other non-whitespace text after it, and
+    parsing fails loudly rather than guessing which of several
+    candidate objects was the real one -- a validation layer should
+    reject ambiguous output, not silently resolve it.
     """
     text = raw.strip()
     if text.startswith("```"):
@@ -37,7 +56,18 @@ def _parse_json_object(raw: str) -> dict[str, Any]:
     try:
         value = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ContractError(f"output is not valid JSON: {exc}") from exc
+        start = text.find("{")
+        if start == -1:
+            raise ContractError(f"output is not valid JSON: {exc}") from exc
+        try:
+            value, end = json.JSONDecoder().raw_decode(text, start)
+        except json.JSONDecodeError:
+            raise ContractError(f"output is not valid JSON: {exc}") from exc
+        trailing = text[end:].strip()
+        if trailing == "```":
+            trailing = ""
+        if trailing:
+            raise ContractError(f"output is not valid JSON: {exc}") from exc
 
     if not isinstance(value, dict):
         raise ContractError("output must be a single JSON object")
