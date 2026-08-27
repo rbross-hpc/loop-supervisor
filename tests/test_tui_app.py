@@ -689,9 +689,12 @@ async def test_shutdown_during_blocked_initialization_retries_after_failed_stop(
 ):
     """Shutdown requested while server.start() is still blocked must not
     duplicate teardown inside _do_initialize_locked: only the shutdown
-    worker's canonical _do_shutdown may touch the server/lock. If the
-    first stop() attempt fails, server and lock ownership must be
-    retained; retrying cleanup must then succeed and clear both."""
+    worker's canonical _do_shutdown may touch the server/lock. A stop()
+    that fails once must not leave the lock stuck: RunSession.close()
+    retries server.stop() internally (see ADR 0009), so this single
+    external shutdown attempt must still confirm cleanup and clear both
+    the server and the lock, without a second action_request_shutdown()
+    call being necessary."""
     repo = _init_repo(tmp_path / "repo")
     call_log: list[str] = []
     release_start = threading.Event()
@@ -739,34 +742,26 @@ async def test_shutdown_during_blocked_initialization_retries_after_failed_stop(
             await pilot.pause(0.05)
 
         # RunSession.close() retries server.stop() internally (up to
-        # rt._CLEANUP_ATTEMPTS times, see ADR 0009), so a stop() that
-        # fails only once may already be confirmed within this single
-        # external shutdown attempt -- this test's original premise (a
-        # single transient failure always forces a second external
-        # action_request_shutdown() call) no longer holds unconditionally.
-        # What must still hold regardless of how many internal retries it
-        # took: the lock is never released while unresolved, and it is
-        # eventually released once stop() actually succeeds.
+        # rt._CLEANUP_ATTEMPTS times, see ADR 0009): the fail-once
+        # server's transient failure is confirmed on its second internal
+        # attempt, all within this single external shutdown attempt, so
+        # no second action_request_shutdown() call should be necessary.
         assert screen._session is not None
-        if not screen.shutdown_clean:
-            assert screen._session.state is rt.SessionState.CLEANUP_UNRESOLVED
-            assert _lock_path(repo.common_dir()).exists()
-            # Retry: this time stop() succeeds.
-            screen.action_request_shutdown()
-            for _ in range(100):
-                if not _lock_path(repo.common_dir()).exists():
-                    break
-                await pilot.pause(0.05)
+        assert screen.shutdown_clean is True
+        assert screen._session.state is rt.SessionState.CLOSED
 
     assert not _lock_path(repo.common_dir()).exists()
     assert screen._session.state is rt.SessionState.CLOSED
-    assert call_log.count("server_stop") >= 2
+    assert call_log.count("server_stop") == 2
 
 
 @pytest.mark.asyncio
 async def test_return_to_browser_retries_transient_stop_failure(tmp_path, monkeypatch):
-    """Pressing 'q'/Return-to-runs after a failed cleanup attempt must
-    retry, and succeed once the transient failure clears."""
+    """Pressing 'q'/Return-to-runs must confirm cleanup even if the first
+    server.stop() attempt fails transiently: RunSession.close() retries
+    internally (see ADR 0009), so the fail-once server's failure is
+    confirmed on its second internal attempt within this one press,
+    without a second external press being necessary."""
     repo = _init_repo(tmp_path / "repo")
     call_log: list[str] = []
     stop_calls = {"n": 0}
@@ -799,50 +794,49 @@ async def test_return_to_browser_retries_transient_stop_failure(tmp_path, monkey
                 break
             await pilot.pause(0.05)
 
-        # RunSession.close() retries server.stop() internally (up to
-        # rt._CLEANUP_ATTEMPTS times, see ADR 0009), so a single transient
-        # failure may already be confirmed within this one
-        # action_request_shutdown() call -- a second press of "q"/Return
-        # is no longer guaranteed to be necessary, only harmless if tried.
-        if not screen._shutdown_clean:
-            assert _lock_path(repo.common_dir()).exists()
-            screen.action_request_shutdown()
-            for _ in range(100):
-                if not _lock_path(repo.common_dir()).exists():
-                    break
-                await pilot.pause(0.05)
+        assert screen._shutdown_clean is True
 
     assert not _lock_path(repo.common_dir()).exists()
-    assert call_log.count("server_stop") >= 1
+    assert call_log.count("server_stop") == 2
 
 
 @pytest.mark.asyncio
 async def test_app_exit_automatically_retries_fail_once_cleanup(tmp_path, monkeypatch):
     """App-level exit must retry cleanup on its own, without any manual
-    'q' press, when the first attempt fails to stop cleanly."""
+    'q' press, when the first app-level attempt fails to stop cleanly.
+
+    RunSession.close() already retries server.stop() internally up to
+    rt._CLEANUP_ATTEMPTS times within a single app-level attempt (see
+    ADR 0009), so the server here must fail exactly that many times --
+    exhausting the *first* app-level attempt's entire internal retry
+    budget -- for this test to actually exercise the app-level retry
+    loop itself rather than being satisfied by RunSession's own internal
+    retry. Succeeding only on the (rt._CLEANUP_ATTEMPTS + 1)th stop()
+    call is what proves a second, distinct app-level attempt occurred.
+    """
     repo = _init_repo(tmp_path / "repo")
     call_log: list[str] = []
     stop_calls = {"n": 0}
 
-    class _FailOnceServer(_FakeServer):
+    class _FailUntilSecondAppAttemptServer(_FakeServer):
         def stop(self) -> None:
             stop_calls["n"] += 1
             call_log.append("server_stop")
-            if stop_calls["n"] == 1:
-                raise RuntimeError("simulated transient stop failure")
+            if stop_calls["n"] <= rt._CLEANUP_ATTEMPTS:
+                raise RuntimeError("simulated stop failure")
 
     def factory(project_dir, config):
-        return _FailOnceServer(project_dir, config, call_log=call_log)
+        return _FailUntilSecondAppAttemptServer(project_dir, config, call_log=call_log)
 
     _patch_server(monkeypatch, factory=factory)
 
     app = LoopSupervisorApp(tmp_path / "repo")
     async with app.run_test() as pilot:
-        app.push_screen(RunScreen(tmp_path / "repo", run_id=None))
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
         await pilot.pause()
         for _ in range(50):
-            screen = app.screen
-            if isinstance(screen, RunScreen) and screen._state is not None:
+            if screen._state is not None:
                 break
             await pilot.pause(0.05)
 
@@ -853,7 +847,11 @@ async def test_app_exit_automatically_retries_fail_once_cleanup(tmp_path, monkey
             await pilot.pause(0.05)
 
     assert not _lock_path(repo.common_dir()).exists()
-    assert call_log.count("server_stop") == 2
+    # rt._CLEANUP_ATTEMPTS failing calls exhaust the first app-level
+    # attempt's entire internal retry budget (confirming it as
+    # genuinely unclean, not merely internally retried), plus one more
+    # successful call made by the automatic second app-level attempt.
+    assert call_log.count("server_stop") == rt._CLEANUP_ATTEMPTS + 1
 
 
 @pytest.mark.asyncio
@@ -1514,16 +1512,12 @@ async def test_registry_membership_clears_only_after_quiescence_and_clean_releas
             await pilot.pause(0.05)
 
         # RunSession.close() retries server.stop() internally (up to
-        # rt._CLEANUP_ATTEMPTS times, see ADR 0009), so a stop() that
-        # fails only once may already be confirmed within this single
-        # external shutdown attempt -- unlike before RunSession adoption,
-        # a second external action_request_shutdown() is not guaranteed
-        # to be needed. If it wasn't already clean, retry until it is;
-        # either way the screen must still be registered and unfinalized
-        # throughout, and finalized only once genuinely clean.
-        if not screen.shutdown_clean:
-            assert screen in app._owned_run_screens
-            screen.action_request_shutdown()
+        # rt._CLEANUP_ATTEMPTS times, see ADR 0009): the fail-once
+        # server's transient failure is confirmed on its second internal
+        # attempt within this single external shutdown attempt, so the
+        # screen must already be quiescent and clean, and therefore
+        # deregistered, without a second action_request_shutdown() call.
+        assert screen.shutdown_clean is True
         for _ in range(100):
             if screen not in app._owned_run_screens:
                 break
