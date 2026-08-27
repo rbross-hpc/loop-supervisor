@@ -487,6 +487,58 @@ def test_run_new_server_startup_failure_persists_operational_failure(tmp_path):
     assert state.last_error["kind"] == "opencode_startup"
 
 
+def test_run_new_exhausted_malformed_output_persists_and_reports_cleanly(tmp_path):
+    """End-to-end: a role that always returns malformed output must not
+    let ContractError escape run_new() raw. Supervisor.run() converts the
+    OPERATIONAL_FAILURE outcome to LoopError (one of the CLI's expected
+    error types, see cli.py's _EXPECTED_CLI_ERRORS), and the durable
+    operational_failure record is already persisted by the time it
+    propagates, exactly like the other operational failure kinds covered
+    above."""
+    from loop_supervisor.state import load_state
+    from loop_supervisor.supervisor import LoopError
+
+    repo = _init_repo(tmp_path / "repo")
+
+    import loop_supervisor.runtime as rt
+
+    original_oc_server = rt.OpenCodeServer
+
+    class MalformedOutputServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def add_observer(self, obs):
+            pass
+
+        def run_agent(self, **kwargs):
+            return "this is not json at all"
+
+    rt.OpenCodeServer = MalformedOutputServer
+    try:
+        try:
+            run_new(tmp_path / "repo", _make_options())
+            raise AssertionError("expected LoopError to be raised")
+        except LoopError as exc:
+            assert "Traceback" not in str(exc)
+    finally:
+        rt.OpenCodeServer = original_oc_server
+
+    runs = list_run_ids(tmp_path / "repo")
+    assert len(runs) == 1
+    state = load_state(repo.common_dir(), runs[0])
+    assert state.phase == "operational_failure"
+    assert state.last_error is not None
+    assert state.last_error["kind"] == "contract"
+    assert state.last_error["retryable"] is True
+
+
 def test_run_resume_server_startup_failure_persists_operational_failure(tmp_path):
     from loop_supervisor.opencode import ServerStartupError
     from loop_supervisor.runtime import RuntimeError_

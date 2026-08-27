@@ -13,14 +13,33 @@ tracked and addressed in follow-up work rather than dropped.
 
 ## Tier 1 — fix next: correctness/security
 
-1. **Exhausted `ContractError` from malformed-output retries escapes
-   without durable failure state.**
-   `src/loop_supervisor/supervisor.py:524-532`,
-   `src/loop_supervisor/supervisor.py:1383-1395`.
-   When malformed-output retries are exhausted, the resulting
-   `ContractError` is raised but never persisted as an
-   `operational_failure`/`failed` state, so the operator has no durable
-   record to resume from or diagnose.
+1. ~~Exhausted `ContractError` from malformed-output retries escapes
+   without durable failure state.~~ **Resolved.**
+   `ContractError` is a `ValueError`, but `advance()`'s operational-failure
+   tuple (`src/loop_supervisor/supervisor.py:524-530`) previously only
+   caught `RuntimeError` subclasses, so any `ContractError` — from
+   exhausted malformed-output retries (`_parse_with_retry()`,
+   `supervisor.py:1396-1408`) or from `check_decision_answered()`/
+   `check_task_identity()`, which have no retry wrapper at all — escaped
+   `advance()` before `_save()` ever ran. Fixed by adding `ContractError`
+   to that tuple and giving it a `kind="contract"` classification and
+   recovery hint in `_classify_operational_failure()`/`_error_kind()`
+   (`supervisor.py:1324-1386`). All raise sites are now covered, not just
+   the retry-exhaustion case. See
+   `docs/decisions/0009-supervisor-lock-and-operational-failure-semantics.md`'s
+   operational-failure examples and `tests/test_advance.py`'s
+   `test_exhausted_malformed_output_persists_operational_failure` and
+   related tests.
+
+   Known follow-up, not fixed here: `_do_architecting()`/`_do_building()`
+   clear `state.pending_question`/consume the operator's guidance before
+   the downstream contract check can raise (`supervisor.py:867-869`,
+   `1022-1024` vs. `909`, `1051`), so a retry after one of these specific
+   `ContractError` sites can lose that input. This is pre-existing and
+   identical for exceptions already in the tuple (e.g. `AgentInvocationError`
+   from the same `run_agent` call hits the same window) — the fix above
+   makes `ContractError` consistent with that existing behavior rather
+   than introducing a new hazard. Tracked as item 24, below.
 
 2. **Ordinary post-transition `_save()` failures are outside
    classification/failure-persistence boundaries.**
@@ -217,6 +236,19 @@ tracked and addressed in follow-up work rather than dropped.
     particular test's own behavior. The other two (pytest/`logging`
     internals) are unaffected by this finding and remain believed not
     ours to fix.
+
+24. **Retry after an operational failure discovered mid-phase can lose
+    operator-supplied guidance.**
+    `src/loop_supervisor/supervisor.py:867-869`,
+    `src/loop_supervisor/supervisor.py:1022-1024`.
+    `_do_architecting()` and `_do_building()` clear
+    `state.pending_question` (consuming any operator guidance/answer)
+    before invoking the role and running its contract checks. If the
+    role invocation or a downstream contract check then fails and the
+    phase is retried, the consumed guidance is gone and the operator
+    must resupply it. Pre-existing for every exception already routed
+    through `_handle_operational_failure()`, not introduced by item 1's
+    `ContractError` fix; not previously called out in this backlog.
 
 ## Out of scope for this backlog
 

@@ -526,6 +526,104 @@ def test_advance_retry_operational_failure(tmp_path):
     assert state.phase == PHASE_CREATING_WORKTREE
 
 
+def test_exhausted_malformed_output_persists_operational_failure(tmp_path):
+    from loop_supervisor.contracts import ContractError
+
+    call_count = [0]
+
+    class AlwaysMalformedRunner:
+        def run_agent(self, **_):
+            call_count[0] += 1
+            return "this is not json at all"
+
+    supervisor, repo = _make_supervisor(tmp_path, AlwaysMalformedRunner())
+    state = supervisor.start_new_run()
+
+    outcome = supervisor.advance(state)
+
+    assert outcome.status == AdvanceStatus.OPERATIONAL_FAILURE
+    assert isinstance(outcome.error, ContractError)
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+    assert state.last_error is not None
+    assert state.last_error["kind"] == "contract"
+    assert state.last_error["retryable"] is True
+    assert state.last_error["retry_phase"] == PHASE_PLANNING
+    assert state.last_error["failed_phase"] == PHASE_PLANNING
+    # One initial call plus one retry (the default malformed_output_retries=1).
+    assert call_count[0] == 2
+
+
+def test_malformed_output_failure_record_survives_reload(tmp_path):
+    class AlwaysMalformedRunner:
+        def run_agent(self, **_):
+            return "not json"
+
+    supervisor, repo = _make_supervisor(tmp_path, AlwaysMalformedRunner())
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+    reloaded = load_state(repo.common_dir(), state.run_id)
+
+    assert reloaded.phase == PHASE_OPERATIONAL_FAILURE
+    assert reloaded.last_error is not None
+    assert reloaded.last_error["kind"] == "contract"
+    assert reloaded.last_error["retry_phase"] == PHASE_PLANNING
+
+
+def test_retry_after_malformed_output_resumes_at_failed_phase(tmp_path):
+    call_count = [0]
+    inner = ScriptedRunner({"loop-planner": [_planner_ready()]})
+
+    class FlakyMalformedRunner:
+        def run_agent(self, *, agent, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 2:
+                return "not json"
+            return inner.run_agent(agent=agent, **kwargs)
+
+    supervisor, repo = _make_supervisor(tmp_path, FlakyMalformedRunner())
+    state = supervisor.start_new_run()
+
+    outcome = supervisor.advance(state)
+    assert outcome.status == AdvanceStatus.OPERATIONAL_FAILURE
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+    assert state.last_error is not None
+    assert state.last_error["retry_phase"] == PHASE_PLANNING
+
+    outcome2 = supervisor.advance(state)
+    assert outcome2.status == AdvanceStatus.ADVANCED
+    assert state.phase == PHASE_PLANNING
+
+    outcome3 = supervisor.advance(state)
+    assert outcome3.status == AdvanceStatus.ADVANCED
+    assert state.phase == PHASE_CREATING_WORKTREE
+
+
+def test_builder_identity_contract_failure_persists_with_building_retry_phase(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(task_id="task-1")],
+            "loop-builder": [_builder(task_id="task-WRONG", status="COMPLETE")],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+    supervisor.advance(state)
+    assert state.phase == PHASE_BUILDING
+
+    outcome = supervisor.advance(state)
+
+    assert outcome.status == AdvanceStatus.OPERATIONAL_FAILURE
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+    assert state.last_error is not None
+    assert state.last_error["kind"] == "contract"
+    assert state.last_error["failed_phase"] == PHASE_BUILDING
+    assert state.last_error["retry_phase"] == PHASE_BUILDING
+    assert state.last_error["retryable"] is True
+
+
 def test_advance_revision_limit_produces_terminal_failure(tmp_path):
     runner = ScriptedRunner(
         {
