@@ -45,10 +45,12 @@ class ScriptedRunner:
     def __init__(self, responses: dict[str, list[str]]):
         self.responses = {k: list(v) for k, v in responses.items()}
         self.calls: list[tuple[str, Path]] = []
+        self.prompts: list[tuple[str, str]] = []
         self._commit_counter = 0
 
     def run_agent(self, *, agent, directory, prompt, json_schema=None, timeout=1800.0):
         self.calls.append((agent, directory))
+        self.prompts.append((agent, prompt))
         queue = self.responses.get(agent)
         if not queue:
             raise AssertionError(f"no more scripted responses for agent {agent!r}")
@@ -370,6 +372,42 @@ def test_revise_then_accept(tmp_path):
     assert len(builder_calls) == 2
     # Both builder invocations happen on the same preserved worktree/directory.
     assert builder_calls[0][1] == builder_calls[1][1]
+
+
+def test_revise_passes_required_changes_and_findings_but_not_design_observations(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(), _planner_complete()],
+            "loop-builder": [_builder(status="COMPLETE"), _builder(status="COMPLETE")],
+            "loop-auditor": [
+                _auditor(
+                    disposition="REVISE",
+                    required_changes=["reject unterminated quoted values"],
+                    findings=["a line with an unterminated quote is silently accepted"],
+                    design_observations=["the schema could use a stricter mode"],
+                ),
+                _auditor(disposition="ACCEPT"),
+            ],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    final = supervisor.run(state)
+
+    assert final.phase == PHASE_DONE
+    builder_prompts = [p for agent, p in runner.prompts if agent == "loop-builder"]
+    assert len(builder_prompts) == 2
+    second_builder_prompt = builder_prompts[1]
+
+    assert "reject unterminated quoted values" in second_builder_prompt
+    assert "a line with an unterminated quote is silently accepted" in second_builder_prompt
+    assert "the schema could use a stricter mode" not in second_builder_prompt
+
+    changes_index = second_builder_prompt.index("reject unterminated quoted values")
+    findings_index = second_builder_prompt.index(
+        "a line with an unterminated quote is silently accepted"
+    )
+    assert changes_index < findings_index
 
 
 def test_replan_continues_on_same_worktree(tmp_path):

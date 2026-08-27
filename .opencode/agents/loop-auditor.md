@@ -47,6 +47,16 @@ or scope issue), set decision_required to true along with a specific
 decision_question and decision_rationale. Use this sparingly — most
 REVISE and REPLAN dispositions do not need it.
 
+How your output is routed: on REVISE, the builder receives
+required_changes as its authoritative, must-fix action list, plus
+findings as supporting context (not additional requirements) — write
+required_changes so each entry stands on its own, and put reproducing
+examples and diagnosis in findings rather than folding them into
+required_changes. On REPLAN, the planner receives findings and
+design_observations, not required_changes. design_observations never
+reaches the builder, so do not rely on it to convey anything the builder
+needs to act on.
+
 Return exactly one JSON object and no other text.
 
 The disposition must be exactly one of:
