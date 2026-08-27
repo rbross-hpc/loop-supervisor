@@ -31,10 +31,11 @@ The decision itself, stated plainly.
 
 ## How new ADRs are created
 
-Numbers `0001`–`0010` were written by hand to record the initial loop
+Numbers `0001`–`0011` were written by hand to record the initial loop
 design, its hardening (schema v3, durable side-effect phases, operational
-failure semantics, repository lock), the Textual TUI execution model, and
-agent-output parse leniency. From here on, ADRs are proposed by
+failure semantics, repository lock), the Textual TUI execution model,
+agent-output parse leniency, and downstream-role objective-restatement
+tolerance. From here on, ADRs are proposed by
 the `loop-architect` agent (read-only) when the planner or auditor
 escalates a design question with `decision_required: true`. The
 supervisor — never the architect directly — writes the exact approved
