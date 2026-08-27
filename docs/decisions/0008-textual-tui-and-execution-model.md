@@ -36,6 +36,21 @@ The UI clearly separates **Durable supervisor state** from
 **Live OpenCode activity — ephemeral** so operators are never confused about
 which source is authoritative.
 
+Resource lifecycle (lock, OpenCode server, `Supervisor`) is owned by a
+single `runtime.RunSession` per `RunScreen`, not by ad hoc attributes on
+the screen — see ADR 0009 for `RunSession` itself. `RunScreen` constructs
+and enters the session on its own initialization worker thread and
+closes it on its own shutdown worker thread; these are two different
+background threads over the lifetime of one screen, so the session is
+never used as a `with` block the way the headless CLI uses it. Between
+those two calls, the session's `advance()` is driven from a third,
+per-transition worker thread spawned on demand, matching the existing
+one-`advance()`-per-thread-worker model above. `RunSession`'s own
+concurrency contract (ADR 0009) — a re-entrant state lock serializing
+`close()` against `stop_server()`, and a quiescence barrier ensuring the
+lock is never released mid-transition — is what makes this safe across
+three threads that are never coordinated by Textual's own message queue.
+
 ## Consequences
 
 - Supervisor core remains testable without any Textual dependency.
@@ -46,3 +61,9 @@ which source is authoritative.
 - `loop-supervisor tui --project PATH` is the new entry point for the UI.
 - Textual and Rich are added as runtime dependencies; `pytest-asyncio` is
   added as a dev dependency for Textual pilot tests.
+- `RunScreen` shares its entire resource-lifecycle implementation with the
+  headless CLI via `RunSession` (ADR 0009) rather than re-implementing
+  lock/server/supervisor ownership; the TUI-specific code left on
+  `RunScreen` is limited to SSE, Textual messaging, and translating
+  `RunSession`'s raising `close()` into the non-raising `shutdown_clean`
+  signal the app's exit-retry loop polls.

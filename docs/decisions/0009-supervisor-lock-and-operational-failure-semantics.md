@@ -47,21 +47,28 @@ launcher to be reaped with a SIGKILL return status. The parent never
 signals or probes a numeric PGID after anchor loss. A `stop()` that raises
 (the process group, control client, launcher pipes, or stdout pump thread
 could not be confirmed released) means the lock is deliberately retained
-on disk, in both the headless runtime (`run_new()` / `run_resume()` in
-`runtime.py`, via the `_LockLease` released only when cleanup is confirmed)
-and the TUI (`RunScreen._cleanup_resources()`, which only releases the
-lock once `self._server is None`). This is intentional: releasing the lock
-while an OpenCode process may still be alive and mutating the working tree
-would let a successor process start concurrently mutating the same
-repository. An operator who encounters a retained lock after a failed
-cleanup must verify no OpenCode process survives before passing
-`--recover-stale-lock`.
+on disk. Both front-ends share exactly one mechanism for this: `RunSession`
+(`runtime.py`), via the `_LockLease` it owns internally, released only
+once cleanup is confirmed. The headless CLI (`run_new()` / `run_resume()`)
+and the TUI (`RunScreen`) each construct and drive their own `RunSession`
+instance, but neither implements its own release decision — that logic
+lives once, in `RunSession.close()`, tracked via `SessionState` rather
+than by either caller nulling out a server reference. This is intentional:
+releasing the lock while an OpenCode process may still be alive and
+mutating the working tree would let a successor process start
+concurrently mutating the same repository. An operator who encounters a
+retained lock after a failed cleanup must verify no OpenCode process
+survives before passing `--recover-stale-lock`.
 
-Unifying these two cleanup owners behind the headless runtime's
-`RunSession` is planned (the TUI does not yet construct or drive one);
-this ADR describes both as they exist today and will be revised once
-`RunScreen` adopts `RunSession` rather than its own
-`_cleanup_resources()`.
+The TUI's `RunScreen._cleanup_resources()` still exists, but it is no
+longer a cleanup owner in its own right — it is a thin adapter with two
+responsibilities `RunSession` cannot have, because it has no knowledge of
+either: tearing down the TUI-owned SSE client before touching the session
+(SSE failure must never block server/lock cleanup, and vice versa), and
+translating `RunSession.close()`'s raising contract into the non-raising
+`shutdown_clean` boolean that `LoopSupervisorApp`'s app-level exit-retry
+loop polls. Ordering, retry, and the release decision itself belong
+entirely to `close()`.
 
 In the headless runtime, "confirmed" means a bounded retry sequence
 (`_confirm_server_stopped()` in `runtime.py`, up to `_CLEANUP_ATTEMPTS`
@@ -107,13 +114,23 @@ operator forcing repeated `stop_server()` calls, each retried up to
 *confirmed* outcome, once recorded by either path, is always consumed
 as-is and never retried or overwritten by a later failing attempt.
 
+The TUI's own app-level exit retry (below) composes with this budget
+rather than replacing it: each of its automatic retries calls
+`RunScreen._cleanup_resources()`, which calls `session.close()`, which
+may itself internally retry `server.stop()` up to `_CLEANUP_ATTEMPTS`
+times. Where the TUI's pre-`RunSession` cleanup made exactly one
+`server.stop()` call per app-level retry, it may now make up to
+`_CLEANUP_ATTEMPTS`; a stuck cleanup that previously needed several
+app-level retries to eventually confirm may now need fewer, since each
+one already exhausts its own internal budget first.
+
 ### Concurrency and the quiescence barrier
 
 `RunSession` (`runtime.py`) may be driven from more than one thread, as
-the Textual TUI does once it adopts it (an `advance()`/
-`run_to_completion()` worker thread plus a shutdown worker thread; see
-ADR 0008). Two primitives enforce the lock's safety under that
-concurrency, and the distinction between them is load-bearing:
+the Textual TUI does (an `advance()`/`run_to_completion()` worker thread
+plus a shutdown worker thread; see ADR 0008). Two primitives enforce the
+lock's safety under that concurrency, and the distinction between them is
+load-bearing:
 
 - **`_state_lock`** (an `RLock`) guards the session's mutable bookkeeping
   and serializes `close()` against `stop_server()`. It is held across
@@ -139,7 +156,7 @@ concurrency, and the distinction between them is load-bearing:
 
 This barrier is a precondition on **both** of `RunSession`'s run-driving
 entry points, not just the per-phase one. `Supervisor.run()`
-(`supervisor.py:697-723`) loops calling `self.advance(state)` on the
+(`supervisor.py:697-727`) loops calling `self.advance(state)` on the
 *supervisor* directly to drive a run to a terminal phase; it never calls
 back through `RunSession.advance()`, so `RunSession.run_to_completion()`
 (the wrapper CLI/TUI code actually calls) clears and sets
@@ -211,23 +228,42 @@ taking precedence — a startup interrupt is itself a kind of failure, so
 its caller need not also pass `outcome=FAILED`.
 
 This split is also what makes `close()` usable by a **detached caller**
-— one invoking cleanup from inside an already-executing `except` block,
-as the TUI's `_release_after_failed_init()` does today and as `app.py`'s
-other exception handlers will once they adopt `RunSession` — rather than
-only from `__exit__` with a body exception still actively propagating.
-`close()` reads `sys.exc_info()` exactly once, at its own entry, to tell
-these two shapes apart: whether the exception a caller passes as `error`
-is the one currently unwinding through this exact call (in which case a
-retained lock is reported by annotating that exception, since it will
-already propagate on its own) or one the caller is holding after having
-already caught it elsewhere (in which case a retained lock must be
-raised, or a detached caller retrying `close()` on a stale exception
-would get a silent return instead of the raise it needs to detect a
-failed retry). Deriving `outcome` from ambient exception state instead of
-taking it as an explicit parameter would not work for this shape: ambient
-state answers "is something unwinding right now", not "did the operation
-this call is concluding succeed", and a detached caller's `except` block
-means those two questions can disagree.
+— one whose `error` argument, whatever it is, is *not* the exception
+currently propagating through this exact call — as distinct from
+`__exit__`, where a body exception is still actively unwinding and
+`error` is exactly that exception. `close()` reads `sys.exc_info()`
+exactly once, at its own entry, to tell these two shapes apart, and the
+distinction is by **identity against that read, not by lexical
+position**: calling `close()` from inside an `except` block does not by
+itself make a caller detached, because a caller can pass the exception it
+just caught as `error` and still be the unwinding shape for as long as
+`sys.exc_info()` still reports it (which it does for the duration of that
+`except` block, even for calls made from deeper in the call stack). What
+actually determines the shape is whether `error is` that ambient
+exception: if so, a retained lock is reported by annotating it, since it
+will already propagate on its own; if `error` is `None`, or is some other
+exception the caller is holding after already having handled the real
+one, a retained lock must instead be *raised*, or a detached caller
+retrying `close()` would get a silent return instead of the raise it
+needs to detect a failed retry.
+
+This is precisely why `RunScreen._release_after_failed_init()` — which
+does run from inside its caller's own `except Exception as exc:` block —
+passes `error=None` rather than `error=exc`. Passing `exc` there would
+make `close()` treat it as the exception actively unwinding through this
+exact call (since `sys.exc_info()` still reports it for the whole
+duration of a synchronous call made from within that block), even though
+that `except` block does not re-raise `exc`; it only renders a banner and
+returns normally. `close()` would then report an unresolved cleanup by
+annotating `exc` and returning silently — invisible, since nothing further
+in that call chain re-raises `exc` — leaving `shutdown_clean` `True` with
+the lock still on disk. `error=None` makes this a genuine detached call,
+so `close()` raises on an unresolved cleanup exactly as it should.
+Deriving `outcome` from ambient exception state instead of taking it as
+an explicit parameter would not work for this shape either: ambient state
+answers "is something unwinding right now", not "did the operation this
+call is concluding succeed", and a detached caller's `except` block means
+those two questions can disagree.
 
 This precedence applies to the *complete* outcome of an operation, not
 just its first failure point. In `OpenCodeServer.create_session()`,
@@ -365,3 +401,14 @@ than re-executing blindly.
   exception in hand" and "detached caller re-invoking cleanup from an
   `except` block" both representable, closing the gap that previously
   let a failed run report success wording.
+- The headless CLI and the TUI now share exactly one cleanup-ownership
+  implementation (`RunSession.close()`/`_LockLease`); `RunScreen` no
+  longer has its own release decision, only a thin adapter
+  (`_cleanup_resources()`) that manages the TUI-owned SSE client and
+  translates `close()`'s raise into the app's non-raising
+  `shutdown_clean` boolean.
+- The TUI's app-level exit retry now composes with the headless
+  runtime's internal `_CLEANUP_ATTEMPTS` budget, so a single app-level
+  retry may issue more `server.stop()` attempts than it did before this
+  ADR's original TUI text was written; total attempts across a stuck
+  shutdown sequence rose accordingly.
