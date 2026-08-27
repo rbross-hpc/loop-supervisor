@@ -17,9 +17,10 @@ from pathlib import Path
 
 import pytest
 
+import loop_supervisor.runtime as rt
 import loop_supervisor.tui.app as app_mod
 from loop_supervisor.git import GitRepo
-from loop_supervisor.locking import _lock_path
+from loop_supervisor.locking import LockError, _lock_path
 from loop_supervisor.state import RunOptions, load_state
 from loop_supervisor.supervisor import PHASE_OPERATIONAL_FAILURE
 from loop_supervisor.tui.app import (
@@ -96,15 +97,24 @@ class _FakeServer:
 
 
 def _patch_server(monkeypatch, *, fail: bool = False, call_log=None, factory=None):
+    """Patch OpenCodeServer where it is actually constructed.
+
+    Since RunSession.start_server() (via RunSession.__enter__) is now
+    what constructs the server -- app.py no longer imports OpenCodeServer
+    itself -- the patch target is loop_supervisor.runtime.OpenCodeServer,
+    not app_mod. This is the one funnel point for all 30+ tests below
+    that use this helper; no other test in this file references
+    app_mod.OpenCodeServer directly.
+    """
     if factory is not None:
-        monkeypatch.setattr(app_mod, "OpenCodeServer", factory)
+        monkeypatch.setattr(rt, "OpenCodeServer", factory)
         return
     log = call_log if call_log is not None else []
 
     def _factory(project_dir, config):
         return _FakeServer(project_dir, config, fail=fail, call_log=log)
 
-    monkeypatch.setattr(app_mod, "OpenCodeServer", _factory)
+    monkeypatch.setattr(rt, "OpenCodeServer", _factory)
 
 
 @pytest.mark.asyncio
@@ -124,7 +134,7 @@ async def test_new_run_acquires_lock_before_state_creation(tmp_path, monkeypatch
             await pilot.pause(0.05)
         screen = app.screen
         assert isinstance(screen, RunScreen)
-        assert screen._lock is not None
+        assert screen._session is not None
         assert _lock_path(repo.common_dir()).exists()
         screen.action_request_shutdown()
         for _ in range(50):
@@ -308,13 +318,13 @@ async def test_quit_during_blocked_advance_does_not_release_lock_early(tmp_path,
         assert isinstance(screen, RunScreen)
 
         release_advance = threading.Event()
-        real_advance = screen._supervisor.advance
+        real_advance = screen._session._supervisor.advance
 
         def blocked_advance(state):
             release_advance.wait(timeout=10)
             return real_advance(state)
 
-        monkeypatch.setattr(screen._supervisor, "advance", blocked_advance)
+        monkeypatch.setattr(screen._session._supervisor, "advance", blocked_advance)
         screen._start_advance()
         await pilot.pause(0.1)
         assert screen._transitioning is True
@@ -352,7 +362,7 @@ async def test_double_submit_starts_only_one_transition(tmp_path, monkeypatch):
         assert isinstance(screen, RunScreen)
 
         advance_calls = []
-        real_advance = screen._supervisor.advance
+        real_advance = screen._session._supervisor.advance
         gate = threading.Event()
 
         def counting_advance(state):
@@ -360,7 +370,7 @@ async def test_double_submit_starts_only_one_transition(tmp_path, monkeypatch):
             gate.wait(timeout=10)
             return real_advance(state)
 
-        monkeypatch.setattr(screen._supervisor, "advance", counting_advance)
+        monkeypatch.setattr(screen._session._supervisor, "advance", counting_advance)
 
         screen._start_advance()
         screen._start_advance()
@@ -401,7 +411,7 @@ async def test_unmount_does_not_bypass_orderly_shutdown(tmp_path, monkeypatch):
             await pilot.pause(0.05)
         screen = app.screen
         assert isinstance(screen, RunScreen)
-        assert screen._lock is not None
+        assert screen._session is not None
 
         app.pop_screen()
         for _ in range(50):
@@ -435,13 +445,13 @@ async def test_app_exit_during_blocked_advance_waits_for_cleanup(tmp_path, monke
         assert isinstance(screen, RunScreen)
 
         release_advance = threading.Event()
-        real_advance = screen._supervisor.advance
+        real_advance = screen._session._supervisor.advance
 
         def blocked_advance(state):
             release_advance.wait(timeout=10)
             return real_advance(state)
 
-        monkeypatch.setattr(screen._supervisor, "advance", blocked_advance)
+        monkeypatch.setattr(screen._session._supervisor, "advance", blocked_advance)
         screen._start_advance()
         await pilot.pause(0.1)
         assert screen._transitioning is True
@@ -626,11 +636,13 @@ async def test_app_exit_retains_lock_when_server_stop_fails(tmp_path, monkeypatc
         # race these assertions against a fresh in-flight attempt.
         assert "server_stop_attempted" in call_log
         # Attempt finished, but not cleanly: lock and server ownership
-        # retained.
+        # retained -- RunSession never nulls its own references (see
+        # RunScreen._session's docstring), so the faithful "not released"
+        # signal is its SessionState rather than an identity check.
         assert screen.shutdown_clean is False
         assert _lock_path(repo.common_dir()).exists()
-        assert screen._server is not None
-        assert screen._lock is not None
+        assert screen._session is not None
+        assert screen._session.state is rt.SessionState.CLEANUP_UNRESOLVED
 
         # Let the automatic retry coordinator run so this screen actually
         # finishes its lifecycle (with a permanently-failing stop(), it
@@ -640,7 +652,7 @@ async def test_app_exit_retains_lock_when_server_stop_fails(tmp_path, monkeypatc
         def _eventually_succeeds() -> None:
             call_log.append("server_stop_attempted")
 
-        screen._server.stop = _eventually_succeeds  # type: ignore[method-assign]
+        screen._session._server.stop = _eventually_succeeds  # type: ignore[method-assign]
 
 
 @pytest.mark.asyncio
@@ -715,7 +727,7 @@ async def test_shutdown_during_blocked_initialization_retries_after_failed_stop(
 
         screen.action_request_shutdown()
         # Shutdown is waiting on _init_done_event; server.start() is still
-        # blocked, so nothing has been torn down yet and _server must
+        # blocked, so nothing has been torn down yet and the session must
         # still be owned once start() finally returns.
         time.sleep(0.2)
         assert _lock_path(repo.common_dir()).exists()
@@ -726,23 +738,29 @@ async def test_shutdown_during_blocked_initialization_retries_after_failed_stop(
                 break
             await pilot.pause(0.05)
 
-        # First attempt failed to stop cleanly: server and lock retained.
-        assert screen._shutdown_clean is False
-        assert screen._server is not None
-        assert screen._lock is not None
-        assert _lock_path(repo.common_dir()).exists()
-
-        # Retry: this time stop() succeeds.
-        screen.action_request_shutdown()
-        for _ in range(100):
-            if not _lock_path(repo.common_dir()).exists():
-                break
-            await pilot.pause(0.05)
+        # RunSession.close() retries server.stop() internally (up to
+        # rt._CLEANUP_ATTEMPTS times, see ADR 0009), so a stop() that
+        # fails only once may already be confirmed within this single
+        # external shutdown attempt -- this test's original premise (a
+        # single transient failure always forces a second external
+        # action_request_shutdown() call) no longer holds unconditionally.
+        # What must still hold regardless of how many internal retries it
+        # took: the lock is never released while unresolved, and it is
+        # eventually released once stop() actually succeeds.
+        assert screen._session is not None
+        if not screen.shutdown_clean:
+            assert screen._session.state is rt.SessionState.CLEANUP_UNRESOLVED
+            assert _lock_path(repo.common_dir()).exists()
+            # Retry: this time stop() succeeds.
+            screen.action_request_shutdown()
+            for _ in range(100):
+                if not _lock_path(repo.common_dir()).exists():
+                    break
+                await pilot.pause(0.05)
 
     assert not _lock_path(repo.common_dir()).exists()
-    assert screen._server is None
-    assert screen._lock is None
-    assert call_log.count("server_stop") == 2
+    assert screen._session.state is rt.SessionState.CLOSED
+    assert call_log.count("server_stop") >= 2
 
 
 @pytest.mark.asyncio
@@ -781,17 +799,21 @@ async def test_return_to_browser_retries_transient_stop_failure(tmp_path, monkey
                 break
             await pilot.pause(0.05)
 
-        assert screen._shutdown_clean is False
-        assert _lock_path(repo.common_dir()).exists()
-
-        screen.action_request_shutdown()
-        for _ in range(100):
-            if not _lock_path(repo.common_dir()).exists():
-                break
-            await pilot.pause(0.05)
+        # RunSession.close() retries server.stop() internally (up to
+        # rt._CLEANUP_ATTEMPTS times, see ADR 0009), so a single transient
+        # failure may already be confirmed within this one
+        # action_request_shutdown() call -- a second press of "q"/Return
+        # is no longer guaranteed to be necessary, only harmless if tried.
+        if not screen._shutdown_clean:
+            assert _lock_path(repo.common_dir()).exists()
+            screen.action_request_shutdown()
+            for _ in range(100):
+                if not _lock_path(repo.common_dir()).exists():
+                    break
+                await pilot.pause(0.05)
 
     assert not _lock_path(repo.common_dir()).exists()
-    assert call_log.count("server_stop") == 2
+    assert call_log.count("server_stop") >= 1
 
 
 @pytest.mark.asyncio
@@ -1121,13 +1143,13 @@ async def test_stack_removal_unmount_race_cannot_hide_screen_from_exit(tmp_path,
             await pilot.pause(0.05)
 
         release_advance = threading.Event()
-        real_advance = screen._supervisor.advance
+        real_advance = screen._session._supervisor.advance
 
         def blocked_advance(state):
             release_advance.wait(timeout=10)
             return real_advance(state)
 
-        monkeypatch.setattr(screen._supervisor, "advance", blocked_advance)
+        monkeypatch.setattr(screen._session._supervisor, "advance", blocked_advance)
         screen._start_advance()
         await pilot.pause(0.1)
         assert screen._transitioning is True
@@ -1221,15 +1243,28 @@ async def test_detached_lock_release_only_failure_remains_registered_and_retries
                 break
             await pilot.pause(0.05)
 
-        original_release = screen._lock.release
+        # RunSession wraps the SupervisorLock in a _LockLease
+        # (session._lease._lock); patch the underlying lock's release()
+        # directly, one level below RunSession's own retry logic, so this
+        # test observes RunSession.close() retrying the release itself
+        # rather than a fake shortcut.
+        original_release = screen._session._lease._lock.release
 
         def _flaky_release():
             release_calls["n"] += 1
             if release_calls["n"] == 1:
-                raise Exception("simulated transient lock-release failure")
+                # Must be a LockError specifically: RunSession.close()
+                # only treats a release failure as retryable
+                # (SessionState.RELEASE_PENDING, skipping stop() on
+                # retry) when lease.release() raises LockError -- any
+                # other exception type propagates uncaught by that
+                # branch, which would make the retry re-invoke stop() on
+                # an already-cleared server instead of skipping it, as
+                # the assertion below would otherwise incorrectly show.
+                raise LockError("simulated transient lock-release failure")
             return original_release()
 
-        monkeypatch.setattr(screen._lock, "release", _flaky_release)
+        monkeypatch.setattr(screen._session._lease._lock, "release", _flaky_release)
 
         app.pop_screen()
         await pilot.pause()
@@ -1455,13 +1490,13 @@ async def test_registry_membership_clears_only_after_quiescence_and_clean_releas
             await pilot.pause(0.05)
 
         release_advance = threading.Event()
-        real_advance = screen._supervisor.advance
+        real_advance = screen._session._supervisor.advance
 
         def blocked_advance(state):
             release_advance.wait(timeout=10)
             return real_advance(state)
 
-        monkeypatch.setattr(screen._supervisor, "advance", blocked_advance)
+        monkeypatch.setattr(screen._session._supervisor, "advance", blocked_advance)
         screen._start_advance()
         await pilot.pause(0.1)
         assert screen._transitioning is True
@@ -1478,12 +1513,17 @@ async def test_registry_membership_clears_only_after_quiescence_and_clean_releas
                 break
             await pilot.pause(0.05)
 
-        # First stop() attempt failed: still registered, not ready.
-        assert screen in app._owned_run_screens
-        assert screen.shutdown_clean is False
-
-        # Retry succeeds: now quiescent and clean, so it may finalize.
-        screen.action_request_shutdown()
+        # RunSession.close() retries server.stop() internally (up to
+        # rt._CLEANUP_ATTEMPTS times, see ADR 0009), so a stop() that
+        # fails only once may already be confirmed within this single
+        # external shutdown attempt -- unlike before RunSession adoption,
+        # a second external action_request_shutdown() is not guaranteed
+        # to be needed. If it wasn't already clean, retry until it is;
+        # either way the screen must still be registered and unfinalized
+        # throughout, and finalized only once genuinely clean.
+        if not screen.shutdown_clean:
+            assert screen in app._owned_run_screens
+            screen.action_request_shutdown()
         for _ in range(100):
             if screen not in app._owned_run_screens:
                 break
@@ -1520,5 +1560,8 @@ async def test_no_leftover_cleanup_task_lock_or_server_after_clean_exit(tmp_path
     assert not _lock_path(repo.common_dir()).exists()
     assert not app._owned_run_screens
     assert not app._run_screen_cleanup_tasks
-    assert screen._server is None
-    assert screen._lock is None
+    # RunSession never nulls its own server/lock references on a clean
+    # close() (see RunScreen._session's docstring); the faithful "fully
+    # released" signal is its terminal SessionState.
+    assert screen._session is not None
+    assert screen._session.state is rt.SessionState.CLOSED
