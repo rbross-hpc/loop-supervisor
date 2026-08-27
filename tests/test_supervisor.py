@@ -9,6 +9,7 @@ from loop_supervisor.state import RunOptions
 from loop_supervisor.supervisor import (
     PHASE_AWAITING_INPUT,
     PHASE_DONE,
+    PHASE_OPERATIONAL_FAILURE,
     PHASE_PLANNING,
     LoopError,
     Supervisor,
@@ -727,6 +728,13 @@ def test_resume_rejects_unregistered_task_directory(tmp_path):
 
 
 def test_task_identity_mismatch_from_builder_raises(tmp_path):
+    # Prior to durable operational-failure handling for ContractError,
+    # this asserted `pytest.raises(ContractError)` around `run()`: the
+    # exception escaped advance()'s dispatch loop entirely, so nothing
+    # was ever persisted. ContractError is now classified as an
+    # operational failure like every other role-invocation error, so
+    # run() converts it to LoopError (see Supervisor.run()'s
+    # OPERATIONAL_FAILURE branch) and the failure is durable.
     runner = ScriptedRunner(
         {
             "loop-planner": [_planner_ready(task_id="task-1")],
@@ -738,8 +746,13 @@ def test_task_identity_mismatch_from_builder_raises(tmp_path):
 
     from loop_supervisor.contracts import ContractError
 
-    with pytest.raises(ContractError):
+    with pytest.raises(LoopError) as excinfo:
         supervisor.run(state)
+    assert isinstance(excinfo.value.__cause__, ContractError)
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+    assert state.last_error is not None
+    assert state.last_error["kind"] == "contract"
+    assert state.last_error["retryable"] is True
 
 
 def test_auditor_decision_request_routes_to_architect_then_planner(tmp_path):
@@ -802,6 +815,9 @@ def test_planner_origin_decision_call_order_unaffected(tmp_path):
 
 
 def test_architect_must_answer_the_requested_question(tmp_path):
+    # See test_task_identity_mismatch_from_builder_raises: ContractError is
+    # now a durable operational failure, so run() converts it to LoopError
+    # instead of letting it escape raw.
     runner = ScriptedRunner(
         {
             "loop-planner": [_planner_ready(decision_required=True)],
@@ -813,8 +829,13 @@ def test_architect_must_answer_the_requested_question(tmp_path):
 
     from loop_supervisor.contracts import ContractError
 
-    with pytest.raises(ContractError):
+    with pytest.raises(LoopError) as excinfo:
         supervisor.run(state)
+    assert isinstance(excinfo.value.__cause__, ContractError)
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+    assert state.last_error is not None
+    assert state.last_error["kind"] == "contract"
+    assert state.last_error["retryable"] is True
 
 
 def test_planner_complete_with_active_worktree_fails_closed(tmp_path):

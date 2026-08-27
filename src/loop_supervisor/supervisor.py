@@ -521,7 +521,13 @@ class Supervisor:
                 phase_before=phase_before,
                 phase_after=state.phase,
             )
-        except (AgentInvocationError, PhaseTimeoutError, GitError, DecisionError) as exc:
+        except (
+            AgentInvocationError,
+            PhaseTimeoutError,
+            GitError,
+            DecisionError,
+            ContractError,
+        ) as exc:
             return self._handle_operational_failure(
                 state,
                 exc=exc,
@@ -1367,6 +1373,15 @@ def _classify_operational_failure(
             False,
             "Resume to retry after the OpenCode server/startup problem is resolved.",
         )
+    if isinstance(exc, ContractError):
+        return (
+            failed_phase,
+            True,
+            False,
+            "The role returned output that does not satisfy its contract. Resume "
+            "to retry the phase; if it recurs, the agent prompt or the contract "
+            "schema may have drifted.",
+        )
     return (failed_phase, True, False, None)
 
 
@@ -1383,6 +1398,8 @@ def _error_kind(exc: Exception) -> str:
         return "decision"
     if isinstance(exc, OpenCodeError):
         return "opencode_startup"
+    if isinstance(exc, ContractError):
+        return "contract"
     return "unknown"
 
 

@@ -358,7 +358,9 @@ persists an `OperationalErrorRecord` (without tracebacks or secrets) into
 `last_error` on `RunState`, sets `phase = "operational_failure"`, and
 exits. The next `resume` or TUI retry replays from the `retry_phase`
 recorded in the error record. Examples: OpenCode network/timeout errors,
-ordinary Git/filesystem errors, merge conflicts requiring operator repair.
+ordinary Git/filesystem errors, merge conflicts requiring operator repair,
+and a role's structured output exhausting its malformed-output retries or
+failing a downstream identity check (`ContractError`, `kind="contract"`).
 
 **Terminal failures** are non-recoverable policy violations. The supervisor
 sets `phase = "failed"` and exits. Examples: revision/replan/architect
