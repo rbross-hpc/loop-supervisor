@@ -282,6 +282,49 @@ tracked and addressed in follow-up work rather than dropped.
     through `_handle_operational_failure()`, not introduced by item 1's
     `ContractError` fix; not previously called out in this backlog.
 
+25. **`init --destination` bootstraps a fork of the supervisor, not a
+    new project.**
+    `src/loop_supervisor/cli.py:211-253`,
+    `docs/decisions/0004-template-bootstrap.md`,
+    `docs/decisions/0007-tracked-files-only-bootstrap-copy.md`.
+    ADR 0004 states copy-mode exists to seed "new, unrelated projects."
+    In practice `cmd_init_copy()` copies every Git-tracked file — all 60
+    — of which only about 8 belong in a new project. The destination
+    receives the 21-file `src/loop_supervisor/` package, the 17-file
+    test suite, ADRs 0001-0009 (all describing supervisor internals:
+    lock leases, `RunSession`, TUI threading), this project's own
+    `docs/plans/`, a 380-line `README.md` about the supervisor, and a
+    `pyproject.toml` declaring `name = "loop-supervisor"` with its
+    dependencies and console script.
+
+    This is not merely untidy. The planner, builder, and auditor all
+    read `README.md` and `docs/decisions/` as canonical truth, so a
+    freshly bootstrapped project points them at the supervisor's design
+    rather than their own. The auditor holds `pytest *` and is asked to
+    judge "test adequacy," so every audit would run the supervisor's
+    ~790 tests. The builder holds `edit: allow` over supervisor source
+    unrelated to its task.
+
+    Wanted in a new project: `.opencode/agents/*` (4),
+    `docs/decisions/README.md` (the ADR format contract),
+    `opencode.json`, `.gitignore`, `.env.example`. Not wanted:
+    everything else.
+
+    ADR 0007 tightened copy-mode's *safety* (tracked-files allowlist
+    instead of a name denylist) but did not revisit its *scope*; the
+    two ADRs together still promise a project seed and deliver a fork.
+
+    Fixing this is a design change, not a filter tweak, and should
+    resolve an open question first: does a bootstrapped project
+    **depend on** `loop-supervisor` as an installed tool, or **vendor**
+    it? Today it implicitly vendors. The tool model would additionally
+    require the packaged-resource bootstrap ADR 0007 defers, since
+    copy-mode currently cannot run from an installed wheel. A real fix
+    also needs generated (not copied) `README.md` and `pyproject.toml`
+    scaffolds — the codebase has no templating today — and would
+    require amending ADRs 0004 and 0007 and reworking
+    `tests/test_cli_init.py`, which pins current behavior.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in
