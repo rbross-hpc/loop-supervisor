@@ -315,6 +315,50 @@ ruff format --check .
 mypy src
 ```
 
+### Testing discipline
+
+These recurred across multiple review cycles in this project's own
+history, each costing a full audit pass to catch. Follow them up front
+instead:
+
+- **A test claiming to pin a historical defect must be verified failing
+  against that defect's actual prior commit, not a hand-written
+  injection.** Check out (or `git show`) the source file as it existed
+  at the commit before the fix, run the new test against it in an
+  isolated trial environment, and confirm it fails there and passes
+  against the fixed code. A hand-written injection only proves the test
+  detects *your* injection, which is frequently a different (and often
+  more broken) bug than the one that actually shipped.
+  - **Mandatory probe self-check:** before trusting the trial run's
+    result, assert something that is only true of the *old* code being
+    tested (e.g. `hasattr(module, "_SomeSymbolAddedByTheFix") is False`).
+    An editable install (`pip install -e`) can silently resolve imports
+    back to the live repo instead of the swapped-in old source, which
+    once produced a false "all tests pass" result that looked like a
+    successful pin.
+- **Self-authored injections only prove the test detects the
+  injection** — not that it detects the real defect. If a bug must be
+  injected to exercise a test before the real fix exists, treat that as
+  a provisional check only, superseded by the prior-commit verification
+  above once the fix is real.
+- **Never re-implement the guard inline inside a test.** A test that
+  duplicates the production guard's logic (e.g. re-checking a state
+  condition itself, or calling an API shape the old code already
+  handled correctly) can pass against both fixed and unfixed code,
+  proving nothing. Call the real method/path being verified.
+- **Verify every new test failing-first.** Confirm it fails before the
+  fix and passes after. A "wrong-reason pass" — e.g. a nominally
+  concurrent test that runs synchronously and passes regardless of the
+  race — is caught by watching for suspicious signals like uniform
+  runtime rather than by the assertion alone.
+- **Use `pytest.raises(X, match=...)`.** A bare `pytest.raises(X)` can
+  pass on a wrong-cause exception of the same type.
+- **Assertions are additive only.** `git diff <base> -- tests/ | grep
+  "^-" | grep assert` should be empty for any change claiming to be a
+  pure addition. A test needing a change beyond a declared,
+  pre-authorised surface should stop and be reported rather than edited
+  around silently.
+
 ## Current limitations
 
 - One task in flight at a time (no parallel task worktrees).

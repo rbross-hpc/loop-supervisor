@@ -57,18 +57,106 @@ repository. An operator who encounters a retained lock after a failed
 cleanup must verify no OpenCode process survives before passing
 `--recover-stale-lock`.
 
+Unifying these two cleanup owners behind the headless runtime's
+`RunSession` is planned (the TUI does not yet construct or drive one);
+this ADR describes both as they exist today and will be revised once
+`RunScreen` adopts `RunSession` rather than its own
+`_cleanup_resources()`.
+
 In the headless runtime, "confirmed" means a bounded retry sequence
-(`_confirm_server_stopped()` in `runtime.py`, `_CLEANUP_ATTEMPTS` calls to
-`server.stop()` on the exact same `OpenCodeServer` instance, with bounded
-backoff between attempts) has produced at least one attempt that returned
-without raising. The server handle itself is never discarded between
-retries, and a later successful attempt fully confirms cleanup regardless
-of how many earlier attempts failed transiently. This same bounded retry
-is applied uniformly to a failed `server.start()`, to the runner handoff
-and `supervisor.run()` (success or failure), and to the ordinary
-post-run cleanup path — there is exactly one cleanup-confirmation
+(`_confirm_server_stopped()` in `runtime.py`, up to `_CLEANUP_ATTEMPTS`
+calls to `server.stop()` on the exact same `OpenCodeServer` instance, with
+bounded backoff between attempts) has produced at least one attempt that
+returned without raising. The server handle itself is never discarded
+between retries, and a later successful attempt fully confirms cleanup
+regardless of how many earlier attempts failed transiently. This same
+bounded retry is applied uniformly to a failed `server.start()`, to the
+runner handoff and `supervisor.run()` (success or failure), and to the
+ordinary post-run cleanup path — there is exactly one cleanup-confirmation
 mechanism in the headless runtime, not one path for startup and a
 different one for run completion.
+
+`_CLEANUP_ATTEMPTS` bounds a single confirmation *attempt sequence*, not
+the total number of `server.stop()` calls a session may make in its
+lifetime — those are not the same thing. `RunSession.stop_server()` lets
+a caller (typically a shutdown thread) force a bounded stop() attempt
+ahead of `close()`, primarily to unblock an `advance()`/
+`run_to_completion()` call that is stuck for up to its full role timeout,
+by tearing down the HTTP transport underneath it. `stop_server()` never
+releases the lock or touches the lease — only `close()` does either,
+matching the single-owner rule above — so calling it is always safe in
+the direction that matters: retaining the lock while the server has been
+stopped is ADR-compliant, but releasing the lock before a *confirmed*
+stop would not be. Each `stop_server()`/`start_server()` failure spends
+its own `_CLEANUP_ATTEMPTS` budget and stashes the outcome for the
+`close()` that follows to consume instead of re-spending it, so a single
+session can call `server.stop()` more than `_CLEANUP_ATTEMPTS` times
+across multiple such sequences (an operator forcing repeated
+`stop_server()` calls, each retried up to `_CLEANUP_ATTEMPTS` times, is
+the ordinary case). A confirmed outcome, once recorded, is never
+overwritten by a later failing attempt.
+
+### Concurrency and the quiescence barrier
+
+`RunSession` (`runtime.py`) may be driven from more than one thread, as
+the Textual TUI does once it adopts it (an `advance()`/
+`run_to_completion()` worker thread plus a shutdown worker thread; see
+ADR 0008). Two primitives enforce the lock's safety under that
+concurrency, and the distinction between them is load-bearing:
+
+- **`_state_lock`** (an `RLock`) guards the session's mutable bookkeeping
+  and serializes `close()` against `stop_server()`. It is held across
+  `server.stop()` deliberately: `OpenCodeServer.stop()` takes the
+  server's own internal `_cleanup_lock`, so both cleanup paths must
+  acquire the two locks in the same order, or `close()` and
+  `stop_server()` could acquire them in opposite orders — an ABBA
+  deadlock. It is just as deliberately **never** held across
+  `supervisor.advance()`/`Supervisor.run()`: doing so would deadlock the
+  very scenario `stop_server()` exists to handle, since a shutdown
+  thread calling `stop_server()` to unblock a stuck transition would
+  instead block behind that same transition.
+- **`_advance_done`** (an `Event`) is a quiescence barrier, not a mutex.
+  A transition clears it on entry and sets it in a `finally`; `close()`
+  waits on it, unboundedly and before acquiring `_state_lock`, before
+  touching the lease. This is what makes lock release safe: the
+  repository lock may never be released while a transition may still be
+  mutating Git or run state. The wait has no safe bound — that hazard is
+  exactly what this ADR exists to prevent, and no Python thread can be
+  force-killed — so `stop_server()` is the only sanctioned way to
+  shorten it, by tearing down the transition's HTTP transport rather
+  than by timing out the wait itself.
+
+This barrier is a precondition on **both** of `RunSession`'s run-driving
+entry points, not just the per-phase one. `Supervisor.run()`
+(`supervisor.py:697-723`) loops calling `self.advance(state)` on the
+*supervisor* directly to drive a run to a terminal phase; it never calls
+back through `RunSession.advance()`, so `RunSession.run_to_completion()`
+(the wrapper CLI/TUI code actually calls) clears and sets
+`_advance_done` around that entire call itself, exactly mirroring
+`advance()`'s own contract, or a concurrent `close()` would have nothing
+to wait on for the whole duration of a multi-phase run.
+
+Because both entry points release `_state_lock` for the duration of the
+actual supervisor work, either can return to find that a concurrent
+`close()` already claimed the session in the meantime (lock released,
+session `CLOSED` or beyond). Any write-back performed after such a call
+returns — restoring `SessionState.STARTED`, or writing the resulting
+`RunState` back onto the session — must therefore be guarded
+by a check that the session is still the same activity that started it
+(`_state_is()`, consumed via `_restore_started_unless_closed()` and
+`_store_run_state_unless_closed()` — the former restores `STARTED`, the
+latter writes the run state back onto the session), never applied
+unconditionally. The real result of the finished work is still returned
+to the immediate caller either way; only writing it back into a session
+that no longer owns it is forbidden. Skipping this guard previously let
+a finishing transition resurrect a session that had already released its
+lock into something that looked live and advanceable again.
+
+Concurrent `advance()`/`run_to_completion()` calls on the same session
+are not supported — a second call is rejected by the same state guard
+that rejects it single-threaded — but `close()`, `stop_server()`, and
+`abort_active_invocations()` are all safe to call from another thread
+while one is in flight; `close()` is simply the one that waits.
 
 **Primary errors take precedence over cleanup errors.** Whenever a
 primary operation (a run/resume failure, a startup failure) and a
@@ -91,6 +179,44 @@ primary exception is already being handled; if there is no primary to
 preserve (an otherwise fully successful run followed by unconfirmable
 cleanup), that exact interrupt is what propagates, annotated with a
 retained-lock note, rather than being converted into a `RuntimeError_`.
+
+**`RunSession.close()` takes the caller's declared outcome and the
+exception to annotate as two independent parameters
+(`close(*, outcome: _RunOutcome, error: BaseException | None)`), not one
+combined value.** An earlier design folded both into a single nullable
+`primary` parameter; that conflated three genuinely independent facts —
+whether the run succeeded, whether the caller is holding an exception,
+and which retained-lock explanation an operator should see — into one
+value, which made "the run failed, but no exception is available to
+report" inexpressible. That shape silently reported such a failure using
+the success wording ("run completed but ..."), a regression that shipped
+once already. `outcome` is the caller's own declaration, independent of
+whether `error` is given: a caller may know a run failed after already
+having caught and discarded the exception that proved it, and a cleanup
+interrupt during an otherwise-successful run is still worth annotating
+regardless of `outcome`. `_cleanup_prefix(outcome, *, startup_interrupted)`
+is a pure function of exactly these two facts, with `startup_interrupted`
+taking precedence — a startup interrupt is itself a kind of failure, so
+its caller need not also pass `outcome=FAILED`.
+
+This split is also what makes `close()` usable by a **detached caller**
+— one invoking cleanup from inside an already-executing `except` block,
+as the TUI's `_release_after_failed_init()` does today and as `app.py`'s
+other exception handlers will once they adopt `RunSession` — rather than
+only from `__exit__` with a body exception still actively propagating.
+`close()` reads `sys.exc_info()` exactly once, at its own entry, to tell
+these two shapes apart: whether the exception a caller passes as `error`
+is the one currently unwinding through this exact call (in which case a
+retained lock is reported by annotating that exception, since it will
+already propagate on its own) or one the caller is holding after having
+already caught it elsewhere (in which case a retained lock must be
+raised, or a detached caller retrying `close()` on a stale exception
+would get a silent return instead of the raise it needs to detect a
+failed retry). Deriving `outcome` from ambient exception state instead of
+taking it as an explicit parameter would not work for this shape: ambient
+state answers "is something unwinding right now", not "did the operation
+this call is concluding succeed", and a detached caller's `except` block
+means those two questions can disagree.
 
 This precedence applies to the *complete* outcome of an operation, not
 just its first failure point. In `OpenCodeServer.create_session()`,
@@ -220,3 +346,11 @@ than re-executing blindly.
   environment variables, or secrets.
 - State schema v3 (additive migration from v2) carries the new fields
   without breaking existing runs.
+- `RunSession` may be safely driven by multiple threads (a transition
+  worker plus a shutdown worker), with the lock never released while a
+  transition is in flight, at the cost of an unbounded wait in `close()`
+  that only `stop_server()` can shorten.
+- `close()`'s explicit `outcome`/`error` parameters make "failed with no
+  exception in hand" and "detached caller re-invoking cleanup from an
+  `except` block" both representable, closing the gap that previously
+  let a failed run report success wording.
