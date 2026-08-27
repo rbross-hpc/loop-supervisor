@@ -244,12 +244,19 @@ def check_task_identity(
     other_objective: str,
     other_role: str,
 ) -> None:
-    """Raise ContractError if a downstream role's task identity drifted."""
+    """Raise ContractError if a downstream role's task identity drifted.
+
+    `task_id` must match exactly: it is the sole identifier carrying task
+    identity across roles, and drift there means the role is reporting on
+    the wrong task. `objective` is not required to match verbatim -- no
+    role's prompt asks for a verbatim echo, and downstream roles routinely
+    (and legitimately) paraphrase or summarize the objective rather than
+    quoting it. It is only checked for presence, to catch a role that
+    dropped the field entirely.
+    """
     if other_task_id != task_id:
         raise ContractError(
             f"{other_role} task_id {other_task_id!r} does not match expected {task_id!r}"
         )
-    if other_objective != objective:
-        raise ContractError(
-            f"{other_role} objective does not match expected objective for {task_id!r}"
-        )
+    if not other_objective.strip():
+        raise ContractError(f"{other_role} objective must not be empty for {task_id!r}")

@@ -340,15 +340,18 @@ def test_check_task_identity_mismatched_id():
         )
 
 
-def test_check_task_identity_mismatched_objective():
-    with pytest.raises(ContractError):
-        check_task_identity(
-            task_id="a",
-            objective="obj1",
-            other_task_id="a",
-            other_objective="obj2",
-            other_role="auditor",
-        )
+def test_check_task_identity_allows_restated_objective():
+    # A downstream role paraphrasing the objective (rather than echoing it
+    # verbatim) is not identity drift: no agent prompt asks for a verbatim
+    # echo, so exact string equality on `objective` was rejecting honest
+    # restatements. `task_id` remains the load-bearing identity check.
+    check_task_identity(
+        task_id="a",
+        objective="obj1",
+        other_task_id="a",
+        other_objective="obj2",
+        other_role="auditor",
+    )
 
 
 def test_check_task_identity_match_ok():
@@ -358,4 +361,55 @@ def test_check_task_identity_match_ok():
         other_task_id="a",
         other_objective="obj",
         other_role="builder",
+    )
+
+
+def test_check_task_identity_rejects_empty_objective():
+    with pytest.raises(ContractError, match="objective"):
+        check_task_identity(
+            task_id="a",
+            objective="obj",
+            other_task_id="a",
+            other_objective="",
+            other_role="builder",
+        )
+
+
+def test_check_task_identity_rejects_whitespace_only_objective():
+    with pytest.raises(ContractError, match="objective"):
+        check_task_identity(
+            task_id="a",
+            objective="obj",
+            other_task_id="a",
+            other_objective="   \n\t",
+            other_role="auditor",
+        )
+
+
+def test_check_task_identity_rejects_mismatched_id_despite_matching_objective():
+    with pytest.raises(ContractError, match="task_id"):
+        check_task_identity(
+            task_id="task-002",
+            objective="same objective",
+            other_task_id="task-003",
+            other_objective="same objective",
+            other_role="builder",
+        )
+
+
+def test_check_task_identity_allows_restated_objective_live_regression():
+    # Verbatim strings from the live test-run auditor rejection that
+    # motivated this fix (run 2dba05654b5e, task-002).
+    check_task_identity(
+        task_id="task-002",
+        objective=(
+            "Implement the generic logfmt LogRecord parsing layer (module + "
+            "tests) that turns OpenCode log lines into typed records, per "
+            "ADR 0001, without touching the query/subcommand layer."
+        ),
+        other_task_id="task-002",
+        other_objective=(
+            "Implement a generic logfmt LogRecord parser with malformed-line accounting and tests."
+        ),
+        other_role="auditor",
     )
