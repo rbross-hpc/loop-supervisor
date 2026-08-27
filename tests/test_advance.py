@@ -495,6 +495,34 @@ def test_advance_operational_failure_persists_last_error(tmp_path):
     assert state.last_error["retryable"] is True
 
 
+def test_operational_failure_message_redacts_secret_from_environment(tmp_path, monkeypatch):
+    """A durable OperationalErrorRecord must not carry a secret that
+    happens to appear in an error message, closing the loop end-to-end
+    through _handle_operational_failure() (see _sanitize_message() /
+    tests/test_sanitize.py for the unit-level coverage)."""
+    from loop_supervisor.opencode import AgentInvocationError
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-" + "x" * 95)
+    secret = "sk-ant-api03-" + "x" * 95
+
+    class FailingRunner:
+        def run_agent(self, **_):
+            raise AgentInvocationError(f"network error: auth rejected for key {secret}")
+
+    supervisor, repo = _make_supervisor(tmp_path, FailingRunner())
+    state = supervisor.start_new_run()
+
+    outcome = supervisor.advance(state)
+
+    assert outcome.status == AdvanceStatus.OPERATIONAL_FAILURE
+    assert state.last_error is not None
+    assert secret not in state.last_error["message"]
+    assert "[redacted:ANTHROPIC_API_KEY]" in state.last_error["message"]
+
+    reloaded = load_state(repo.common_dir(), state.run_id)
+    assert secret not in reloaded.last_error["message"]
+
+
 def test_advance_retry_operational_failure(tmp_path):
     from loop_supervisor.opencode import AgentInvocationError
 

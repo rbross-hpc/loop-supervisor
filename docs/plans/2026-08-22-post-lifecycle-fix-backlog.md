@@ -49,14 +49,46 @@ tracked and addressed in follow-up work rather than dropped.
    not classified or recorded consistently with other operational
    failures.
 
-3. **Persisted "sanitized" messages may include HTTP response bodies or
-   server output.**
-   `src/loop_supervisor/opencode.py:614-618`,
-   `src/loop_supervisor/supervisor.py:1376-1380`.
-   `OperationalErrorRecord` is documented (ADR 0009) as never containing
-   secrets/headers/env vars, but response-body truncation is not the same
-   as redaction; a response body could still contain sensitive content
-   from the target repository or environment.
+3. ~~Persisted "sanitized" messages may include HTTP response bodies or
+   server output.~~ **Resolved (partially).**
+   `_sanitize_message()` (`src/loop_supervisor/supervisor.py:1406-1479`)
+   previously only truncated to 2000 characters; its docstring claimed it
+   also stripped secret patterns, but it did not, and ADR 0009 and
+   `state.py`'s `OperationalErrorRecord` docstring both asserted an
+   absolute "never contains ... environment variables, or secrets"
+   guarantee with nothing in the code enforcing it. Confirmed exploitable
+   via `_diagnostic_output()` (`opencode.py:820-828`): OpenCode's child
+   process inherits the full environment (`opencode.py:578`), so a
+   startup failure that echoes an env-derived auth error survives
+   head-only truncation intact (the secret sits in the early lines,
+   which `msg[:2000]` keeps).
+
+   Fixed by giving `_sanitize_message()` two real passes before
+   truncating: (1) literal replacement of secret-named environment
+   variable values (`*_KEY`, `*_TOKEN`, `*_SECRET`, etc.) above a minimum
+   length, to avoid mangling unrelated text on a short/placeholder value
+   under a secret-sounding name (a real hazard found while designing
+   this — e.g. `OPENAI_API_KEY=rross` blindly redacting every occurrence
+   of `rross`, including in unrelated file paths); (2) a pattern backstop
+   for common credential formats (`sk-...`, `ghp_...`, `Bearer ...`) that
+   catches keys not in *this* process's own environment (e.g. the
+   OpenCode child's own provider key). Truncation now keeps both a
+   leading and trailing portion instead of only the head, so it no
+   longer discards the actual terminating error in favor of a startup
+   banner. Also truncated the one previously-unbounded server-supplied
+   channel, `opencode.py`'s `_extract_text()` error field. ADR 0009 and
+   the `OperationalErrorRecord` docstring now describe this as a
+   best-effort guarantee, not an absolute one.
+
+   Explicitly **not** resolved: arbitrary repository content in Git/
+   contract-error messages (a merge conflict's file list, an agent's
+   malformed output quoting a config value) is not distinguishable from
+   legitimate diagnostic content and can still appear verbatim. The
+   record remains a `0o600` file under `.git/loop-supervisor/runs/`
+   (never committed, never transmitted) and should be treated as
+   sensitive regardless. See `tests/test_sanitize.py` and
+   `docs/decisions/0009-supervisor-lock-and-operational-failure-semantics.md`'s
+   Consequences section.
 
 4. **Symlinked lock/state ancestor directories, and state-file symlinks,
    are not rejected.**

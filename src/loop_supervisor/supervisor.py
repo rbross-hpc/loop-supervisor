@@ -9,6 +9,8 @@ irreversible without inspection: it depends only on `AgentRunner` and
 
 from __future__ import annotations
 
+import os
+import re
 import uuid
 from collections import Counter
 from dataclasses import dataclass
@@ -1403,11 +1405,85 @@ def _error_kind(exc: Exception) -> str:
     return "unknown"
 
 
+# Env var *names* treated as likely to hold a secret. Matched against
+# os.environ keys, not values -- deliberately broad (better to redact an
+# unrelated "MY_TOKEN" than to miss a real one) since the actual
+# candidate strings being scrubbed always come from _this_ process's own
+# environment, never from user-controlled text.
+_SECRET_ENV_NAME_RE = re.compile(
+    r"(API_KEY|_KEY$|^KEY$|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTHORIZATION|ACCESS_KEY)",
+    re.IGNORECASE,
+)
+
+# Below this length, a secret-named env var's value is not redacted. Real
+# credentials (API keys, tokens) are comfortably longer than this in every
+# common format (shortest observed: 40-character AWS/GitHub secrets); a
+# short value under a secret-sounding name is far more likely to be an
+# unset placeholder, a username typed into the wrong field, or a test
+# fixture, and blind literal-value replacement at that length risks
+# silently mangling unrelated diagnostic text (e.g. a value that happens
+# to match part of a file path).
+_MIN_REDACTABLE_SECRET_LENGTH = 16
+
+# Common credential formats, matched even when the value never appeared
+# in *this* process's environment (e.g. it belongs to the OpenCode child
+# process's own configuration, or was echoed back by a remote provider).
+# This is a backstop, not a guarantee: it recognizes known shapes, not
+# arbitrary secrets.
+_SECRET_PATTERN_RE = re.compile(
+    r"sk-[A-Za-z0-9_-]{16,}"
+    r"|gh[pousr]_[A-Za-z0-9]{36}"
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|(?i:authorization|bearer)\s*:?\s*\S+"
+)
+
+# Total persisted message length, and how much of that budget goes to the
+# leading portion. Kept well under _diagnostic_output()'s raw ceiling
+# (500 stdout lines, each unbounded) so a single record can never grow
+# unreasonably large, while still preserving both ends of the original
+# text: the earliest lines (often a banner or config echo) and the latest
+# lines (often the actual terminal error), rather than only the former.
+_MAX_MESSAGE_LENGTH = 2000
+_MESSAGE_HEAD_LENGTH = 500
+
+
+def _redact_secrets(msg: str) -> str:
+    """Best-effort removal of known-secret environment values and common
+    credential formats from `msg`. Not a guarantee that no secret can
+    ever appear (arbitrary repository content or novel credential
+    formats are out of scope), but removes the specific, high-confidence
+    cases this process can identify."""
+    for name, value in os.environ.items():
+        if len(value) < _MIN_REDACTABLE_SECRET_LENGTH:
+            continue
+        if not _SECRET_ENV_NAME_RE.search(name):
+            continue
+        if value in msg:
+            msg = msg.replace(value, f"[redacted:{name}]")
+    return _SECRET_PATTERN_RE.sub("[redacted]", msg)
+
+
+def _truncate_message(msg: str) -> str:
+    """Bound `msg` to `_MAX_MESSAGE_LENGTH`, keeping both a leading and a
+    trailing portion rather than only the head. A pure head-truncation
+    would keep whatever came first (often a startup banner) and discard
+    whatever came last (often the actual terminating error), which is
+    exactly backwards for diagnosing a failure."""
+    if len(msg) <= _MAX_MESSAGE_LENGTH:
+        return msg
+    marker = "\n…[truncated]…\n"
+    tail_length = _MAX_MESSAGE_LENGTH - _MESSAGE_HEAD_LENGTH - len(marker)
+    return msg[:_MESSAGE_HEAD_LENGTH] + marker + msg[-tail_length:]
+
+
 def _sanitize_message(msg: str) -> str:
-    """Truncate and strip potential secret patterns from error messages."""
-    if len(msg) > 2000:
-        msg = msg[:2000] + "…"
-    return msg
+    """Redact known secrets, then truncate, for inclusion in a durable
+    `OperationalErrorRecord.message`. Redaction runs first so a secret
+    cannot survive by falling on the truncation boundary. Best-effort:
+    see `_redact_secrets()`'s docstring for what is and is not covered.
+    """
+    return _truncate_message(_redact_secrets(msg))
 
 
 def _parse_with_retry(parse, raw, *, retries, rerun):

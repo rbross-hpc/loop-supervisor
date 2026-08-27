@@ -178,8 +178,12 @@ class DecisionRequest:
 class OperationalErrorRecord:
     """A sanitized, durable record of an operational failure.
 
-    Never contains tracebacks, full request payloads, environment variables,
-    authorization headers, or secrets."""
+    Never contains tracebacks, full request payloads, or authorization
+    headers. Known-secret environment variable values and common
+    credential formats in `message` are redacted on a best-effort basis
+    by supervisor.py's `_sanitize_message()`; this is not a guarantee
+    against arbitrary sensitive content (see ADR 0009's Consequences).
+    """
 
     error_id: str
     kind: str

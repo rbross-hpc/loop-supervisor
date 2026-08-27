@@ -354,7 +354,8 @@ screen.
 Failures are classified into two categories:
 
 **Operational failures** are transient and resumable. The supervisor
-persists an `OperationalErrorRecord` (without tracebacks or secrets) into
+persists an `OperationalErrorRecord` (without tracebacks, with known
+secrets redacted on a best-effort basis — see Consequences) into
 `last_error` on `RunState`, sets `phase = "operational_failure"`, and
 exits. The next `resume` or TUI retry replays from the `retry_phase`
 recorded in the error record. Examples: OpenCode network/timeout errors,
@@ -395,7 +396,23 @@ than re-executing blindly.
 - Non-recoverable failures produce a clear `failed` state; no further
   resume is possible without starting a new run.
 - The `OperationalErrorRecord` never contains tracebacks, HTTP headers,
-  environment variables, or secrets.
+  or request payloads (no code path interpolates any of these into a
+  persisted message). Environment-variable values and common credential
+  formats (API keys, bearer tokens) are redacted on a best-effort basis
+  by `_sanitize_message()`: it replaces literal values of secret-named
+  environment variables (`*_KEY`, `*_TOKEN`, `*_SECRET`, etc., above a
+  minimum length to avoid mangling unrelated text on a short/placeholder
+  value) and known credential formats (`sk-...`, `ghp_...`, `Bearer ...`)
+  wherever they appear in the message, then truncates, keeping both a
+  leading and trailing portion so truncation cannot itself discard the
+  terminating error while preserving an early banner. This is a
+  best-effort backstop, not a guarantee: arbitrary repository content
+  (e.g. a `git merge` conflict listing, or an agent's malformed output
+  quoting a config value) can still appear verbatim, since it cannot be
+  distinguished from legitimate diagnostic content. The record is
+  persisted to a `0o600` file under `.git/loop-supervisor/runs/` (never
+  committed, never transmitted) and should still be treated as
+  sensitive.
 - State schema v3 (additive migration from v2) carries the new fields
   without breaking existing runs.
 - `RunSession` may be safely driven by multiple threads (a transition

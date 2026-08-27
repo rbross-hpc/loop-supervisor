@@ -21,6 +21,7 @@ from loop_supervisor.opencode import (
     _BoundedCloseAttempt,
     _close_bounded,
     _close_request_local_client,
+    _extract_text,
     _start_bounded_close,
 )
 
@@ -739,6 +740,23 @@ def test_send_prompt_rejects_non_list_parts(tmp_path):
     with _FakeServer(tmp_path, config) as server:
         with pytest.raises(AgentInvocationError):
             server.run_agent(agent="loop-planner", directory=tmp_path, prompt="go")
+
+
+def test_extract_text_truncates_server_supplied_error_field():
+    # Unlike the sibling response-body error messages (which slice
+    # response.text[:500] before formatting), this one previously
+    # interpolated the server-supplied `error` field with no bound at
+    # all -- the widest untruncated channel for arbitrarily large or
+    # sensitive server-side content to reach a persisted error message.
+    huge_error = "x" * 5000
+    data = {"info": {"error": huge_error}}
+
+    with pytest.raises(
+        AgentInvocationError, match="agent 'loop-planner' returned an error"
+    ) as excinfo:
+        _extract_text(data, agent="loop-planner")
+
+    assert len(str(excinfo.value)) <= 500
 
 
 # -- timeout precedence over abort failure ------------------------------------
