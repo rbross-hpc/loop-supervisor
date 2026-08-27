@@ -4445,7 +4445,17 @@ def test_close_detached_caller_with_startup_interrupt_pending_raises(tmp_path):
     this is the corner no prior test exercised, where the old
     parameter-identity check (`primary is startup_exc`) and the
     currently-unwinding check could disagree: the interrupt object is
-    still the same object, but it is no longer unwinding."""
+    still the same object, but it is no longer unwinding.
+
+    The discriminating call is `close(error=the_interrupt)`: passing the
+    interrupt object explicitly while it is *not* the exception currently
+    unwinding. A bare `close()` does NOT discriminate here -- under the
+    pre-split API that is equivalent to `primary=None`, which the old
+    code already raised on, so a bare call passes against both the fixed
+    and the unfixed code and proves nothing. (An earlier version of this
+    test called bare `close()` for exactly that reason and was vacuous;
+    confirmed by running it against the pre-split runtime, where it
+    passed despite the bug still being present.)"""
     import loop_supervisor.runtime as rt
     from loop_supervisor.runtime import RuntimeError_
 
@@ -4468,7 +4478,7 @@ def test_close_detached_caller_with_startup_interrupt_pending_raises(tmp_path):
         assert session._startup_exception is the_interrupt
 
         with pytest.raises(RuntimeError_, match="startup was interrupted; the"):
-            session.close()
+            session.close(error=the_interrupt)
 
     assert session.state is rt.SessionState.CLEANUP_UNRESOLVED
     notes = getattr(the_interrupt, "__notes__", [])
