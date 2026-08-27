@@ -97,11 +97,17 @@ tracked and addressed in follow-up work rather than dropped.
     monotonic deadline check independent of httpx's own timeout
     semantics.
 
-12. **Define cleanup/error precedence for startup failures where server
-    ownership remains unresolved**, beyond what blocker-1/blocker-4 fixes
+12. ~~Define cleanup/error precedence for startup failures where server
+    ownership remains unresolved, beyond what blocker-1/blocker-4 fixes
     already cover — specifically for TUI initialization (parallel to the
     headless runtime's `_startup_failure()` handling added in this
-    round).
+    round).~~ **Resolved** by the `RunSession` TUI migration
+    (`docs/decisions/0009-supervisor-lock-and-operational-failure-semantics.md`):
+    `RunScreen._do_initialize` now constructs and enters a `RunSession`,
+    and TUI startup failures route through `RunSession.__enter__()` /
+    `start_server()` into the same `_startup_failure()` the headless
+    runtime uses (`runtime.py:869-925`) — exactly the parallel this item
+    asked for, not a separate TUI-specific implementation.
 
 13. **Acceptance tests for**: orphan-child prevention under process
     kill/crash, stale-lock recovery end-to-end, repeated cleanup attempts
@@ -139,9 +145,18 @@ tracked and addressed in follow-up work rather than dropped.
 
 ## Tier 5 — documentation/testing debt
 
-20. **Correct ADR 0008's claim that worker and event-loop threads share
-    no state** — `LiveActivityReducer` ownership and `call_from_thread`
-    boundaries should be described accurately.
+20. **Document `LiveActivityReducer`'s single-owner-thread contract in
+    ADR 0008.** `src/loop_supervisor/tui/live.py:104-127`. The reducer
+    asserts (`_assert_owner()`) that only the Textual event-loop thread
+    ever touches it, constructed with `owner_thread=threading.current_thread()`
+    at `RunScreen.__init__`; ADR 0008 does not document this contract or
+    the assertion that enforces it. (The other half of this item — the
+    ADR's blanket "worker threads do not share state with the event
+    loop" claim — was corrected during the `RunSession` TUI migration:
+    see ADR 0008's Consequences section, which now distinguishes UI/
+    widget state, which is not shared, from lifecycle state, which is
+    deliberately shared and guarded by `threading.Event`/`RunSession`'s
+    own concurrency primitives.)
 
 21. **Correct merge-conflict repair instructions.**
     `README.md:267-272`.
@@ -152,20 +167,56 @@ tracked and addressed in follow-up work rather than dropped.
     fakes exercise, and cleanup failures under real process-kill
     scenarios rather than monkeypatched `stop()`.
 
-23. **Investigate 9 hidden `ResourceWarning`s in the full test suite**,
-    found while adding `filterwarnings` for
+23. ~~Investigate hidden `ResourceWarning`s in the full test suite~~
+    **Closed: investigated, no cleanup gap found.** Originally raised
+    while adding `filterwarnings` for
     `PytestUnhandledThreadExceptionWarning`/`PytestUnraisableExceptionWarning`
-    (see `pyproject.toml`'s `[tool.pytest.ini_options]`). Surfaced via
-    `pytest tests/ -W always`; not escalated to errors in that change
-    because a blanket `filterwarnings = ["error"]` fails the suite
-    immediately on these. One is substantive:
-    `tests/test_opencode.py::test_start_bounded_close_reports_thread_start_failure`
-    leaks a running subprocess (`ResourceWarning: subprocess NNNNN is
-    still running`) — in a fault-injection test specifically about
-    cleanup behavior, this may indicate a real cleanup gap rather than
-    test sloppiness and should be looked at first. The other two are
-    unclosed-file `ResourceWarning`s attributed to pytest's own
-    `logging`/`python` plugin internals and are likely not ours to fix.
+    (see `pyproject.toml`'s `[tool.pytest.ini_options]`), surfaced via
+    `pytest tests/ -W always`, and reported as "9 hidden ResourceWarnings"
+    with one — a subprocess leak attributed to
+    `test_start_bounded_close_reports_thread_start_failure` — flagged as
+    possibly a real cleanup gap since it appeared in a fault-injection
+    test specifically about cleanup behavior.
+
+    That specific claim was investigated directly and does not hold. A
+    standalone reproduction of the malformed-anchor-identity startup
+    path (the scenario most resembling the flagged test) confirmed the
+    launcher is correctly reaped on that failure: `launcher.poll()`
+    returns `-9` (terminated, not running), `launcher.stdout.closed` is
+    `True`, and `OpenCodeServer._pending_launcher` is cleared to `None`
+    — exactly what `stop()`'s cleanup contract requires.
+
+    The warning itself turned out to be a GC-attribution artifact rather
+    than a fixed location: `ResourceWarning` fires at object
+    finalization, which pytest attributes to whichever test happens to
+    be executing when the garbage collector runs the finalizer — not the
+    test that created the leaked-looking object. Confirmed by four
+    independent probes: (a) the subprocess warning's *blamed test name*
+    changed across repeated full-suite runs (seen attributed to both
+    `test_malformed_anchor_identity_retains_pending_until_reaped` and the
+    originally-named `test_start_bounded_close_reports_thread_start_failure`);
+    (b) the *count* of hidden warnings varied across runs (3, 8, and 9
+    observed, so the original "9" was one sample of a non-deterministic
+    count, not a stable figure); (c) running `test_opencode.py` alone
+    never reproduces the subprocess warning at all; (d) instrumenting
+    `subprocess.Popen.__del__` to report any object still running at
+    finalization time found none across a full-suite run in which the
+    warning still fired under plain `-W always` — and running under
+    `-X tracemalloc=30` (which perturbs GC timing) made the warning
+    disappear entirely, which is itself consistent with a
+    finalization-timing artifact and inconsistent with a real fixed
+    leak.
+
+    Net effect: no code change is warranted, and the entry naming a
+    specific test as the suspected leak site should not be trusted as
+    stable — GC-attributed warnings will keep landing on whichever test
+    is unlucky enough to be running at the next collection cycle. Escalating
+    `filterwarnings` to `error` for `ResourceWarning` remains inadvisable,
+    not because of a latent bug but because it would fail the suite
+    non-deterministically based on GC timing rather than on any
+    particular test's own behavior. The other two (pytest/`logging`
+    internals) are unaffected by this finding and remain believed not
+    ours to fix.
 
 ## Out of scope for this backlog
 

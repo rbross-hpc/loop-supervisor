@@ -54,8 +54,14 @@ three threads that are never coordinated by Textual's own message queue.
 ## Consequences
 
 - Supervisor core remains testable without any Textual dependency.
-- Worker threads do not share state with the event loop; all UI mutation is
-  serialized through the Textual message queue.
+- UI/widget state is not shared with worker threads: no widget is ever
+  mutated from a background thread, and all UI mutation is serialized
+  through the Textual message queue. Lifecycle state is a deliberate
+  exception to this — the init, advance, and shutdown worker threads
+  share `RunScreen._session` plus a handful of `threading.Event`/`bool`
+  fields (`_shutdown_requested`, `_shutdown_clean`, `_init_done_event`,
+  `_advance_done_event`) directly, guarded by `RunSession`'s own
+  concurrency primitives (ADR 0009) rather than by the message queue.
 - SSE failure leaves the durable UI fully usable; no run is failed due to
   an SSE transport error.
 - `loop-supervisor tui --project PATH` is the new entry point for the UI.
