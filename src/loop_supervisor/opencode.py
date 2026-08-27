@@ -1387,7 +1387,7 @@ def _extract_text(data: dict[str, Any], *, agent: str) -> str:
         )
     error = info.get("error")
     if error:
-        raise AgentInvocationError(f"agent {agent!r} returned an error: {error}")
+        raise AgentInvocationError(f"agent {agent!r} returned an error: {error}"[:500])
 
     structured = info.get("structured")
     if structured is None:
