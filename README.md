@@ -351,8 +351,12 @@ instead:
   concurrent test that runs synchronously and passes regardless of the
   race — is caught by watching for suspicious signals like uniform
   runtime rather than by the assertion alone.
-- **Use `pytest.raises(X, match=...)`.** A bare `pytest.raises(X)` can
-  pass on a wrong-cause exception of the same type.
+- **Prefer `pytest.raises(X, match=...)` for new tests, especially any
+  claiming to pin a specific defect.** A bare `pytest.raises(X)` can
+  pass on a wrong-cause exception of the same type; this is not yet a
+  consistent convention across the existing suite, but it should be
+  followed going forward rather than copied from surrounding bare
+  examples.
 - **Assertions are additive only.** `git diff <base> -- tests/ | grep
   "^-" | grep assert` should be empty for any change claiming to be a
   pure addition. A test needing a change beyond a declared,
