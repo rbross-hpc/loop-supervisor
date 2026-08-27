@@ -110,21 +110,18 @@ from textual.widgets import (
     TextArea,
 )
 
-from ..git import GitError, GitRepo
-from ..locking import LockError, SupervisorLock
-from ..opencode import InvocationRef, OpenCodeServer, OpenCodeServerConfig
+from ..git import GitRepo
+from ..opencode import InvocationRef
 from ..opencode_events import OpenCodeEventError, normalize_global_event
+from ..runtime import RunSession, _RunOutcome, new_run_session, resume_run_session
 from ..sse import SSEClient, SSEConnectionState
-from ..state import RunOptions, RunState, list_runs, load_state
+from ..state import RunOptions, RunState, list_runs
 from ..supervisor import (
     PHASE_AWAITING_INPUT,
     PHASE_DONE,
     PHASE_FAILED,
     PHASE_OPERATIONAL_FAILURE,
     AdvanceStatus,
-    FailurePersistenceError,
-    LoopError,
-    Supervisor,
 )
 from .live import LiveActivityReducer
 from .messages import (
@@ -356,7 +353,6 @@ class RunScreen(Screen):
         self._options = options or _DEFAULT_OPTIONS
         self._recover_stale_lock = recover_stale_lock
 
-        self._repo: GitRepo | None = None
         # Captured once in on_mount(). self.app walks the live parent chain
         # and raises NoActiveAppError once this screen has been detached
         # (e.g. during its own pop_screen at the end of shutdown), so
@@ -364,9 +360,14 @@ class RunScreen(Screen):
         # (notably _shutdown_worker's final pop_screen call) use this
         # cached reference instead of the `self.app` property.
         self._app_ref: LoopSupervisorApp | None = None
-        self._lock: SupervisorLock | None = None
-        self._server: OpenCodeServer | None = None
-        self._supervisor: Supervisor | None = None
+        # Owns the lock, OpenCode server, and Supervisor as a single unit
+        # (see runtime.RunSession). None until _do_initialize_locked
+        # successfully constructs it; from that point on it is entered
+        # (RunSession.__enter__ already called) and never re-entered, and
+        # this screen calls close() directly on the init/shutdown threads
+        # rather than using a `with` block, since acquisition and release
+        # happen on two different background threads.
+        self._session: RunSession | None = None
         self._state: RunState | None = None
         self._input_provider = _QueueInputProvider()
 
@@ -462,42 +463,51 @@ class RunScreen(Screen):
         if self._shutdown_requested:
             return
 
+        if self._run_id is None:
+            session = new_run_session(
+                self._project_root,
+                self._options,
+                input_provider=self._input_provider,
+                recover_stale_lock=self._recover_stale_lock,
+                operation="tui",
+            )
+        else:
+            session = resume_run_session(
+                self._project_root,
+                self._run_id,
+                input_provider=self._input_provider,
+                recover_stale_lock=self._recover_stale_lock,
+                operation="tui",
+            )
+
         try:
-            repo = GitRepo(self._project_root)
-        except GitError as exc:
-            self.app.call_from_thread(self._set_banner, f"[red]Error: {escape(str(exc))}[/red]")
+            session.__enter__()
+        except Exception as exc:
+            # RunSession.__enter__ is its own cleanup boundary: on failure
+            # it has already released the lock (or left it RELEASE_PENDING
+            # if release itself failed) before re-raising, so there is
+            # nothing further for this screen to release here. No banner
+            # distinction is drawn between a Git error, a lock error, and
+            # a resume-validation error: RunSession reports all of them as
+            # RuntimeError_, which was already true for the resume case
+            # before this migration.
+            self.app.call_from_thread(
+                self._set_banner, f"[red]Initialization error: {escape(str(exc))}[/red]"
+            )
             return
-        self._repo = repo
-        common_dir = repo.common_dir()
+        # From here on this screen owns `session` and is responsible for
+        # calling close() on it exactly once cleanup is safe to attempt
+        # (see _cleanup_resources()); __enter__ succeeding means the lock
+        # is held and _session must be set before any further failure, so
+        # a subsequent exception still finds it and can release it.
+        self._session = session
 
         if self._shutdown_requested:
-            return
-
-        lock = SupervisorLock(
-            common_dir,
-            operation="tui",
-            run_id=self._run_id,
-            integration_path=str(repo.root),
-            recover_stale=self._recover_stale_lock,
-        )
-        try:
-            lock.acquire()
-        except LockError as exc:
-            self.app.call_from_thread(
-                self._set_banner, f"[red]Lock error: {escape(str(exc))}[/red]"
-            )
-            return
-        self._lock = lock
-
-        try:
-            self._do_initialize_locked(repo, common_dir)
-        except FailurePersistenceError as exc:
-            self.app.call_from_thread(
-                self._set_banner,
-                "[red]OpenCode startup failed, and the failure record could not be "
-                f"persisted: {escape(str(exc))}[/red]",
-            )
             self._release_after_failed_init()
+            return
+
+        try:
+            self._do_initialize_locked()
         except Exception as exc:
             self.app.call_from_thread(
                 self._set_banner, f"[red]Initialization error: {escape(str(exc))}[/red]"
@@ -510,125 +520,79 @@ class RunScreen(Screen):
         thread, never concurrently with shutdown (shutdown waits on
         _init_done_event before touching these same resources).
 
-        Uses the same ownership-preserving routine as normal shutdown, in
-        the same order (SSE, then server, then lock), so a failed
-        initialization can never discard a still-live worker/process or
-        release the lock on a transient failure. Deliberately does not
-        finalize (deregister/pop) this screen itself: ready_to_finalize
-        requires _init_done_event, which is not set until _initialize()'s
-        finally block runs *after* this method returns — see the
-        finalization check there, which handles both the clean and
-        not-yet-clean cases uniformly with normal shutdown."""
-        server = self._server
-        if server is not None:
-            try:
-                server.abort_active_sessions()
-            except Exception:
-                pass
-        self._cleanup_resources()
+        Uses the same ownership-preserving routine as normal shutdown
+        (_cleanup_resources(), which itself asks the session to abort any
+        active invocations before closing it), so a failed initialization
+        can never discard a still-live worker/process or release the lock
+        on a transient failure. Deliberately does not finalize
+        (deregister/pop) this screen itself: ready_to_finalize requires
+        _init_done_event, which is not set until _initialize()'s finally
+        block runs *after* this method returns — see the finalization
+        check there, which handles both the clean and not-yet-clean cases
+        uniformly with normal shutdown.
 
-    def _do_initialize_locked(self, repo: GitRepo, common_dir: Path) -> None:
-        """Everything from state creation/validation through SSE startup.
+        Passes outcome=FAILED and error=None to _cleanup_resources,
+        deliberately never the caught exception itself. Two reasons:
 
-        Called only while holding the just-acquired lock. Any exception
-        propagates to `_do_initialize`'s handler, which cleans up whatever
-        this method had already assigned to self._server/self._sse_client
-        before the lock is released.
+        1. Every caller of this method is on a failure path (a caught
+           exception already reported via the banner, or shutdown racing
+           a startup that never got to report success), so silently
+           defaulting to close()'s own outcome=SUCCEEDED would reintroduce
+           the exact wording defect ADR 0009 documents (a failure
+           reported as "run completed but...").
+        2. error=None (rather than the caught exception) matters for
+           correctness, not just wording, and is easy to get backwards:
+           this method always runs synchronously from inside the caller's
+           own `except Exception as exc:` block (see _do_initialize), so
+           sys.exc_info() still reports `exc` for the whole duration of
+           this call. Passing error=exc would make close() treat `exc` as
+           the exception actively unwinding through this exact call and
+           silently return without raising on an unresolved cleanup --
+           correct for __exit__, where the caller's exception genuinely
+           keeps propagating on its own, but wrong here, since this
+           screen's except block does not re-raise `exc`; it only renders
+           a banner and returns normally. Passing error=exc would
+           therefore make an unresolved cleanup invisible: close() would
+           return silently, this method's own exception handling would
+           never fire, and shutdown_clean would stay True with the lock
+           still on disk. error=None makes this a genuine detached call,
+           so close() raises on an unresolved cleanup exactly as it
+           should."""
+        self._cleanup_resources(outcome=_RunOutcome.FAILED)
+
+    def _do_initialize_locked(self) -> None:
+        """Everything from server startup through SSE startup.
+
+        Called only once ``self._session`` has successfully entered (lock
+        held, state created/validated). Any exception propagates to
+        ``_do_initialize``'s handler, which cleans up whatever this method
+        had already assigned to ``self._sse_client`` before the session
+        (and therefore the lock) is released.
         """
         if self._shutdown_requested:
             return
 
-        if self._run_id is None:
-            supervisor = Supervisor(
-                repo=repo,
-                runner=_UnstartedRunner(),
-                git_common_dir=common_dir,
-                input_provider=self._input_provider,
-                options=self._options,
-            )
-            state = supervisor.start_new_run()
-        else:
-            state = load_state(common_dir, self._run_id)
-            supervisor = Supervisor(
-                repo=repo,
-                runner=_UnstartedRunner(),
-                git_common_dir=common_dir,
-                input_provider=self._input_provider,
-            )
-            try:
-                state = supervisor.resume(state)
-            except LoopError:
-                # Resume validation failed: the saved state is untouched and
-                # OpenCode was never started. Nothing further to clean up
-                # beyond the lock, which the caller's except handler does.
-                raise
-
-        if self._shutdown_requested:
-            return
-
-        server_config = OpenCodeServerConfig(
-            executable=state.options.opencode_executable,
-            startup_timeout=state.options.opencode_startup_timeout,
-        )
-        server = OpenCodeServer(self._project_root, server_config)
-        server.add_observer(_InvocationObserver(self))
-        # Take ownership as soon as the object exists — ownership begins the
-        # moment the server may acquire a process, not only after a
-        # successful start(). Otherwise a start() that partially spawned a
-        # process and then failed cleanup would drop the only handle to it.
-        self._server = server
-        try:
-            server.start()
-        except Exception as exc:
-            # server.start() already terminates the process and releases its
-            # own resources on any failure past subprocess creation; this
-            # call is defense in depth in case that guarantee is ever
-            # violated by a future change, not the primary cleanup path.
-            try:
-                server.stop()
-            except Exception:
-                pass
-            # A run ID already exists at this point (either just-created or
-            # loaded from disk), so persist a durable operational failure
-            # rather than only showing a transient banner. The failure is
-            # durable: the user can resume this run later (from the CLI or
-            # the run browser) to retry, exactly like any other
-            # operational_failure discovered inside advance(). Unlike a
-            # transient startup exception, a failure to persist that record
-            # must never be silently discarded: the UI would otherwise
-            # imply a durable failure exists when it does not, and the user
-            # would have no way to know resume will simply repeat the same
-            # unrecorded failure.
-            try:
-                supervisor.record_external_failure(state, exc=exc, phase=state.phase)
-            except FailurePersistenceError as persist_exc:
-                raise persist_exc from exc
-            raise
-
-        supervisor.runner = server
-        self._server = server
-        self._supervisor = supervisor
-        self._state = state
+        session = self._session
+        assert session is not None
+        session.add_observer(_InvocationObserver(self))
+        session.start_server()
+        self._state = session.run_state
 
         if self._shutdown_requested:
             # Shutdown was requested while we were still starting the
-            # server. Do NOT abort sessions / stop the server / clear
-            # self._server here: doing so would duplicate (and race)
-            # _shutdown_worker's own teardown, which is already waiting on
-            # _init_done_event before touching these same resources (see
-            # _do_shutdown). Simply returning leaves self._server owned;
+            # server. Do NOT abort sessions / stop the server here: doing
+            # so would duplicate (and race) _shutdown_worker's own
+            # teardown, which is already waiting on _init_done_event
+            # before touching this same session (see _do_shutdown).
+            # Simply returning leaves self._session owned;
             # _initialize()'s finally block sets _init_done_event right
             # after this method returns, at which point _do_shutdown
-            # proceeds to perform the single canonical teardown. Clearing
-            # self._server here (regardless of whether stop() "succeeded")
-            # would let a later stop() failure go unnoticed by the
-            # shutdown worker, since it would see self._server as None and
-            # assume the server was already gone.
+            # proceeds to perform the single canonical teardown.
             return
 
-        if server.base_url:
+        if session.base_url:
             sse = SSEClient(
-                server.base_url,
+                session.base_url,
                 on_event=self._on_sse_event,
                 on_state_change=self._on_sse_state_change,
                 on_notice=self._on_sse_notice,
@@ -729,14 +693,21 @@ class RunScreen(Screen):
         plain ``threading.Event`` and is the sole exception: it exists only
         to let the shutdown worker (also a background thread) know when it
         is safe to proceed, and carries no application state itself.
+
+        Distinct from ``RunSession``'s own internal ``_advance_done``
+        barrier (see runtime.py's thread-safety docstring): that one
+        gates ``RunSession.close()`` against this exact call, while this
+        one gates this screen's own ``_do_shutdown`` (which waits on it
+        before touching the session at all). ``session.advance()``
+        already provides the former; this screen still needs the latter
+        to know when it may safely call ``close()``.
         """
-        supervisor = self._supervisor
-        state = self._state
-        if supervisor is None or state is None:
+        session = self._session
+        if session is None or self._state is None:
             self._advance_done_event.set()
             return
         try:
-            outcome = supervisor.advance(state)
+            outcome = session.advance()
             self.app.call_from_thread(self.post_message, AdvanceCompleted(outcome))
         except Exception as exc:
             self.app.call_from_thread(self.post_message, AdvanceFailed(exc))
@@ -982,15 +953,43 @@ class RunScreen(Screen):
             # separate signal (self._shutdown_clean / shutdown_clean).
             self._shutdown_complete_event.set()
 
-    def _cleanup_resources(self) -> None:
-        """Ownership-preserving teardown of SSE worker, OpenCode server, and
-        the repository lock, in that order.
+    def _cleanup_resources(
+        self, *, outcome: _RunOutcome = _RunOutcome.SUCCEEDED, error: BaseException | None = None
+    ) -> None:
+        """Ownership-preserving teardown of the SSE worker, then the
+        session (OpenCode server + repository lock together, via
+        ``RunSession.close()``).
 
-        Each owned reference is cleared only once the resource is
-        definitively released; a timed-out/failed stop retains the
-        reference so a later attempt can retry and so the lock is never
-        released while a subordinate resource may still be live. Sets
-        self._shutdown_clean only if everything was released.
+        SSE is torn down first since it is TUI-owned and RunSession has
+        no knowledge of it; a timed-out/failed stop retains the SSE
+        reference so a later attempt can retry. ``session.close()`` then
+        owns the server-stop/lock-release ordering and retry semantics
+        itself (see ADR 0009) — it is never null-checked and cleared here
+        the way the SSE client is, because RunSession tracks "is this
+        confirmed released" via its own SessionState rather than by
+        discarding its internal references, and re-invoking close() on
+        the same still-owned session is exactly how a retry is meant to
+        work. Sets self._shutdown_clean only if everything was released.
+
+        ``outcome``/``error`` are forwarded to ``session.close()``
+        unchanged and default to exactly what a bare ``close()`` call
+        defaults to (matching the CLI's ``__exit__`` with no body
+        exception): ordinary shutdown — requested via "q", the "Return to
+        runs" button, or app-level exit — is not itself evidence the run
+        failed, regardless of which phase the run happened to be in.
+        Only ``_release_after_failed_init()`` overrides these, since it
+        is a detached caller invoked from inside an active ``except``
+        block with a real failure already in hand.
+
+        RunSession.close() raises on an unresolved failure (its
+        single-owner cleanup contract, load-bearing for the headless
+        CLI's traceback guarantees); this screen's contract is instead
+        the non-raising shutdown_clean boolean the app-level exit-retry
+        loop depends on, so the raise is caught here and never allowed to
+        escape. Caught as BaseException, not Exception: an operator
+        KeyboardInterrupt/SystemExit raised from close() itself must
+        still leave the screen in the same "retry later" shape as any
+        other unresolved cleanup, not crash the shutdown worker.
         """
         clean = True
 
@@ -1003,37 +1002,23 @@ class RunScreen(Screen):
             else:
                 self._sse_client = None
 
-        if self._server is not None:
+        session = self._session
+        if session is not None:
             try:
-                self._server.stop()
-            except Exception:
-                # A stop() exception means at least one owned resource
-                # (possibly a live process) was not confirmed released.
-                # Retain the server object for retry and do NOT release the
-                # lock below.
-                clean = False
-            else:
-                self._server = None
-
-        # Only release the repository lock once the server is definitively
-        # gone: the accepted contract holds the lock through OpenCode
-        # shutdown (ADR 0009). If the server is still owned, keep the lock.
-        if self._server is None and self._lock is not None:
-            try:
-                self._lock.release()
-                self._lock = None
-            except Exception:
-                # release() only forgets its token on a definitive outcome,
-                # so a transient failure here means the lock file is most
-                # likely still present and still ours. Leave self._lock set.
+                session.close(outcome=outcome, error=error)
+            except BaseException:  # noqa: BLE001 - mapped to shutdown_clean, never re-raised
+                # CLEANUP_UNRESOLVED (server may still be alive) or
+                # RELEASE_PENDING (server confirmed gone, lock release
+                # itself failed) both retain what close() still owns;
+                # either way this screen has nothing further to release
+                # and must simply report "not clean" and let a later
+                # close() retry.
                 clean = False
                 self._set_banner_safe(
-                    "[red]Warning: could not release the repository lock; it may "
+                    "[red]Warning: could not confirm OpenCode/lock cleanup; it may "
                     "still be held. Manual inspection (or --recover-stale-lock "
                     "after this process exits) may be required.[/red]"
                 )
-        elif self._server is not None:
-            clean = False
 
         self._shutdown_clean = clean
 
@@ -1062,30 +1047,32 @@ class RunScreen(Screen):
 
         # 2. Ask any in-flight advance()'s OpenCode sessions to abort, then
         #    give the worker a bounded cooperative grace period to unwind.
-        server = self._server
-        if server is not None:
-            try:
-                server.abort_active_sessions()
-            except Exception:
-                pass
+        # RunSession.abort_active_invocations() is a no-op before startup
+        # and never raises (see its docstring), so no None-check or
+        # try/except is needed here the way the raw server call required.
+        session = self._session
+        if session is not None:
+            session.abort_active_invocations()
 
         if not self._advance_done_event.wait(timeout=_SHUTDOWN_GRACE_SECONDS):
             # 3. Escalate: the advance worker is still running past the
             #    grace period. Stopping the server breaks any blocked prompt
             #    transport so the worker's OpenCode call fails and it can
             #    unwind, instead of blocking until the (up to 1800s) role
-            #    timeout. This does not release the lock.
+            #    timeout. RunSession.stop_server() never releases the lock
+            #    or touches the lease -- only close() (in the final cleanup
+            #    step below) ever does either -- and, unlike the server
+            #    reference this replaced, is never cleared here: RunSession
+            #    tracks whether cleanup is confirmed via its own
+            #    SessionState, not by discarding self._session, and
+            #    stop_server() itself never raises (see its docstring), so
+            #    there is nothing here to catch.
             self._set_banner_safe(
                 "[yellow]Transition still running; stopping OpenCode to "
                 "release it, then finishing shutdown…[/yellow]"
             )
-            if self._server is not None:
-                try:
-                    self._server.stop()
-                except Exception:
-                    pass
-                else:
-                    self._server = None
+            if session is not None:
+                session.stop_server()
 
         # 4. Wait for the advance worker to FULLY unwind before releasing
         #    the lock. There is no safe bound here: the lock must not be
@@ -1179,11 +1166,6 @@ class _InvocationObserver:
             self._screen.post_message,
             InvocationFinished(invocation, error if isinstance(error, BaseException) else None),
         )
-
-
-class _UnstartedRunner:
-    def run_agent(self, **_: object) -> str:
-        raise LoopError("agent invoked before server was started")
 
 
 class LoopSupervisorApp(App):
