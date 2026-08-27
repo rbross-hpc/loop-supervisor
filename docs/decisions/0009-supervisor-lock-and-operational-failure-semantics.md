@@ -247,18 +247,21 @@ one, a retained lock must instead be *raised*, or a detached caller
 retrying `close()` would get a silent return instead of the raise it
 needs to detect a failed retry.
 
-This is precisely why `RunScreen._release_after_failed_init()` — which
-does run from inside its caller's own `except Exception as exc:` block —
-passes `error=None` rather than `error=exc`. Passing `exc` there would
-make `close()` treat it as the exception actively unwinding through this
-exact call (since `sys.exc_info()` still reports it for the whole
-duration of a synchronous call made from within that block), even though
-that `except` block does not re-raise `exc`; it only renders a banner and
-returns normally. `close()` would then report an unresolved cleanup by
-annotating `exc` and returning silently — invisible, since nothing further
-in that call chain re-raises `exc` — leaving `shutdown_clean` `True` with
-the lock still on disk. `error=None` makes this a genuine detached call,
-so `close()` raises on an unresolved cleanup exactly as it should.
+This is precisely why `RunScreen._release_after_failed_init()` always
+passes `error=None` rather than the caught exception, from either of its
+two call sites: one runs from inside its caller's own `except Exception
+as exc:` block, the other from a shutdown race that has no exception to
+pass at all. For the first, passing `exc` there would make `close()`
+treat it as the exception actively unwinding through this exact call
+(since `sys.exc_info()` still reports it for the whole duration of a
+synchronous call made from within that block), even though that `except`
+block does not re-raise `exc`; it only renders a banner and returns
+normally. `close()` would then report an unresolved cleanup by
+annotating `exc` and returning silently — invisible, since nothing
+further in that call chain re-raises `exc` — leaving `shutdown_clean`
+`True` with the lock still on disk. `error=None` makes every call here a
+genuine detached call, so `close()` raises on an unresolved cleanup
+exactly as it should.
 Deriving `outcome` from ambient exception state instead of taking it as
 an explicit parameter would not work for this shape either: ambient state
 answers "is something unwinding right now", not "did the operation this

@@ -540,23 +540,27 @@ class RunScreen(Screen):
            defaulting to close()'s own outcome=SUCCEEDED would reintroduce
            the exact wording defect ADR 0009 documents (a failure
            reported as "run completed but...").
-        2. error=None (rather than the caught exception) matters for
-           correctness, not just wording, and is easy to get backwards:
-           this method always runs synchronously from inside the caller's
-           own `except Exception as exc:` block (see _do_initialize), so
-           sys.exc_info() still reports `exc` for the whole duration of
-           this call. Passing error=exc would make close() treat `exc` as
-           the exception actively unwinding through this exact call and
-           silently return without raising on an unresolved cleanup --
-           correct for __exit__, where the caller's exception genuinely
-           keeps propagating on its own, but wrong here, since this
-           screen's except block does not re-raise `exc`; it only renders
-           a banner and returns normally. Passing error=exc would
-           therefore make an unresolved cleanup invisible: close() would
-           return silently, this method's own exception handling would
-           never fire, and shutdown_clean would stay True with the lock
-           still on disk. error=None makes this a genuine detached call,
-           so close() raises on an unresolved cleanup exactly as it
+        2. error=None matters for correctness, not just wording, and is
+           easy to get backwards -- particularly for one of this
+           method's two call sites. From _do_initialize's `except
+           Exception as exc:` block, passing error=exc instead would
+           make close() treat `exc` as the exception actively unwinding
+           through this exact call (sys.exc_info() still reports it for
+           the whole duration of a synchronous call made from within
+           that block) and silently return without raising on an
+           unresolved cleanup -- correct for __exit__, where the
+           caller's exception genuinely keeps propagating on its own,
+           but wrong here, since that except block does not re-raise
+           `exc`; it only renders a banner and returns normally. The
+           other call site (shutdown racing a startup that never got to
+           report success) is not in an except block at all and has no
+           exception to pass regardless. Either way, passing anything
+           other than error=None would risk making an unresolved
+           cleanup invisible: close() could return silently, this
+           method's own exception handling would never fire, and
+           shutdown_clean would stay True with the lock still on disk.
+           error=None makes every call here a genuine detached call, so
+           close() raises on an unresolved cleanup exactly as it
            should."""
         self._cleanup_resources(outcome=_RunOutcome.FAILED)
 
