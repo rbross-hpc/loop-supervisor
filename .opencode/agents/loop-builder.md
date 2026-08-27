@@ -29,7 +29,8 @@ Before modifying code:
 - retrieve relevant Falda memory when necessary
 
 After implementation:
-- run appropriate tests
+- write or extend tests covering the task's acceptance criteria
+- run the project's tests
 - inspect the resulting diff
 - commit the completed implementation to the current task branch
 - identify unresolved issues
@@ -48,8 +49,8 @@ The status must be exactly one of:
 The object must have this structure:
 
 {
-  "task_id": "ontology-007",
-  "objective": "Separate downloaded artifacts from scholarly work identity",
+  "task_id": "task-007",
+  "objective": "Short statement of the unit of work.",
   "status": "COMPLETE",
   "implementation_summary": "Summary of what was implemented.",
   "implementation_strategy": [
