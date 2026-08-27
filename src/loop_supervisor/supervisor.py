@@ -1031,13 +1031,25 @@ class Supervisor:
             guidance = state.pending_question.get("answer")
             state.pending_question = None
 
-        auditor_findings = None
+        required_changes = None
+        audit_findings = None
         if state.auditor_result is not None:
             auditor = AuditorResult.model_validate(state.auditor_result)
             if auditor.disposition is AuditorDisposition.REVISE:
-                auditor_findings = auditor.required_changes
+                required_changes = auditor.required_changes
+                # design_observations is deliberately withheld here: it is the
+                # auditor's scope/criteria-critique channel, routed only to
+                # the planner on REPLAN (see _build_planner_prompt). Handing
+                # it to the builder would invite the scope creep the auditor
+                # prompt explicitly tells it to avoid on REVISE.
+                audit_findings = auditor.findings
 
-        prompt = _build_builder_prompt(planner, findings=auditor_findings, guidance=guidance)
+        prompt = _build_builder_prompt(
+            planner,
+            required_changes=required_changes,
+            audit_findings=audit_findings,
+            guidance=guidance,
+        )
         raw = self.runner.run_agent(
             agent="loop-builder",
             directory=worktree.path,
@@ -1561,7 +1573,8 @@ def _build_architect_prompt(
 def _build_builder_prompt(
     planner: PlannerResult,
     *,
-    findings: list[str] | None,
+    required_changes: list[str] | None,
+    audit_findings: list[str] | None = None,
     guidance: str | None,
 ) -> str:
     lines = [
@@ -1574,10 +1587,17 @@ def _build_builder_prompt(
     if planner.relevant_files:
         lines.append("relevant_files:")
         lines.extend(f"- {f}" for f in planner.relevant_files)
-    if findings:
+    if required_changes:
         lines.append("")
         lines.append("The auditor requested these changes on your previous attempt:")
-        lines.extend(f"- {f}" for f in findings)
+        lines.extend(f"- {c}" for c in required_changes)
+    if audit_findings:
+        lines.append("")
+        lines.append(
+            "Supporting detail from the audit (context for the changes above, "
+            "not additional requirements):"
+        )
+        lines.extend(f"- {f}" for f in audit_findings)
     if guidance:
         lines.append("")
         lines.append(f"Additional guidance from the operator: {guidance}")
