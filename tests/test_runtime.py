@@ -5695,3 +5695,262 @@ def test_stop_server_during_blocked_run_to_completion_does_not_deadlock(tmp_path
                 run_thread.join(timeout=5)
 
             assert not run_thread.is_alive()
+
+
+# --- PermissionDenier wiring (headless permission-ask hang, backlog #27) ---
+
+
+def _fake_denier_class(call_log: list[str], *, denied_count: int = 0, denied_summary=None):
+    """A stand-in for permissions.PermissionDenier that records its own
+    lifecycle calls in `call_log` without any real HTTP/SSE activity."""
+
+    class FakeDenier:
+        def __init__(self, base_url: str) -> None:
+            call_log.append(f"denier_init:{base_url}")
+            self._denied_count = denied_count
+            self._denied_summary = list(denied_summary or [])
+
+        def start(self) -> None:
+            call_log.append("denier_start")
+
+        def stop(self) -> None:
+            call_log.append("denier_stop")
+
+        @property
+        def denied_count(self) -> int:
+            return self._denied_count
+
+        @property
+        def denied_summary(self) -> list[str]:
+            return list(self._denied_summary)
+
+    return FakeDenier
+
+
+def test_start_server_starts_permission_denier_with_server_base_url(tmp_path):
+    """start_server() must construct and start a PermissionDenier against
+    the server's own base_url once it is known -- this is the sole seam
+    that closes the headless permission.asked hang (backlog #27); SSE is
+    otherwise TUI-only."""
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    call_log: list[str] = []
+    fake_server = _FakeServer(call_log)
+
+    class FakeOCServer:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __new__(cls, *a, **kw):
+            return fake_server
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+    mp.setattr(rt, "PermissionDenier", _fake_denier_class(call_log))
+    try:
+        session = rt.new_run_session(tmp_path / "repo", _make_options())
+        with session:
+            session.start_server()
+            assert f"denier_init:{fake_server.base_url}" in call_log
+            assert "denier_start" in call_log
+    finally:
+        mp.undo()
+
+    assert "denier_stop" in call_log
+    assert call_log.index("denier_start") < call_log.index("denier_stop")
+
+
+def test_close_stops_permission_denier_before_server(tmp_path):
+    """The denier's SSE subscription must be torn down before the
+    server itself is stopped, not after: stopping the server first
+    would leave the denier's SSE client trying to read from a socket
+    the server has already closed."""
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    call_log: list[str] = []
+    fake_server = _FakeServer(call_log)
+
+    class FakeOCServer:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __new__(cls, *a, **kw):
+            return fake_server
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+    mp.setattr(rt, "PermissionDenier", _fake_denier_class(call_log))
+    try:
+        session = rt.new_run_session(tmp_path / "repo", _make_options())
+        with session:
+            session.start_server()
+    finally:
+        mp.undo()
+
+    assert call_log.index("denier_stop") < call_log.index("server_stop")
+
+
+def test_denied_permission_count_and_summary_readable_after_close(tmp_path):
+    """denied_permission_count/_summary must remain readable from the
+    session after the `with` block (and thus close()) has already run,
+    since callers inspect them after run_to_completion() returns and
+    the `with` exits -- close() must snapshot before tearing the denier
+    down."""
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    call_log: list[str] = []
+    fake_server = _FakeServer(call_log)
+
+    class FakeOCServer:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __new__(cls, *a, **kw):
+            return fake_server
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+    mp.setattr(
+        rt,
+        "PermissionDenier",
+        _fake_denier_class(call_log, denied_count=2, denied_summary=["bash", "edit"]),
+    )
+    session = rt.new_run_session(tmp_path / "repo", _make_options())
+    try:
+        with session:
+            session.start_server()
+            assert session.denied_permission_count == 2
+            assert session.denied_permission_summary == ["bash", "edit"]
+    finally:
+        mp.undo()
+
+    assert session.denied_permission_count == 2
+    assert session.denied_permission_summary == ["bash", "edit"]
+
+
+def test_denied_permission_count_zero_before_start_server(tmp_path):
+    """Before start_server() has ever run (no denier constructed yet),
+    denied_permission_count/_summary must report empty defaults rather
+    than raising."""
+    import loop_supervisor.runtime as rt
+
+    _init_repo(tmp_path / "repo")
+    session = rt.new_run_session(tmp_path / "repo", _make_options())
+    assert session.denied_permission_count == 0
+    assert session.denied_permission_summary == []
+
+
+def test_run_new_prints_denial_diagnostic_to_stderr(tmp_path, capsys):
+    """run_new() must report a nonzero denial count/summary on stderr
+    after the run completes -- the CLI-facing half of backlog #27 (the
+    headless path previously had no diagnostic at all for a stall
+    caused by permission.asked)."""
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    call_log: list[str] = []
+
+    class FakeOCServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def add_observer(self, obs):
+            pass
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+    mp.setattr(
+        rt,
+        "PermissionDenier",
+        _fake_denier_class(call_log, denied_count=3, denied_summary=["bash"]),
+    )
+    try:
+        run_new(tmp_path / "repo", _make_options(max_accepted_tasks=0), max_steps=1)
+    finally:
+        mp.undo()
+
+    captured = capsys.readouterr()
+    assert "denied 3 permission request(s)" in captured.err
+    assert "bash" in captured.err
+
+
+def test_run_new_prints_nothing_when_no_permissions_were_denied(tmp_path, capsys):
+    """When the denier never sees a permission.asked event, run_new()
+    must not print a denial line at all."""
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    call_log: list[str] = []
+
+    class FakeOCServer:
+        def __init__(self, *a, **kw):
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def add_observer(self, obs):
+            pass
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+    mp.setattr(rt, "PermissionDenier", _fake_denier_class(call_log))
+    try:
+        run_new(tmp_path / "repo", _make_options(max_accepted_tasks=0), max_steps=1)
+    finally:
+        mp.undo()
+
+    captured = capsys.readouterr()
+    assert "denied" not in captured.err
+
+
+def test_denier_start_failure_does_not_fail_start_server(tmp_path):
+    """A PermissionDenier that raises from start() must not prevent
+    start_server() from succeeding -- a denier fault must never fail an
+    otherwise-healthy run, matching sse.py's own non-fatal contract."""
+    _init_repo(tmp_path / "repo")
+    import loop_supervisor.runtime as rt
+
+    call_log: list[str] = []
+    fake_server = _FakeServer(call_log)
+
+    class FakeOCServer:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __new__(cls, *a, **kw):
+            return fake_server
+
+    class BoomDenier:
+        def __init__(self, base_url: str) -> None:
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("denier boom")
+
+        def stop(self) -> None:
+            pass
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+    mp.setattr(rt, "PermissionDenier", BoomDenier)
+    try:
+        session = rt.new_run_session(tmp_path / "repo", _make_options())
+        with session:
+            session.start_server()
+            assert session.state == rt.SessionState.STARTED
+            assert session.denied_permission_count == 0
+    finally:
+        mp.undo()
