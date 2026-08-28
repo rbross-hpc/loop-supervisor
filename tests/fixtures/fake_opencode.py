@@ -32,6 +32,13 @@ test process can configure it before spawning:
     file is configured), the descendant ignores SIGTERM so tests can
     exercise stop()'s escalation to SIGKILL against the whole process
     group.
+- FAKE_OPENCODE_SSE_PERMISSION_ASK: if set to a request id, the SSE
+    stream emits one `permission.asked` event (with that id and a fixed
+    `permission` key of "bash") immediately after `server.connected`.
+- FAKE_OPENCODE_PERMISSION_REPLY_LOG: if set, every
+    `POST /permission/{requestID}/reply` appends one JSON line
+    `{"request_id": ..., "body": ...}` to this file, then responds
+    `200 true`.
 """
 
 from __future__ import annotations
@@ -92,6 +99,29 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
+
+        ask_request_id = os.environ.get("FAKE_OPENCODE_SSE_PERMISSION_ASK")
+        if ask_request_id:
+            ask_payload = json.dumps(
+                {
+                    "directory": "/repo",
+                    "payload": {
+                        "type": "permission.asked",
+                        "properties": {
+                            "id": ask_request_id,
+                            "sessionID": "ses_fake123",
+                            "permission": "bash",
+                            "patterns": ["*"],
+                        },
+                    },
+                }
+            )
+            try:
+                self.wfile.write(f"data: {ask_payload}\n\n".encode())
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
         sse_mode = os.environ.get("FAKE_OPENCODE_SSE", "hold")
         if sse_mode == "disconnect":
             return
@@ -171,6 +201,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            self._send_json(200, True)
+            return
+
+        if path_only.startswith("/permission/") and path_only.endswith("/reply"):
+            request_id = path_only[len("/permission/") : -len("/reply")]
+            status_override = os.environ.get("FAKE_OPENCODE_PERMISSION_REPLY_STATUS")
+            if status_override:
+                self.send_response(int(status_override))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            log_path = os.environ.get("FAKE_OPENCODE_PERMISSION_REPLY_LOG")
+            if log_path:
+                reply_body: object = None
+                try:
+                    reply_body = json.loads(raw or b"{}")
+                except json.JSONDecodeError:
+                    pass
+                with open(log_path, "a") as f:
+                    f.write(json.dumps({"request_id": request_id, "body": reply_body}) + "\n")
             self._send_json(200, True)
             return
 

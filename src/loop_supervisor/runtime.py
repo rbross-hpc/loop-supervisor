@@ -142,6 +142,8 @@ from .opencode import (
     OpenCodeServerConfig,
     build_agent_env,
 )
+from .permissions import PermissionDenier
+from .sse import SSECleanupError
 from .state import RunOptions, RunState, StateError, list_runs, load_state, validate_run_id
 from .supervisor import AdvanceOutcome, InputProvider, LoopError, Supervisor
 
@@ -572,6 +574,13 @@ class RunSession:
         self._supervisor: Supervisor | None = None
         self._run_state: RunState | None = None
         self._server: OpenCodeServer | None = None
+        self._permission_denier: PermissionDenier | None = None
+        # Snapshot taken in close() before the denier is torn down, so
+        # denied_permission_count/_summary remain readable by a caller
+        # (e.g. the CLI) that only inspects the session after the `with`
+        # block has exited.
+        self._denied_permission_count = 0
+        self._denied_permission_summary: list[str] = []
 
         # True from the moment server.start() is attempted: an OpenCode
         # process may exist from then on, even if start() raised.
@@ -639,6 +648,30 @@ class RunSession:
     def run_state(self) -> RunState | None:
         """The current run state, or None before ``__enter__``."""
         return self._run_state
+
+    @property
+    def denied_permission_count(self) -> int:
+        """How many ``permission.asked`` requests the headless denier
+        (see ``permissions.PermissionDenier``) has auto-rejected so far.
+        Zero before the server is started or if no request ever arrived.
+        This is an in-memory diagnostic only, not persisted to
+        ``RunState``.
+
+        Readable after ``close()`` too: ``close()`` snapshots the count
+        before tearing the denier down, since the common shape is
+        ``with session: ...`` followed by inspecting the session once
+        the block has already exited.
+        """
+        if self._permission_denier is not None:
+            return self._permission_denier.denied_count
+        return self._denied_permission_count
+
+    @property
+    def denied_permission_summary(self) -> list[str]:
+        """Distinct permission keys denied so far, in first-seen order."""
+        if self._permission_denier is not None:
+            return self._permission_denier.denied_summary
+        return list(self._denied_permission_summary)
 
     # -- observer / invocation control -----------------------------------
 
@@ -935,6 +968,26 @@ class RunSession:
                     self._annotated.append(startup_exc)
                 raise
 
+        # Best-effort: a failure to start the permission denier must never
+        # fail the run (mirrors sse.py's "SSE failure is strictly
+        # non-fatal" contract, which PermissionDenier itself builds on).
+        # Without it a stray permission.asked would silently stall a
+        # phase for up to role_timeout with no diagnostic (see backlog
+        # item 27); failing to start it is worse than not having it, but
+        # still not worth failing an otherwise-healthy run over.
+        try:
+            base_url = self._server.base_url
+        except Exception:
+            base_url = None
+        if base_url is not None:
+            denier = PermissionDenier(base_url)
+            try:
+                denier.start()
+            except Exception:
+                pass
+            else:
+                self._permission_denier = denier
+
         # Separate stage: a failure here is a runner-handoff failure, not a
         # startup failure, and propagates raw.
         self._supervisor.runner = self._server
@@ -1198,6 +1251,22 @@ class RunSession:
             state_before_close = self._state
             self._state = SessionState.CLOSING
 
+            # Best-effort, and deliberately before server cleanup: an
+            # SSECleanupError (worker thread not confirmed stopped within
+            # the bounded join) must never replace the primary close()
+            # outcome, matching every other best-effort teardown in this
+            # method. Cleared even on failure so a retried close() does
+            # not attempt to stop it again.
+            if self._permission_denier is not None:
+                denier = self._permission_denier
+                self._denied_permission_count = denier.denied_count
+                self._denied_permission_summary = denier.denied_summary
+                self._permission_denier = None
+                try:
+                    denier.stop()
+                except SSECleanupError:
+                    pass
+
             # Skip stop() entirely when a previous close() already confirmed
             # it and only the lock release remains outstanding: the bounded
             # retry budget belongs to cleanup, not to lock release.
@@ -1375,6 +1444,29 @@ def _start_server_call_lineno(func: object) -> int:
     return -1
 
 
+def _report_denied_permissions(session: RunSession) -> None:
+    """Print a one-line stderr diagnostic if the headless permission
+    denier (see permissions.PermissionDenier) auto-rejected any
+    ``permission.asked`` request during this run/resume invocation.
+
+    This is the CLI-facing half of backlog item 27 ("no diagnostic"): a
+    phase that stalled or failed because of a denial is otherwise
+    silent about it. Deliberately printed here (inside the `with
+    session:` block having just exited run_to_completion(), but before
+    close() tears the denier down) rather than only in cmd_run/
+    cmd_resume, so both headless entry points get it uniformly without
+    duplicating the check.
+    """
+    count = session.denied_permission_count
+    if count == 0:
+        return
+    keys = ", ".join(session.denied_permission_summary)
+    print(
+        f"loop-supervisor: denied {count} permission request(s) ({keys})",
+        file=sys.stderr,
+    )
+
+
 def run_new(
     project_root: Path,
     options: RunOptions,
@@ -1405,7 +1497,9 @@ def run_new(
     )
     with session:
         session.start_server()
-        return session.run_to_completion(max_steps=max_steps)
+        result = session.run_to_completion(max_steps=max_steps)
+        _report_denied_permissions(session)
+        return result
 
 
 def run_resume(
@@ -1439,7 +1533,9 @@ def run_resume(
     )
     with session:
         session.start_server()
-        return session.run_to_completion(max_steps=max_steps)
+        result = session.run_to_completion(max_steps=max_steps)
+        _report_denied_permissions(session)
+        return result
 
 
 def list_run_ids(project_root: Path) -> list[str]:

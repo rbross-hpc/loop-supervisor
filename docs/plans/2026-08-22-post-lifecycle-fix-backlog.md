@@ -419,8 +419,9 @@ after the fact get written down.
     widening the real signatures to accept `object` was out of scope
     and would have weakened `src`'s actual type guarantees.
 
-27. **A permission `ask` in a headless agent run stalls the phase for
-    the full `role_timeout` with no diagnostic.** (Tier 3 — reliability)
+27. ~~A permission `ask` in a headless agent run stalls the phase for
+    the full `role_timeout` with no diagnostic.~~ **Resolved.** (Tier 3
+    — reliability)
     `src/loop_supervisor/opencode.py:1196-1245`,
     `src/loop_supervisor/opencode.py:257`,
     `docs/decisions/0014-server-mode-permission-defaults.md`.
@@ -470,6 +471,33 @@ after the fact get written down.
     its own lifecycle and teardown obligations under the ADR 0009
     lock/cleanup contract. Try (b) first; only pursue (a) as a
     diagnostic backstop and (c) if asks recur after (b) ships.
+
+    **Resolution:** (c) was implemented directly rather than as a
+    last resort, because `Permission.evaluate`'s `ask` fallback is
+    hard-coded (`?? {action: "ask", ...}`) — no config, including
+    item 28's catch-all, can eliminate it for every possible
+    permission key, only narrow the surface. `permissions.
+    PermissionDenier` starts alongside the OpenCode server in
+    `RunSession.start_server()`, subscribes to `GET /global/event`
+    (reusing `sse.py`/`normalize_global_event` exactly as anticipated
+    above — SSE is no longer TUI-only), and replies `reject` to every
+    `permission.asked` event via `POST /permission/{requestID}/reply`.
+    Both the event name and the reply route/body were verified against
+    the OpenCode 1.18.22 binary's own compiled route table, and the
+    approach mirrors that binary's own client-side `mode: "auto"`
+    auto-reply path (inverted to `reject` rather than `once`/approve).
+    `RunSession.close()` stops the denier before the server itself is
+    stopped. A denier fault (start failure, reply transport error,
+    non-2xx reply status) is swallowed and never fails the run,
+    matching `sse.py`'s own "SSE failure is strictly non-fatal"
+    contract — the same posture used throughout this module already.
+    Denial counts/summaries are in-memory only, not persisted to
+    `RunState` (see item 30 for why); `run_new`/`run_resume` print a
+    one-line stderr diagnostic (`denied N permission request(s)
+    (...)`) when any occurred, closing the "no diagnostic" half of
+    this item without the weaker warn-on-timeout option (a). Item 28
+    (config-level catch-all) remains worthwhile as defence-in-depth
+    but is no longer required to close this item.
 
 28. **Add a config-level catch-all `deny` so no permission can ever
     evaluate to `ask`, closing the general case behind item 27.**
@@ -564,6 +592,67 @@ after the fact get written down.
     "finished just now" with "was already finished before this
     invocation"; an early rejection sidesteps that ambiguity rather
     than trying to distinguish the two after the fact.
+
+30. **Squash `RunState` schema migrations (currently v2→v3) into a
+    single current version.** `src/loop_supervisor/state.py`
+    (`STATE_SCHEMA_VERSION`, `_migrate_v2_to_v3`, `_V2_FIELDS`,
+    `_V3_ONLY_FIELDS`, `V2_PHASES`).
+
+    This project has no users and no production installs — every
+    `RunState` document that has ever existed was created by this
+    codebase, in this repo, during development. There is no real
+    document anywhere carrying schema v1 or v2 that a migration needs
+    to keep loading. The v2→v3 migration path (`_migrate_v2_to_v3`,
+    plus the strict v2-field-set/v2-phase-vocabulary enforcement
+    around it) is pure carrying cost: real code, real tests, and a
+    real audit surface, purchased for compatibility nobody needs.
+
+    This showed up concretely while implementing item 27's resolution
+    (`permissions.PermissionDenier`): the natural place to persist
+    denied-permission counts/summaries would have been a new
+    `RunState` field, but `RunState.from_dict`'s exact-field-set
+    validation (`known - keys` / `keys - known`, both fatal) means any
+    new field requires bumping `STATE_SCHEMA_VERSION` and writing a
+    `_migrate_v3_to_v4` mirroring the existing v2→v3 machinery. That
+    cost was avoided for now by keeping denial counts in-memory only
+    (see item 27's resolution note), but the next legitimate field
+    addition will face the identical tax, and it only compounds:
+    v2→v3, then v3→v4, then v4→v5, forever, for a schema whose only
+    real consumers are this repo's own tests and a handful of
+    throwaway runs in `test-run/.git/loop-supervisor/runs/`.
+
+    Fix: pick a point (ideally right before or right after this
+    backlog closes out) to collapse the schema to a single current
+    version — delete `_migrate_v2_to_v3`, `_V2_FIELDS`,
+    `_V3_ONLY_FIELDS`, `V2_PHASES`, and the v1/v2 rejection branches in
+    `RunState.from_dict`, and drop `STATE_SCHEMA_VERSION` back to a
+    single implicit "current" shape (or reset it to 1 with a comment
+    explaining the reset, if a fixed starting number is preferred).
+    Any existing run-state files on disk at that point are dev
+    artifacts and can simply be deleted rather than migrated. Revisit
+    this policy (i.e. start taking migrations seriously again) only if
+    the project ever acquires a real installed user base whose
+    in-flight run state would need to survive an upgrade.
+
+31. **Route `permission.asked` auto-denial through the TUI's own live
+    SSE connection too.** `src/loop_supervisor/tui/app.py`,
+    `src/loop_supervisor/permissions.py`.
+
+    Item 27's `PermissionDenier` was deliberately scoped to the
+    headless path only (`RunSession.start_server()`/`close()`), where
+    it closes a real gap: SSE was previously TUI-only, so a headless
+    run had no permission-response channel at all. The TUI already
+    subscribes to `GET /global/event` via its own `SSEClient`
+    (`RunScreen._on_sse_event` in `tui/app.py`) and already renders
+    permission-adjacent state, so an operator watching the TUI can, in
+    principle, notice and react to an `ask` — the case for an
+    automatic responder there is weaker and the UX tradeoff (should
+    the TUI ever auto-deny on the operator's behalf, or only surface
+    the pending request?) is a real design question, not just a
+    wiring change. Tracked separately rather than folded into item 27
+    because it needs its own answer to that question plus a second SSE
+    consumer sharing one connection's event dispatch, not just
+    reusing `PermissionDenier` as-is.
 
 ## Out of scope for this backlog
 
