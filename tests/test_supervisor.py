@@ -42,11 +42,12 @@ class ScriptedRunner:
     to check.
     """
 
-    def __init__(self, responses: dict[str, list[str]]):
+    def __init__(self, responses: dict[str, list[str]], *, truncate_commit_to: int | None = None):
         self.responses = {k: list(v) for k, v in responses.items()}
         self.calls: list[tuple[str, Path]] = []
         self.prompts: list[tuple[str, str]] = []
         self._commit_counter = 0
+        self._truncate_commit_to = truncate_commit_to
 
     def run_agent(self, *, agent, directory, prompt, json_schema=None, timeout=1800.0):
         self.calls.append((agent, directory))
@@ -64,7 +65,11 @@ class ScriptedRunner:
                 (directory / fname).write_text("change\n")
                 _run(["add", "-A"], directory)
                 _run(["commit", "-m", f"builder change {self._commit_counter}"], directory)
-                data["commit"] = _run(["rev-parse", "HEAD"], directory).strip()
+                full_commit = _run(["rev-parse", "HEAD"], directory).strip()
+                if self._truncate_commit_to is not None:
+                    data["commit"] = full_commit[: self._truncate_commit_to]
+                else:
+                    data["commit"] = full_commit
                 raw = json.dumps(data)
 
         return raw
@@ -230,6 +235,71 @@ def test_happy_path_accept_then_complete(tmp_path):
     assert final.phase == PHASE_DONE
     assert final.accepted_task_count == 1
     assert (repo.root / "change-1.txt").exists()
+
+
+def test_builder_abbreviated_commit_hash_is_accepted_and_resolved(tmp_path):
+    # A builder that reports a 7-char abbreviation (e.g. from a habit of
+    # copying `git log --oneline` output) instead of the full 40-character
+    # SHA must not be rejected as an identity mismatch: the supervisor
+    # resolves it and persists the full hash.
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="COMPLETE")],
+        },
+        truncate_commit_to=7,
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+    supervisor.advance(state)  # building -> auditing
+
+    assert state.phase == "auditing"
+    assert state.last_task_head is not None
+    assert len(state.last_task_head) == 40
+
+
+def test_builder_complete_with_falsy_commit_raises_loop_error(tmp_path, monkeypatch):
+    # BuilderResult's own validator already requires a commit when status
+    # is COMPLETE, so a falsy commit can never reach _do_building through
+    # the normal BuilderResult.parse() path. This exercises the
+    # supervisor's defense-in-depth check directly by bypassing that
+    # validation (model_construct), simulating a hand-edited or otherwise
+    # corrupted result rather than a normal contract violation.
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="COMPLETE")],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+    supervisor.advance(state)
+    assert state.phase == "building"
+
+    from loop_supervisor.contracts import BuilderResult, BuilderStatus
+
+    corrupted = BuilderResult.model_construct(
+        task_id="task-1",
+        objective="Do a thing",
+        status=BuilderStatus.COMPLETE,
+        implementation_summary="did it",
+        implementation_strategy=[],
+        tests_run=[],
+        test_results=[],
+        files_changed=[],
+        commit=None,
+        open_concerns=[],
+    )
+    monkeypatch.setattr(BuilderResult, "parse", classmethod(lambda cls, raw: corrupted))
+
+    # advance() catches LoopError internally and converts it to a terminal
+    # failure outcome rather than raising, so call _do_building() directly
+    # to observe the LoopError itself.
+    with pytest.raises(LoopError, match="no commit hash"):
+        supervisor._do_building(state)
 
 
 def test_run_max_steps_none_matches_unbounded_default(tmp_path):

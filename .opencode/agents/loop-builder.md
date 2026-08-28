@@ -33,6 +33,8 @@ After implementation:
 - run the project's tests
 - inspect the resulting diff
 - commit the completed implementation to the current task branch
+- report the full 40-character commit hash (e.g. from `git rev-parse
+  HEAD`), not an abbreviated form
 - identify unresolved issues
 
 Do not merge branches.
@@ -66,7 +68,7 @@ The object must have this structure:
   "files_changed": [
     "..."
   ],
-  "commit": "abcdef123456",
+  "commit": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
   "open_concerns": [
     "..."
   ]

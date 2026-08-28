@@ -1078,7 +1078,19 @@ class Supervisor:
         state.builder_result = result.model_dump(mode="json")
 
         if result.status is BuilderStatus.COMPLETE:
-            verified_head = self.repo.verify_builder_commit(worktree, result.commit or "")
+            if not result.commit:
+                # BuilderResult's validator already requires a commit when
+                # status is COMPLETE, so reaching here means a hand-edited
+                # or otherwise corrupted state was replayed rather than a
+                # normal contract violation. Fail closed with a message
+                # naming the actual problem instead of letting an empty
+                # string reach verify_builder_commit as a bare "commit ''
+                # does not match" Git error.
+                raise LoopError(
+                    "builder reported status COMPLETE with no commit hash; "
+                    "this should be unreachable via BuilderResult's own validation"
+                )
+            verified_head = self.repo.verify_builder_commit(worktree, result.commit)
             state.last_task_head = verified_head
             state.phase = PHASE_AUDITING
             return
