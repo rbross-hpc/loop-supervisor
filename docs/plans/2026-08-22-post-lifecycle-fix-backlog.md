@@ -11,6 +11,46 @@ This is a prioritized list of substantiated findings from the lifecycle
 audit that were judged **not** to block release, but that should be
 tracked and addressed in follow-up work rather than dropped.
 
+## Corrections to prior commit messages
+
+Commit messages in this project are treated as part of the durable
+record and are never amended; a factual error in one is corrected here
+instead, since this file is already the place inaccuracies discovered
+after the fact get written down.
+
+- **258357d** ("chore: extend mypy to cover tests, add
+  check_untyped_defs, fix pyright venv") states that `git diff <base>
+  -- tests/ | grep "^-" | grep assert` is empty and that "every
+  assertion change is an addition." That is not accurate: one
+  assertion line matches the removal filter, in
+  `tests/test_opencode.py`'s `test_bounded_close_attempt_reports_hang`:
+
+  ```
+  -        assert isinstance(attempt, _BoundedCloseAttempt)
+  ```
+
+  The line was moved, not deleted. It and its preceding `attempt =
+  _start_bounded_close(client)` were hoisted out of the `try:` block
+  to just above it, so that `attempt` is narrowed from
+  `_BoundedCloseAttempt | BaseException` to `_BoundedCloseAttempt`
+  before the `finally:` clause references it — without the hoist,
+  mypy reports `union-attr` on `attempt.wait(...)` in `finally`. The
+  assertion still runs, in the same order, with the same predicate.
+
+  No code change accompanies this correction; the hoist is correct as
+  it stands and is mildly preferable to the original (it checks the
+  precondition before entering the block whose `finally` depends on
+  it). The one behavioural difference is that if the `isinstance`
+  assertion itself were ever to fail, `release.set()` in the
+  `finally` would no longer run. That cannot hang the suite:
+  `_BoundedCloseAttempt.start()` creates its worker with
+  `daemon=True` (`opencode.py:257`), so a stranded worker cannot block
+  interpreter exit.
+
+  The verification claim should have read: one assertion line was
+  relocated within its test; no assertion was removed, weakened, or
+  had its predicate changed.
+
 ## Tier 1 — fix next: correctness/security
 
 1. ~~Exhausted `ContractError` from malformed-output retries escapes
@@ -378,6 +418,109 @@ tracked and addressed in follow-up work rather than dropped.
     with a one-line reason rather than a signature change, since
     widening the real signatures to accept `object` was out of scope
     and would have weakened `src`'s actual type guarantees.
+
+27. **A permission `ask` in a headless agent run stalls the phase for
+    the full `role_timeout` with no diagnostic.** (Tier 3 — reliability)
+    `src/loop_supervisor/opencode.py:1196-1245`,
+    `src/loop_supervisor/opencode.py:257`,
+    `docs/decisions/0014-server-mode-permission-defaults.md`.
+    ADR 0014 set `external_directory` and `doom_loop` to `deny` so
+    that an agent action needing permission fails fast instead of
+    blocking on a prompt nobody can answer. That closes the two
+    observed cases but leaves the general shape open: any permission
+    that evaluates to `ask` in server mode has no responder, because
+    the supervisor speaks to OpenCode over plain HTTP
+    (`POST /session/{id}/message`) and never opens the event stream in
+    the headless path — `sse.py` and `opencode_events.py` are
+    imported only by `tui/app.py`. The prompt is raised server-side
+    and waits.
+
+    The consequence is bounded but poor: `send_prompt` builds its
+    client with `timeout=timeout` (default 1800.0), so the request
+    does eventually raise `PhaseTimeoutError` and the phase is retried
+    — after a silent 30-minute stall, reported as a generic timeout
+    with nothing pointing at the real cause. Diagnosis currently
+    requires reading `~/.local/share/opencode/log/opencode.log` for
+    `action.action=ask`, which is how the original instance was
+    eventually found (runs `40e0c0bd`, `be71f648`, `e3e6e838`, all
+    `loop-auditor` globbing for `pytest`/`ruff`/`mypy` outside the
+    project root before the PATH fix).
+
+    Note this is a distinct failure from the PATH gap ADR 0014 also
+    fixed: the PATH fix removed the *reason* those particular asks
+    fired, and the deny defaults convert them to fast failures, but
+    neither prevents a future `ask` on some permission not currently
+    listed. An ask still fired on 2026-08-28 (an interactive run
+    reaching `/home/node/.local/share/rtk/tee/*`, 14:47 UTC), confirming
+    that allowlisting only covers paths that were predicted in advance.
+    Zero asks have been observed in a `loop-auditor`/`loop-builder`/
+    `loop-architect`/`loop-planner` run since the PATH fix landed
+    (2026-08-28T02:09), only in interactive sessions.
+
+    Recommended fix, cheapest first: (a) log a loud warning naming the
+    permission when a phase times out, so the 30-minute stall is at
+    least self-diagnosing; (b) a config-level catch-all deny, tracked
+    separately as item 28, which is the stronger and now-verified fix
+    and should be tried before this item's (a); (c) have the headless
+    path consume the event stream (reusing `sse.py` and
+    `normalize_global_event`) and auto-deny pending permission
+    requests, which is the only option that gives a precise error at
+    the moment of the ask, but is materially more work — it puts an
+    event consumer in the previously synchronous headless path, with
+    its own lifecycle and teardown obligations under the ADR 0009
+    lock/cleanup contract. Try (b) first; only pursue (a) as a
+    diagnostic backstop and (c) if asks recur after (b) ships.
+
+28. **Add a config-level catch-all `deny` so no permission can ever
+    evaluate to `ask`, closing the general case behind item 27.**
+    `opencode.json`. Verified against the installed OpenCode 1.18.22
+    binary (`/home/node/.npm-global/lib/node_modules/opencode-ai/bin/opencode.exe`)
+    by reading its (minified) permission-resolution code directly,
+    since 1.18.22 ships compiled and the published JSON Schema at
+    `https://opencode.ai/config.json` documents the shape of
+    `permission` but not its runtime semantics:
+
+    - `Permission.fromConfig` (config → ruleset) flattens each
+      permission entry; a bare string value (e.g. `"doom_loop":
+      "deny"`) becomes one rule with `pattern: "*"`, and an object
+      value becomes one rule per key, with `~`/`$HOME` expanded in the
+      *pattern* only, never in the permission key.
+    - `Permission.evaluate` picks the **last** ruleset entry (in
+      object-insertion order) where both the permission name and the
+      pattern match, via `Array.prototype.findLast`, and falls back to
+      `{action: "ask"}` if nothing matches. Critically, the permission
+      *key* itself is matched with the same wildcard matcher as the
+      pattern (`g.match(requestedPermission, rule.permission)`), so a
+      `"*"` key is a valid catch-all across every permission type, not
+      just `external_directory`-style path patterns.
+    - Consequently, `{"permission": "deny"}` (a bare top-level string)
+      is schema-valid per `PermissionConfig`'s `anyOf` but does
+      **nothing** here — `Object.entries` over a string yields no
+      rules, so it silently falls through to the same `ask` default.
+      The catch-all must be a `"*"` **key**, and because
+      `findLast` favours later entries, it must be the **first** key
+      in the `permission` object so any more specific rule after it
+      (`external_directory`, `doom_loop`, etc.) still wins:
+
+      ```json
+      "permission": {
+        "*": "deny",
+        "external_directory": {"*": "deny", "/workspaces/loop-tui-experiment": "allow"},
+        "doom_loop": "deny",
+        "bash": "allow", "read": "allow", "edit": "allow", "write": "allow",
+        "glob": "allow", "grep": "allow", "list": "allow", "task": "allow"
+      }
+      ```
+
+    Not yet applied: `Permission.evaluate` merges the session-level
+    ruleset from `opencode.json` with each of the four `.opencode/
+    agents/*.md` agent-level `permission:` blocks
+    (`de.merge(agent.permission, session.permission ?? [])`), and a
+    top-level `"*": "deny"` will win over anything the agent files
+    don't already re-allow. Applying this requires auditing all four
+    agent permission blocks against the re-allow list above and a live
+    smoke run of at least one full task cycle to confirm no agent
+    action that currently succeeds starts asking or gets denied.
 
 ## Out of scope for this backlog
 
