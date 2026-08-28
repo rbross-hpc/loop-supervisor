@@ -522,6 +522,49 @@ after the fact get written down.
     smoke run of at least one full task cycle to confirm no agent
     action that currently succeeds starts asking or gets denied.
 
+29. **`resume` on a terminal run silently no-ops after needlessly
+    starting OpenCode.**
+    `src/loop_supervisor/cli.py:177-181`,
+    `src/loop_supervisor/runtime.py:1434-1442`,
+    `src/loop_supervisor/supervisor.py:469-475`, `:719`.
+    Discovered live: a completed run's state (`phase: "done"`) is not
+    rejected by `resume`, so nothing prevents pointing `resume` at a
+    finished run_id. `_paused_phase_message` returns `None` for
+    `TERMINAL_PHASES`, so `cmd_resume` prints only `final phase: done`
+    and exits 0 — indistinguishable from a resume that performed real
+    work and completed. An operator has to open the state JSON to
+    learn why nothing happened.
+
+    Worse, the no-op is discovered late rather than up front.
+    `run_resume` acquires the supervisor lock and calls
+    `session.start_server()` (spawning a real `opencode serve`
+    process) *before* `run_to_completion` ever reaches
+    `Supervisor.run()`'s `while state.phase not in _TERMINAL_PHASES`
+    loop guard, which is what actually exits immediately for a
+    terminal phase. A resume that is a guaranteed no-op therefore
+    still pays for a full server spawn and teardown — the same
+    lifecycle already responsible for this session's orphaned-server
+    and stale-lock incidents (see the live-run environment notes on
+    `nohup`-managed steps).
+
+    This is not a reason to allow reopening a finished run — ADR 0006
+    and README's "Operational failure and retry" section are
+    deliberate on that point ("no further resume is possible. Start a
+    new run."), and nothing here argues for relaxing it. This item is
+    about the *reporting and cost* of the already-correct no-op, not
+    the invariant itself.
+
+    Fix: reject terminal phases early — in `cmd_resume` or
+    `_validate_resume` — before the lock is acquired and before
+    `start_server()` runs, with an actionable message naming the run,
+    its phase, and `accepted_task_count` (e.g. "run 2dba05654b5e is
+    already done (6 tasks accepted); start a new run with
+    'loop-supervisor run'") and a non-zero exit. Note `cmd_resume`'s
+    `return 0 if final.phase == "done" else 1` currently conflates
+    "finished just now" with "was already finished before this
+    invocation"; an early rejection sidesteps that ambiguity rather
+    than trying to distinguish the two after the fact.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in
