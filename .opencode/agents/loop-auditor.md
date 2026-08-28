@@ -15,6 +15,8 @@ permission:
     "git rev-parse*": allow
     "git merge-base*": allow
     "pytest *": allow
+    "ruff *": allow
+    "mypy *": allow
 ---
 
 You are the independent reviewer for the project in the current working
