@@ -1,6 +1,7 @@
 import json
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -198,7 +199,7 @@ def _make_supervisor(
     repo = _init_repo(tmp_path / "project")
     common_dir = repo.common_dir()
     if options is None:
-        overrides = {}
+        overrides: dict[str, Any] = {}
         if limits is not None:
             overrides.update(
                 max_accepted_tasks=limits.max_accepted_tasks,

@@ -31,7 +31,7 @@ def test_multiline_data_valid_json():
 
 def test_multiline_data_invalid_json_calls_notice():
     lines = ["data: {", "data: broken", ""]
-    notices = []
+    notices: list[str] = []
     result = _parse(lines, on_notice=notices.append)
     assert result == []
     assert len(notices) == 1
@@ -67,7 +67,7 @@ def test_non_object_json_skipped():
 
 
 def test_malformed_json_calls_on_notice():
-    notices = []
+    notices: list[str] = []
     lines = ["data: {broken", ""]
     result = _parse(lines, on_notice=notices.append)
     assert result == []
@@ -76,7 +76,7 @@ def test_malformed_json_calls_on_notice():
 
 
 def test_event_size_limit_drops_oversized():
-    notices = []
+    notices: list[str] = []
     big = "x" * 1000
     lines = [f'data: {{"{big}": 1}}', ""]
     result = _parse(lines, max_event_bytes=100, on_notice=notices.append)
@@ -92,7 +92,7 @@ def test_incomplete_final_record_discarded():
 
 def test_empty_data_after_blank():
     lines = ["data: ", ""]
-    notices = []
+    notices: list[str] = []
     result = _parse(lines, on_notice=notices.append)
     assert result == []
 
@@ -110,7 +110,7 @@ def test_event_field_ignored():
 
 
 def test_oversized_record_partial_suffix_not_dispatched():
-    notices = []
+    notices: list[str] = []
     big = "x" * 500
     lines = [
         f'data: {{"{big}": 1}}',
@@ -165,7 +165,7 @@ def test_sse_client_requests_correct_path():
     server = _FakeServer()
     server.start()
     try:
-        received = []
+        received: list[dict] = []
         states = []
         client = SSEClient(
             server.base_url,
@@ -241,7 +241,7 @@ def test_sse_intentional_stop_does_not_emit_error_notice():
     server = _FakeServer()
     server.start()
     try:
-        notices = []
+        notices: list[str] = []
         client = SSEClient(
             server.base_url,
             on_event=lambda e: None,
@@ -260,7 +260,7 @@ def test_sse_receives_server_connected_event():
     server = _FakeServer()
     server.start()
     try:
-        received = []
+        received: list[dict] = []
         client = SSEClient(server.base_url, on_event=received.append)
         client.start()
         deadline = time.monotonic() + 3.0

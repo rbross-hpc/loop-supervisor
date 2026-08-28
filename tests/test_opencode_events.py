@@ -154,6 +154,7 @@ def test_message_part_updated_text_with_delta_infers_text_field():
     event = normalize_global_event(raw)
     assert event.delta == "world"
     assert event.delta_field == "text"
+    assert event.part is not None
     assert event.part.text == "hello world"
 
 
@@ -174,6 +175,7 @@ def test_message_part_updated_reasoning_with_delta_infers_reasoning_field():
     event = normalize_global_event(raw)
     assert event.delta == "more"
     assert event.delta_field == "reasoning"
+    assert event.part is not None
     assert event.part.reasoning == "thinking more"
 
 
@@ -293,6 +295,8 @@ def test_tool_state_pending():
         },
     )
     event = normalize_global_event(raw)
+    assert event.part is not None
+    assert event.part.tool_state is not None
     assert event.part.tool_state.status == "pending"
 
 
@@ -312,6 +316,8 @@ def test_tool_state_error():
         },
     )
     event = normalize_global_event(raw)
+    assert event.part is not None
+    assert event.part.tool_state is not None
     assert event.part.tool_state.status == "error"
     assert event.part.tool_state.error == "permission denied"
 

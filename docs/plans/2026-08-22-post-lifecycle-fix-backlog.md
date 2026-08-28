@@ -325,6 +325,60 @@ tracked and addressed in follow-up work rather than dropped.
     require amending ADRs 0004 and 0007 and reworking
     `tests/test_cli_init.py`, which pins current behavior.
 
+26. ~~`mypy src tests` (checked together) surfaces ~331 errors that
+    `mypy src` and `mypy tests` (checked separately) do not.~~
+    **Resolved.** `tests/test_runtime.py` (268), `tests/test_tui_app.py`
+    (28), `tests/test_state.py` (16), `tests/test_advance.py` (8),
+    `tests/test_opencode_events.py` (8), `tests/test_opencode.py` (3).
+    All 331 are now fixed; the gate runs the combined `mypy src tests`
+    invocation.
+
+    The cause was a style choice, not something inherent to testing
+    this way. A minimal two-file probe proved it: `m.GitRepo = Fake`
+    (direct module-attribute assignment) errors under mypy with
+    `misc`/`assignment`, because mypy can see the real type on the
+    right-hand side and compare it against the left; the identical
+    intent via `monkeypatch.setattr(m, "GitRepo", Fake)` is clean,
+    because `setattr` accepts a bare attribute-name string that breaks
+    the type comparison. Checked in isolation (the old `mypy tests`
+    invocation), mypy also could not see `src`'s real types at all, so
+    even the direct-assignment form passed — which is what let ~250
+    such assignments accumulate silently in `tests/test_runtime.py`
+    over time, undetected by either the old split gate or by local
+    convention (the file already had 36 `monkeypatch.setattr` calls
+    alongside 135 direct assignments, so there was no single dominant
+    style to infer from). Fixed by converting the class/method
+    assignments to `pytest.MonkeyPatch()` (used directly, not as a
+    fixture, since two of the largest offending blocks were shared
+    `@contextlib.contextmanager` helpers with 70+ call sites that
+    cannot take the `monkeypatch` fixture) and `monkeypatch.setattr`
+    where a fixture was already in scope; function assignments
+    (`rt.load_state = ...`) were left untouched since they were
+    already type-clean. See README.md's "Testing discipline" for the
+    resulting convention.
+
+    The remaining ~81 errors were dict-unpacking inference gaps
+    (`defaults = dict(...); Cls(**defaults)` needing a `dict[str,
+    Any]` annotation — including `tests/test_runtime.py:53` and
+    `tests/test_tui_app.py:70`, previously miscategorised in this
+    project's session notes as pre-existing LSP/pyright noise to
+    ignore; they are real mypy findings, only invisible under the old
+    split-invocation gate) and `union-attr` reaches through `X | None`
+    attributes (`RunSession | None`, `_LockLease | None`, etc.) without
+    an `assert x is not None` guard first. Verified none of these
+    indicated a real production bug: in every case the corresponding
+    `src` code already guards the same attribute correctly (e.g.
+    `session = self._session` followed by a check in
+    `tui/app.py:370`+), and only the tests were reaching through
+    unguarded. Fixed with a targeted `assert ... is not None` at each
+    site, which also documents the test's actual precondition. A
+    handful of remaining cases were genuinely-intentional duck-typed
+    fakes or bare `object()` identity sentinels passed where a real
+    type was expected; those got a targeted `# type: ignore[arg-type]`
+    with a one-line reason rather than a signature change, since
+    widening the real signatures to accept `object` was out of scope
+    and would have weakened `src`'s actual type guarantees.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in

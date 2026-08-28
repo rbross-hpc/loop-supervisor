@@ -3,6 +3,7 @@
 import json
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -147,7 +148,7 @@ def _architect_decided(question="Which approach?", **extra):
 
 
 def _make_options(**overrides) -> RunOptions:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         max_accepted_tasks=20,
         max_revisions_per_task=5,
         max_replans_per_task=3,
@@ -520,6 +521,7 @@ def test_operational_failure_message_redacts_secret_from_environment(tmp_path, m
     assert "[redacted:ANTHROPIC_API_KEY]" in state.last_error["message"]
 
     reloaded = load_state(repo.common_dir(), state.run_id)
+    assert reloaded.last_error is not None
     assert secret not in reloaded.last_error["message"]
 
 
@@ -1118,6 +1120,7 @@ def test_cleanup_branch_failure_persists_with_absent_worktree(tmp_path):
 
     assert outcome.status == AdvanceStatus.OPERATIONAL_FAILURE
     assert state.phase == PHASE_OPERATIONAL_FAILURE
+    assert state.last_error is not None
     assert state.last_error["kind"] == "git"
     assert state.last_error["failed_phase"] == PHASE_CLEANUP_BRANCH
     assert state.last_error["retry_phase"] == PHASE_CLEANUP_BRANCH
@@ -1128,6 +1131,7 @@ def test_cleanup_branch_failure_persists_with_absent_worktree(tmp_path):
 
     reloaded = load_state(repo.common_dir(), state.run_id)
     assert reloaded.phase == PHASE_OPERATIONAL_FAILURE
+    assert reloaded.last_error is not None
     assert reloaded.last_error["failed_phase"] == PHASE_CLEANUP_BRANCH
     assert reloaded.last_error["retry_phase"] == PHASE_CLEANUP_BRANCH
     assert reloaded.task_status_snapshot is None

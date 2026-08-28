@@ -325,6 +325,7 @@ def _get_dead_pid() -> int:
     p = ctx.Process(target=lambda: None)
     p.start()
     p.join()
+    assert p.pid is not None  # always set once start() has returned
     return p.pid
 
 
