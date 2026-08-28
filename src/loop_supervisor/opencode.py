@@ -439,6 +439,67 @@ class OpenCodeServerConfig:
     env: dict[str, str] | None = None
 
 
+def build_agent_env(
+    project_root: Path,
+    *,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build the environment OpenCode (and every agent invocation under it)
+    inherits, with each project's `.venv/bin` made findable on `PATH`.
+
+    Agents commonly need `pytest`, `ruff`, and `mypy`, which this project's
+    own convention installs into a project-local `.venv` rather than onto
+    the ambient `PATH`. Without this, an agent that globs for those tools
+    and doesn't find them on `PATH` may go looking in system directories
+    (e.g. `/usr/local/bin`) outside the project, which under a
+    server-driven run (no human to answer an `external_directory` prompt)
+    can hang forever rather than fail (see ADR 0014).
+
+    Two entries are prepended, in this order:
+
+    1. A *relative* `.venv/bin`, included unconditionally regardless of
+       whether it exists relative to this process's own cwd. Every agent
+       invocation runs with its `directory` set to its own task worktree
+       (see `_do_building` / `_do_auditing`), and a relative `PATH` entry
+       is resolved fresh at each individual command's exec-time against
+       *that* process's cwd, not against whatever directory the
+       supervisor itself happens to be running in when this function
+       runs (typically once, at server startup). Checking existence here
+       would test the wrong directory entirely, so it is deliberately
+       skipped; a worktree with no `.venv/bin` simply finds nothing there
+       and falls through to the next entry, same as any other missing
+       PATH directory. This is deliberately not a symlink to the
+       integration project's venv: an editable install's `.pth` file (and
+       every console-script shebang in `.venv/bin`) embeds an *absolute*
+       path, so a symlinked/shared venv would silently run tests against
+       the integration checkout's source tree instead of the task
+       worktree's, defeating the point of verification without any
+       visible error.
+    2. `<project_root>/.venv/bin`, an absolute fallback for invocations
+       whose cwd has no venv of its own (e.g. the top-level planner
+       working in the integration root). This one *is* checked for
+       existence, since `project_root` is a real, known path at the time
+       this function runs.
+
+    Returns a new dict; never mutates `base_env`.
+    """
+    env = dict(base_env if base_env is not None else os.environ)
+    existing_path = env.get("PATH", "")
+    existing_entries = existing_path.split(os.pathsep) if existing_path else []
+
+    relative_entry = str(Path(".venv/bin"))
+    absolute_entry = str(project_root / ".venv" / "bin")
+
+    prefix = [relative_entry]
+    if (project_root / ".venv" / "bin").is_dir():
+        prefix.append(absolute_entry)
+
+    prefix = [entry for entry in prefix if entry not in existing_entries]
+
+    env["PATH"] = os.pathsep.join([*prefix, *existing_entries])
+    return env
+
+
 class OpenCodeServer:
     """Manages the lifecycle of one `opencode serve` process."""
 

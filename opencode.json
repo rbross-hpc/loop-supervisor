@@ -30,8 +30,10 @@
   },
   "permission": {
     "external_directory": {
+      "*": "deny",
       "/workspaces/loop-tui-experiment": "allow"
-    }
+    },
+    "doom_loop": "deny"
   },
   "mcp": {
     "falda": {

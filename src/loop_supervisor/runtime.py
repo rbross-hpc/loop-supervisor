@@ -136,7 +136,12 @@ from typing import Literal, NoReturn
 from .git import GitError, GitRepo
 from .input_providers import StdinInputProvider
 from .locking import LockError, SupervisorLock
-from .opencode import InvocationObserver, OpenCodeServer, OpenCodeServerConfig
+from .opencode import (
+    InvocationObserver,
+    OpenCodeServer,
+    OpenCodeServerConfig,
+    build_agent_env,
+)
 from .state import RunOptions, RunState, StateError, list_runs, load_state, validate_run_id
 from .supervisor import AdvanceOutcome, InputProvider, LoopError, Supervisor
 
@@ -805,6 +810,7 @@ class RunSession:
                 OpenCodeServerConfig(
                     executable=options.opencode_executable,
                     startup_timeout=options.opencode_startup_timeout,
+                    env=build_agent_env(self._project_root),
                 ),
             )
             if self._server_observer is not None:
