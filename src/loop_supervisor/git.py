@@ -31,6 +31,8 @@ class MergeConflictError(GitError):
 
 _TASK_ID_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 
+_COMMIT_HASH_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
 
 def sanitize_task_id(task_id: str) -> str:
     """Turn an arbitrary planner task_id into a safe branch/path fragment."""
@@ -369,7 +371,16 @@ class GitRepo:
     ) -> str:
         """Verify the builder's reported commit against actual repo state.
 
-        Returns the verified commit hash. Raises GitError on any mismatch.
+        `reported_commit` must be a hash (full 40-character SHA or an
+        unambiguous abbreviation of at least 7 hex characters, matching
+        Git's own default `core.abbrev`); anything else -- including
+        revspecs like "HEAD" or a branch name, which would trivially
+        "match" whatever the worktree happens to be at -- is rejected
+        without ever being resolved.
+
+        Returns the verified, full-length commit hash regardless of
+        whether an abbreviation was reported. Raises GitError on any
+        mismatch.
         """
         actual_branch = _run(
             ["rev-parse", "--abbrev-ref", "HEAD"], cwd=task_worktree.path
@@ -383,9 +394,30 @@ class GitRepo:
             raise GitError(f"task worktree {task_worktree.path} is not clean after COMPLETE")
 
         actual_head = self.head_commit(cwd=task_worktree.path)
-        if actual_head != reported_commit:
+
+        candidate = reported_commit.strip()
+        if not _COMMIT_HASH_RE.match(candidate):
             raise GitError(
-                f"builder reported commit {reported_commit!r} but actual HEAD is {actual_head!r}"
+                f"builder reported {reported_commit!r}, which is not a commit hash "
+                "(expected 7-40 hex characters); refusing to resolve it as a revspec"
+            )
+
+        result = _run(
+            ["rev-parse", "--verify", "--end-of-options", f"{candidate}^{{commit}}"],
+            cwd=task_worktree.path,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise GitError(
+                f"builder reported commit {reported_commit!r}, which could not be "
+                f"resolved in the task worktree: {result.stderr.strip()}"
+            )
+        resolved = result.stdout.strip()
+
+        if resolved != actual_head:
+            raise GitError(
+                f"builder reported commit {reported_commit!r} (resolved to {resolved!r}) "
+                f"but actual HEAD is {actual_head!r}"
             )
 
         count = _run(

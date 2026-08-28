@@ -113,6 +113,125 @@ def test_verify_builder_commit_rejects_dirty_worktree(tmp_path):
         repo.verify_builder_commit(worktree, head)
 
 
+def test_verify_builder_commit_accepts_seven_char_abbreviation(tmp_path):
+    repo = _init_repo(tmp_path / "project")
+    worktree = repo.create_task_worktree("task-007")
+
+    (worktree.path / "feature.txt").write_text("new feature\n")
+    _run(["add", "-A"], worktree.path)
+    _run(["commit", "-m", "implement feature"], worktree.path)
+    head = repo.head_commit(cwd=worktree.path)
+
+    verified = repo.verify_builder_commit(worktree, head[:7])
+    assert verified == head
+
+
+def test_verify_builder_commit_accepts_twelve_char_abbreviation(tmp_path):
+    repo = _init_repo(tmp_path / "project")
+    worktree = repo.create_task_worktree("task-007")
+
+    (worktree.path / "feature.txt").write_text("new feature\n")
+    _run(["add", "-A"], worktree.path)
+    _run(["commit", "-m", "implement feature"], worktree.path)
+    head = repo.head_commit(cwd=worktree.path)
+
+    verified = repo.verify_builder_commit(worktree, head[:12])
+    assert verified == head
+
+
+def test_verify_builder_commit_always_returns_full_hash(tmp_path):
+    repo = _init_repo(tmp_path / "project")
+    worktree = repo.create_task_worktree("task-007")
+
+    (worktree.path / "feature.txt").write_text("new feature\n")
+    _run(["add", "-A"], worktree.path)
+    _run(["commit", "-m", "implement feature"], worktree.path)
+    head = repo.head_commit(cwd=worktree.path)
+
+    verified = repo.verify_builder_commit(worktree, head[:7])
+    assert len(verified) == 40
+    assert verified == head
+
+
+def test_verify_builder_commit_rejects_empty_string(tmp_path):
+    repo = _init_repo(tmp_path / "project")
+    worktree = repo.create_task_worktree("task-007")
+
+    (worktree.path / "feature.txt").write_text("new feature\n")
+    _run(["add", "-A"], worktree.path)
+    _run(["commit", "-m", "implement feature"], worktree.path)
+
+    with pytest.raises(GitError):
+        repo.verify_builder_commit(worktree, "")
+
+
+def test_verify_builder_commit_rejects_whitespace_only(tmp_path):
+    repo = _init_repo(tmp_path / "project")
+    worktree = repo.create_task_worktree("task-007")
+
+    (worktree.path / "feature.txt").write_text("new feature\n")
+    _run(["add", "-A"], worktree.path)
+    _run(["commit", "-m", "implement feature"], worktree.path)
+
+    with pytest.raises(GitError):
+        repo.verify_builder_commit(worktree, "   ")
+
+
+def test_verify_builder_commit_rejects_head_revspec(tmp_path):
+    # A builder reporting "HEAD" would trivially "match" whatever the
+    # worktree happens to be at, defeating the point of verification.
+    # Only hash-shaped values are ever resolved.
+    repo = _init_repo(tmp_path / "project")
+    worktree = repo.create_task_worktree("task-007")
+
+    (worktree.path / "feature.txt").write_text("new feature\n")
+    _run(["add", "-A"], worktree.path)
+    _run(["commit", "-m", "implement feature"], worktree.path)
+
+    with pytest.raises(GitError):
+        repo.verify_builder_commit(worktree, "HEAD")
+
+
+def test_verify_builder_commit_rejects_branch_name(tmp_path):
+    repo = _init_repo(tmp_path / "project")
+    worktree = repo.create_task_worktree("task-007")
+
+    (worktree.path / "feature.txt").write_text("new feature\n")
+    _run(["add", "-A"], worktree.path)
+    _run(["commit", "-m", "implement feature"], worktree.path)
+
+    with pytest.raises(GitError):
+        repo.verify_builder_commit(worktree, worktree.branch)
+
+
+def test_verify_builder_commit_rejects_nonexistent_hex_prefix(tmp_path):
+    repo = _init_repo(tmp_path / "project")
+    worktree = repo.create_task_worktree("task-007")
+
+    (worktree.path / "feature.txt").write_text("new feature\n")
+    _run(["add", "-A"], worktree.path)
+    _run(["commit", "-m", "implement feature"], worktree.path)
+
+    with pytest.raises(GitError):
+        repo.verify_builder_commit(worktree, "deadbee")
+
+
+def test_verify_builder_commit_rejects_abbreviation_of_different_commit(tmp_path):
+    repo = _init_repo(tmp_path / "project")
+    worktree = repo.create_task_worktree("task-007")
+
+    base = repo.head_commit(cwd=worktree.path)
+    (worktree.path / "feature.txt").write_text("new feature\n")
+    _run(["add", "-A"], worktree.path)
+    _run(["commit", "-m", "implement feature"], worktree.path)
+
+    # base is a real, resolvable commit, but it is not HEAD: reporting an
+    # abbreviation of it must still be rejected as a mismatch, not
+    # silently accepted just because it resolves to *something*.
+    with pytest.raises(GitError):
+        repo.verify_builder_commit(worktree, base[:7])
+
+
 def test_merge_accepted_task_and_cleanup(tmp_path):
     repo = _init_repo(tmp_path / "project")
     worktree = repo.create_task_worktree("task-007")
