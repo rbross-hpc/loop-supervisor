@@ -54,6 +54,7 @@ ignore = ["UP042"]  # str+Enum is intentional for JSON-serializable enums
 
 [tool.mypy]
 python_version = "3.11"
-packages = ["loop_supervisor"]
+files = ["src", "tests"]
+check_untyped_defs = true
 strict = false
 ignore_missing_imports = true

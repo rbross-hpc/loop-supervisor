@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -54,7 +55,7 @@ def _init_repo(path: Path) -> GitRepo:
 
 
 def _make_options(**overrides) -> RunOptions:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         max_accepted_tasks=1,
         max_revisions_per_task=1,
         max_replans_per_task=1,
@@ -165,6 +166,7 @@ async def test_server_startup_failure_persists_operational_failure(tmp_path, mon
     run_id = runs[0].stem
     state = load_state(repo.common_dir(), run_id)
     assert state.phase == PHASE_OPERATIONAL_FAILURE
+    assert state.last_error is not None
     assert state.last_error["kind"] == "opencode_startup"
     assert "server_start" in call_log
 
@@ -192,6 +194,7 @@ async def test_repeated_tui_startup_failure_preserves_retry_phase(tmp_path, monk
     run_id = runs[0].stem
     first = load_state(repo.common_dir(), run_id)
     assert first.phase == PHASE_OPERATIONAL_FAILURE
+    assert first.last_error is not None
     first_retry_phase = first.last_error["retry_phase"]
     assert first_retry_phase != PHASE_OPERATIONAL_FAILURE
 
@@ -206,6 +209,7 @@ async def test_repeated_tui_startup_failure_preserves_retry_phase(tmp_path, monk
 
     second = load_state(repo.common_dir(), run_id)
     assert second.phase == PHASE_OPERATIONAL_FAILURE
+    assert second.last_error is not None
     assert second.last_error["retry_phase"] == first_retry_phase
 
 
@@ -318,6 +322,8 @@ async def test_quit_during_blocked_advance_does_not_release_lock_early(tmp_path,
         assert isinstance(screen, RunScreen)
 
         release_advance = threading.Event()
+        assert screen._session is not None
+        assert screen._session._supervisor is not None
         real_advance = screen._session._supervisor.advance
 
         def blocked_advance(state):
@@ -362,6 +368,8 @@ async def test_double_submit_starts_only_one_transition(tmp_path, monkeypatch):
         assert isinstance(screen, RunScreen)
 
         advance_calls = []
+        assert screen._session is not None
+        assert screen._session._supervisor is not None
         real_advance = screen._session._supervisor.advance
         gate = threading.Event()
 
@@ -445,6 +453,8 @@ async def test_app_exit_during_blocked_advance_waits_for_cleanup(tmp_path, monke
         assert isinstance(screen, RunScreen)
 
         release_advance = threading.Event()
+        assert screen._session is not None
+        assert screen._session._supervisor is not None
         real_advance = screen._session._supervisor.advance
 
         def blocked_advance(state):
@@ -652,6 +662,7 @@ async def test_app_exit_retains_lock_when_server_stop_fails(tmp_path, monkeypatc
         def _eventually_succeeds() -> None:
             call_log.append("server_stop_attempted")
 
+        assert screen._session._server is not None
         screen._session._server.stop = _eventually_succeeds  # type: ignore[method-assign]
 
 
@@ -1141,6 +1152,8 @@ async def test_stack_removal_unmount_race_cannot_hide_screen_from_exit(tmp_path,
             await pilot.pause(0.05)
 
         release_advance = threading.Event()
+        assert screen._session is not None
+        assert screen._session._supervisor is not None
         real_advance = screen._session._supervisor.advance
 
         def blocked_advance(state):
@@ -1246,6 +1259,8 @@ async def test_detached_lock_release_only_failure_remains_registered_and_retries
         # directly, one level below RunSession's own retry logic, so this
         # test observes RunSession.close() retrying the release itself
         # rather than a fake shortcut.
+        assert screen._session is not None
+        assert screen._session._lease is not None
         original_release = screen._session._lease._lock.release
 
         def _flaky_release():
@@ -1488,6 +1503,8 @@ async def test_registry_membership_clears_only_after_quiescence_and_clean_releas
             await pilot.pause(0.05)
 
         release_advance = threading.Event()
+        assert screen._session is not None
+        assert screen._session._supervisor is not None
         real_advance = screen._session._supervisor.advance
 
         def blocked_advance(state):

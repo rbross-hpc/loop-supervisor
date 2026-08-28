@@ -11,6 +11,7 @@ import contextlib
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -38,7 +39,7 @@ def _init_repo(path: Path) -> GitRepo:
 
 
 def _make_options(**overrides) -> RunOptions:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         max_accepted_tasks=1,
         max_revisions_per_task=1,
         max_replans_per_task=1,
@@ -127,10 +128,6 @@ def _patch_runtime(repo: GitRepo, *, call_log: list[str], final_phase: str = "do
 
     fake_server = _FakeServer(call_log)
 
-    original_git_repo = rt.GitRepo
-    original_oc_server = rt.OpenCodeServer
-    original_supervisor = rt.Supervisor
-
     class FakeGitRepo:
         def __init__(self, *a, **kw):
             self.root = repo.root
@@ -174,19 +171,13 @@ def _patch_runtime(repo: GitRepo, *, call_log: list[str], final_phase: str = "do
         def runner(self, value):
             call_log.append("runner_set")
 
-    import contextlib
-
     @contextlib.contextmanager
     def _ctx():
-        rt.GitRepo = FakeGitRepo
-        rt.OpenCodeServer = FakeOCServer
-        rt.Supervisor = FakeSupervisor
-        try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(rt, "GitRepo", FakeGitRepo)
+            mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+            mp.setattr(rt, "Supervisor", FakeSupervisor)
             yield
-        finally:
-            rt.GitRepo = original_git_repo
-            rt.OpenCodeServer = original_oc_server
-            rt.Supervisor = original_supervisor
 
     return _ctx()
 
@@ -240,11 +231,12 @@ def test_run_new_server_stops_before_lock_release(tmp_path):
         lock_released.append("lock_released")
 
     with _patch_runtime(repo, call_log=call_log):
-        rt._LockLease.release = patched_release
+        mp = pytest.MonkeyPatch()
+        mp.setattr(rt._LockLease, "release", patched_release)
         try:
             run_new(tmp_path / "repo", _make_options())
         finally:
-            rt._LockLease.release = original_release
+            mp.undo()
 
     assert lock_released == ["lock_released"]
     assert call_log.index("server_stop") < call_log.index("lock_released")
@@ -281,7 +273,8 @@ def test_run_resume_loads_state_after_lock_acquisition(tmp_path):
 
     call_log: list[str] = []
     with _patch_runtime(repo, call_log=call_log):
-        SupervisorLock.acquire = patched_acquire
+        mp = pytest.MonkeyPatch()
+        mp.setattr(SupervisorLock, "acquire", patched_acquire)
         rt.load_state = patched_load_state
         try:
             try:
@@ -289,7 +282,7 @@ def test_run_resume_loads_state_after_lock_acquisition(tmp_path):
             except Exception:
                 pass
         finally:
-            SupervisorLock.acquire = original_acquire
+            mp.undo()
             rt.load_state = original_load_state
 
     assert load_order.index("lock_acquired") < load_order.index("load_state")
@@ -325,10 +318,6 @@ def test_run_new_uses_runtime_not_supervisor_directly(tmp_path):
         def runner(self, v):
             pass
 
-    original_supervisor = rt.Supervisor
-    original_oc_server = rt.OpenCodeServer
-    original_git_repo = rt.GitRepo
-
     class FakeGitRepo:
         def __init__(self, *a, **kw):
             self.root = repo.root
@@ -346,15 +335,14 @@ def test_run_new_uses_runtime_not_supervisor_directly(tmp_path):
         def stop(self):
             pass
 
-    rt.GitRepo = FakeGitRepo
-    rt.OpenCodeServer = FakeOCServer
-    rt.Supervisor = SpySupervisor
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "GitRepo", FakeGitRepo)
+    mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+    mp.setattr(rt, "Supervisor", SpySupervisor)
     try:
         run_new(tmp_path / "repo", _make_options())
     finally:
-        rt.GitRepo = original_git_repo
-        rt.OpenCodeServer = original_oc_server
-        rt.Supervisor = original_supervisor
+        mp.undo()
 
     assert "Supervisor.__init__" in called
     assert "start_new_run" in called
@@ -398,10 +386,6 @@ def test_run_resume_uses_runtime_not_supervisor_directly(tmp_path):
         def runner(self, v):
             pass
 
-    original_supervisor = rt.Supervisor
-    original_oc_server = rt.OpenCodeServer
-    original_git_repo = rt.GitRepo
-
     class FakeGitRepo:
         def __init__(self, *a, **kw):
             self.root = repo.root
@@ -419,17 +403,16 @@ def test_run_resume_uses_runtime_not_supervisor_directly(tmp_path):
         def stop(self):
             pass
 
-    rt.GitRepo = FakeGitRepo
-    rt.OpenCodeServer = FakeOCServer
-    rt.Supervisor = SpySupervisor
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "GitRepo", FakeGitRepo)
+    mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+    mp.setattr(rt, "Supervisor", SpySupervisor)
     try:
         run_resume(tmp_path / "repo", run_id)
     except Exception:
         pass
     finally:
-        rt.GitRepo = original_git_repo
-        rt.OpenCodeServer = original_oc_server
-        rt.Supervisor = original_supervisor
+        mp.undo()
 
     assert "Supervisor.__init__" in called
 
@@ -458,8 +441,6 @@ def test_run_new_server_startup_failure_persists_operational_failure(tmp_path):
 
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class FailingOCServer:
         def __init__(self, *a, **kw):
             pass
@@ -470,7 +451,8 @@ def test_run_new_server_startup_failure_persists_operational_failure(tmp_path):
         def stop(self):
             pass
 
-    rt.OpenCodeServer = FailingOCServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingOCServer)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -478,7 +460,7 @@ def test_run_new_server_startup_failure_persists_operational_failure(tmp_path):
         except RuntimeError_:
             pass
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     runs = list_run_ids(tmp_path / "repo")
     assert len(runs) == 1
@@ -503,8 +485,6 @@ def test_run_new_exhausted_malformed_output_persists_and_reports_cleanly(tmp_pat
 
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class MalformedOutputServer:
         def __init__(self, *a, **kw):
             self.base_url = "http://127.0.0.1:9999"
@@ -521,7 +501,8 @@ def test_run_new_exhausted_malformed_output_persists_and_reports_cleanly(tmp_pat
         def run_agent(self, **kwargs):
             return "this is not json at all"
 
-    rt.OpenCodeServer = MalformedOutputServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", MalformedOutputServer)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -529,7 +510,7 @@ def test_run_new_exhausted_malformed_output_persists_and_reports_cleanly(tmp_pat
         except LoopError as exc:
             assert "Traceback" not in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     runs = list_run_ids(tmp_path / "repo")
     assert len(runs) == 1
@@ -559,8 +540,6 @@ def test_run_resume_server_startup_failure_persists_operational_failure(tmp_path
 
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class FailingOCServer:
         def __init__(self, *a, **kw):
             pass
@@ -571,7 +550,8 @@ def test_run_resume_server_startup_failure_persists_operational_failure(tmp_path
         def stop(self):
             pass
 
-    rt.OpenCodeServer = FailingOCServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingOCServer)
     try:
         try:
             run_resume(tmp_path / "repo", run_id)
@@ -579,7 +559,7 @@ def test_run_resume_server_startup_failure_persists_operational_failure(tmp_path
         except RuntimeError_:
             pass
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     reloaded = load_state(repo.common_dir(), run_id)
     assert reloaded.phase == "operational_failure"
@@ -611,8 +591,6 @@ def test_repeated_resume_startup_failure_preserves_original_retry_phase(tmp_path
 
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     def _make_failing_server(message: str):
         class FailingOCServer:
             def __init__(self, *a, **kw):
@@ -626,6 +604,7 @@ def test_repeated_resume_startup_failure_preserves_original_retry_phase(tmp_path
 
         return FailingOCServer
 
+    mp = pytest.MonkeyPatch()
     try:
         # First failure: interrupts a run that has not yet reached
         # PHASE_BUILDING; the resume path's own validation determines the
@@ -633,7 +612,7 @@ def test_repeated_resume_startup_failure_preserves_original_retry_phase(tmp_path
         # fresh run's phase (planning) as the true interrupted phase by
         # failing on run_new instead, then simulate a second failure via
         # run_resume against the resulting operational_failure state.
-        rt.OpenCodeServer = _make_failing_server("first failure")
+        mp.setattr(rt, "OpenCodeServer", _make_failing_server("first failure"))
         try:
             run_resume(tmp_path / "repo", run_id)
             raise AssertionError("expected RuntimeError_ to be raised")
@@ -642,12 +621,13 @@ def test_repeated_resume_startup_failure_preserves_original_retry_phase(tmp_path
 
         first = load_state(repo.common_dir(), run_id)
         assert first.phase == "operational_failure"
+        assert first.last_error is not None
         first_retry_phase = first.last_error["retry_phase"]
         assert first_retry_phase != "operational_failure"
 
         # Second failure on the same still-unrecovered run: retry_phase
         # must be unchanged, not overwritten with "operational_failure".
-        rt.OpenCodeServer = _make_failing_server("second failure")
+        mp.setattr(rt, "OpenCodeServer", _make_failing_server("second failure"))
         try:
             run_resume(tmp_path / "repo", run_id)
             raise AssertionError("expected RuntimeError_ to be raised")
@@ -656,12 +636,13 @@ def test_repeated_resume_startup_failure_preserves_original_retry_phase(tmp_path
 
         second = load_state(repo.common_dir(), run_id)
         assert second.phase == "operational_failure"
+        assert second.last_error is not None
         assert second.last_error["retry_phase"] == first_retry_phase
         assert second.last_error["retry_phase"] != "operational_failure"
         assert "second failure" in second.last_error["message"]
 
         # A third failure continues to preserve it.
-        rt.OpenCodeServer = _make_failing_server("third failure")
+        mp.setattr(rt, "OpenCodeServer", _make_failing_server("third failure"))
         try:
             run_resume(tmp_path / "repo", run_id)
             raise AssertionError("expected RuntimeError_ to be raised")
@@ -669,9 +650,10 @@ def test_repeated_resume_startup_failure_preserves_original_retry_phase(tmp_path
             pass
 
         third = load_state(repo.common_dir(), run_id)
+        assert third.last_error is not None
         assert third.last_error["retry_phase"] == first_retry_phase
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     # Sanity: the preserved retry target is a real dispatchable phase
     # (planning, since the run never advanced past its initial phase).
@@ -689,8 +671,6 @@ def test_run_new_supervisor_failure_takes_precedence_over_server_stop_failure(tm
 
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class FailingStopServer:
         def __init__(self, *a, **kw):
             self.base_url = "http://127.0.0.1:9999"
@@ -704,13 +684,12 @@ def test_run_new_supervisor_failure_takes_precedence_over_server_stop_failure(tm
         def add_observer(self, obs):
             pass
 
-    original_run = Supervisor.run
-
     def _boom_run(self, state, *, max_steps=None):
         raise LoopError("simulated supervisor failure")
 
-    rt.OpenCodeServer = FailingStopServer
-    Supervisor.run = _boom_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingStopServer)
+    mp.setattr(Supervisor, "run", _boom_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -718,8 +697,7 @@ def test_run_new_supervisor_failure_takes_precedence_over_server_stop_failure(tm
         except LoopError as exc:
             assert "simulated supervisor failure" in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     runs = list_run_ids(tmp_path / "repo")
     assert len(runs) == 1
@@ -762,8 +740,6 @@ def test_run_new_successful_run_failed_stop_retains_lock(tmp_path):
 
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class FailingStopServer:
         def __init__(self, *a, **kw):
             self.base_url = "http://127.0.0.1:9999"
@@ -777,14 +753,13 @@ def test_run_new_successful_run_failed_stop_retains_lock(tmp_path):
         def add_observer(self, obs):
             pass
 
-    original_run = Supervisor.run
-
     def _fake_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
-    rt.OpenCodeServer = FailingStopServer
-    Supervisor.run = _fake_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingStopServer)
+    mp.setattr(Supervisor, "run", _fake_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -792,8 +767,7 @@ def test_run_new_successful_run_failed_stop_retains_lock(tmp_path):
         except RuntimeError_ as exc:
             assert "cleanup could not be confirmed" in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     assert _lock_path(repo.common_dir()).exists()
 
@@ -812,8 +786,6 @@ def test_run_new_successful_run_failed_stop_with_unprintable_str_retains_lock(tm
 
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class _UnprintableStopError(RuntimeError):
         def __str__(self) -> str:
             raise RuntimeError("simulated str failure in stop error")
@@ -831,14 +803,13 @@ def test_run_new_successful_run_failed_stop_with_unprintable_str_retains_lock(tm
         def add_observer(self, obs):
             pass
 
-    original_run = Supervisor.run
-
     def _fake_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
-    rt.OpenCodeServer = FailingStopServer
-    Supervisor.run = _fake_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingStopServer)
+    mp.setattr(Supervisor, "run", _fake_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -847,8 +818,7 @@ def test_run_new_successful_run_failed_stop_with_unprintable_str_retains_lock(tm
             assert "cleanup could not be confirmed" in str(exc)
             assert "unprintable _UnprintableStopError" in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     assert _lock_path(repo.common_dir()).exists()
 
@@ -864,8 +834,6 @@ def test_run_new_failed_run_and_failed_stop_preserves_run_exception_and_retains_
 
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class FailingStopServer:
         def __init__(self, *a, **kw):
             self.base_url = "http://127.0.0.1:9999"
@@ -879,13 +847,12 @@ def test_run_new_failed_run_and_failed_stop_preserves_run_exception_and_retains_
         def add_observer(self, obs):
             pass
 
-    original_run = Supervisor.run
-
     def _boom_run(self, state, *, max_steps=None):
         raise LoopError("simulated supervisor failure")
 
-    rt.OpenCodeServer = FailingStopServer
-    Supervisor.run = _boom_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingStopServer)
+    mp.setattr(Supervisor, "run", _boom_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -893,8 +860,7 @@ def test_run_new_failed_run_and_failed_stop_preserves_run_exception_and_retains_
         except LoopError as exc:
             assert "simulated supervisor failure" in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     assert _lock_path(repo.common_dir()).exists()
 
@@ -913,8 +879,6 @@ def test_run_new_failed_startup_and_failed_cleanup_persists_failure_and_retains_
 
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class FailingEverythingServer:
         def __init__(self, *a, **kw):
             pass
@@ -925,7 +889,8 @@ def test_run_new_failed_startup_and_failed_cleanup_persists_failure_and_retains_
         def stop(self):
             raise RuntimeError("simulated cleanup-retry failure")
 
-    rt.OpenCodeServer = FailingEverythingServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingEverythingServer)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -933,7 +898,7 @@ def test_run_new_failed_startup_and_failed_cleanup_persists_failure_and_retains_
         except RuntimeError_ as exc:
             assert "cleanup could not be confirmed" in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     assert _lock_path(repo.common_dir()).exists()
 
@@ -977,8 +942,6 @@ def test_run_resume_successful_run_failed_stop_retains_lock(tmp_path):
 
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class FailingStopServer:
         def __init__(self, *a, **kw):
             self.base_url = "http://127.0.0.1:9999"
@@ -992,14 +955,13 @@ def test_run_resume_successful_run_failed_stop_retains_lock(tmp_path):
         def add_observer(self, obs):
             pass
 
-    original_run = Supervisor.run
-
     def _fake_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
-    rt.OpenCodeServer = FailingStopServer
-    Supervisor.run = _fake_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingStopServer)
+    mp.setattr(Supervisor, "run", _fake_run)
     try:
         try:
             run_resume(tmp_path / "repo", run_id)
@@ -1007,8 +969,7 @@ def test_run_resume_successful_run_failed_stop_retains_lock(tmp_path):
         except RuntimeError_ as exc:
             assert "cleanup could not be confirmed" in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     assert _lock_path(repo.common_dir()).exists()
 
@@ -1032,8 +993,6 @@ def test_run_resume_failed_startup_and_failed_cleanup_retains_lock(tmp_path):
 
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class FailingEverythingServer:
         def __init__(self, *a, **kw):
             pass
@@ -1044,7 +1003,8 @@ def test_run_resume_failed_startup_and_failed_cleanup_retains_lock(tmp_path):
         def stop(self):
             raise RuntimeError("simulated cleanup-retry failure")
 
-    rt.OpenCodeServer = FailingEverythingServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingEverythingServer)
     try:
         try:
             run_resume(tmp_path / "repo", run_id)
@@ -1052,7 +1012,7 @@ def test_run_resume_failed_startup_and_failed_cleanup_retains_lock(tmp_path):
         except RuntimeError_ as exc:
             assert "cleanup could not be confirmed" in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     assert _lock_path(repo.common_dir()).exists()
 
@@ -1107,6 +1067,7 @@ def test_run_new_relative_project_path_uses_canonical_lock_metadata(tmp_path, mo
         run_new(Path("repo"), _make_options())
 
     record = captured["record"]
+    assert isinstance(record, dict)
     assert record["integration_path"] == str(repo.root)
     assert Path(record["integration_path"]).is_absolute()
 
@@ -1158,7 +1119,9 @@ def test_confirm_server_stopped_retries_exact_count_and_backoff(monkeypatch):
             raise RuntimeError(f"fail {self.stop_calls}")
 
     server = AlwaysFailsServer()
-    outcome = rt._confirm_server_stopped(server)
+    # AlwaysFailsServer is a duck-typed fake (only .stop()), not a real
+    # OpenCodeServer; _confirm_server_stopped only ever calls .stop() on it.
+    outcome = rt._confirm_server_stopped(server)  # type: ignore[arg-type]
 
     assert outcome.confirmed is False
     assert outcome.attempts == rt._CLEANUP_ATTEMPTS
@@ -1201,7 +1164,9 @@ def test_confirm_server_stopped_never_discards_server_handle(monkeypatch):
                 raise RuntimeError("transient")
 
     server = TrackedServer()
-    outcome = rt._confirm_server_stopped(server)
+    # TrackedServer is a duck-typed fake (only .stop()), not a real
+    # OpenCodeServer; _confirm_server_stopped only ever calls .stop() on it.
+    outcome = rt._confirm_server_stopped(server)  # type: ignore[arg-type]
     assert outcome.confirmed is True
     assert len(set(seen_instances)) == 1
     assert seen_instances[0] == id(server)
@@ -1218,15 +1183,17 @@ def test_run_new_startup_transient_stop_failure_then_success_releases_lock(tmp_p
     import loop_supervisor.runtime as rt
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
-    original_oc_server = rt.OpenCodeServer
 
     Server = _flaky_stop_server(fail_times=1)
 
-    class FailingStartServer(Server):
+    # Server is a class object returned from a runtime factory, not a
+    # statically known type, so mypy cannot verify it as a base class.
+    class FailingStartServer(Server):  # type: ignore[misc,valid-type]
         def start(self) -> None:
             raise ServerStartupError("simulated startup failure")
 
-    rt.OpenCodeServer = FailingStartServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingStartServer)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -1234,7 +1201,7 @@ def test_run_new_startup_transient_stop_failure_then_success_releases_lock(tmp_p
         except RuntimeError_:
             pass
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     assert not _lock_path(repo.common_dir()).exists()
 
@@ -1250,7 +1217,6 @@ def test_run_new_startup_failure_retry_exhaustion_retains_lock(tmp_path, monkeyp
     import loop_supervisor.runtime as rt
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
-    original_oc_server = rt.OpenCodeServer
 
     class FailingEverythingServer:
         def __init__(self, *a, **kw) -> None:
@@ -1262,7 +1228,8 @@ def test_run_new_startup_failure_retry_exhaustion_retains_lock(tmp_path, monkeyp
         def stop(self) -> None:
             raise RuntimeError("simulated cleanup-retry failure")
 
-    rt.OpenCodeServer = FailingEverythingServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingEverythingServer)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -1270,7 +1237,7 @@ def test_run_new_startup_failure_retry_exhaustion_retains_lock(tmp_path, monkeyp
         except RuntimeError_ as exc:
             assert "cleanup could not be confirmed" in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     assert _lock_path(repo.common_dir()).exists()
 
@@ -1292,7 +1259,6 @@ def test_run_new_startup_failure_retry_exhaustion_with_unprintable_cleanup_error
     import loop_supervisor.runtime as rt
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
-    original_oc_server = rt.OpenCodeServer
 
     class _UnprintableCleanupError(RuntimeError):
         def __str__(self) -> str:
@@ -1308,7 +1274,8 @@ def test_run_new_startup_failure_retry_exhaustion_with_unprintable_cleanup_error
         def stop(self) -> None:
             raise _UnprintableCleanupError("unprintable")
 
-    rt.OpenCodeServer = FailingEverythingServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingEverythingServer)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -1317,7 +1284,7 @@ def test_run_new_startup_failure_retry_exhaustion_with_unprintable_cleanup_error
             assert "cleanup could not be confirmed" in str(exc)
             assert "unprintable _UnprintableCleanupError" in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     assert _lock_path(repo.common_dir()).exists()
 
@@ -1336,9 +1303,6 @@ def test_run_new_startup_failure_persistence_error_with_unprintable_str(tmp_path
     import loop_supervisor.runtime as rt
     import loop_supervisor.supervisor as sup_module
 
-    original_oc_server = rt.OpenCodeServer
-    original_record = sup_module.Supervisor.record_external_failure
-
     class _UnprintablePersistError(RuntimeError):
         def __str__(self) -> str:
             raise RuntimeError("simulated str failure in persistence error")
@@ -1356,8 +1320,9 @@ def test_run_new_startup_failure_persistence_error_with_unprintable_str(tmp_path
     def _boom_record(self, state, *, exc, phase):
         raise _UnprintablePersistError("cannot persist")
 
-    rt.OpenCodeServer = FailingOCServer
-    sup_module.Supervisor.record_external_failure = _boom_record
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingOCServer)
+    mp.setattr(sup_module.Supervisor, "record_external_failure", _boom_record)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -1366,8 +1331,7 @@ def test_run_new_startup_failure_persistence_error_with_unprintable_str(tmp_path
             assert "could not be persisted" in str(exc)
             assert "unprintable _UnprintablePersistError" in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
-        sup_module.Supervisor.record_external_failure = original_record
+        mp.undo()
 
 
 def test_run_new_startup_keyboard_interrupt_preserves_identity(tmp_path):
@@ -1381,7 +1345,6 @@ def test_run_new_startup_keyboard_interrupt_preserves_identity(tmp_path):
     repo = _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
     the_interrupt = KeyboardInterrupt()
 
     class InterruptingServer:
@@ -1397,13 +1360,14 @@ def test_run_new_startup_keyboard_interrupt_preserves_identity(tmp_path):
         def add_observer(self, obs) -> None:
             pass
 
-    rt.OpenCodeServer = InterruptingServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", InterruptingServer)
     try:
         with pytest.raises(KeyboardInterrupt) as excinfo:
             run_new(tmp_path / "repo", _make_options())
         assert excinfo.value is the_interrupt
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     runs = list_run_ids(tmp_path / "repo")
     assert len(runs) == 1
@@ -1450,7 +1414,6 @@ def test_run_new_startup_keyboard_interrupt_preserves_exact_traceback(tmp_path):
     _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
     the_interrupt = KeyboardInterrupt()
 
     class InterruptingServer:
@@ -1466,7 +1429,8 @@ def test_run_new_startup_keyboard_interrupt_preserves_exact_traceback(tmp_path):
         def add_observer(self, obs) -> None:
             pass
 
-    rt.OpenCodeServer = InterruptingServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", InterruptingServer)
     try:
         with pytest.raises(KeyboardInterrupt) as excinfo:
             run_new(tmp_path / "repo", _make_options())
@@ -1481,7 +1445,7 @@ def test_run_new_startup_keyboard_interrupt_preserves_exact_traceback(tmp_path):
             tail_func="start",
         )
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
 
 def test_run_resume_startup_keyboard_interrupt_preserves_exact_traceback(tmp_path):
@@ -1506,7 +1470,6 @@ def test_run_resume_startup_keyboard_interrupt_preserves_exact_traceback(tmp_pat
 
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
     the_interrupt = KeyboardInterrupt()
 
     class InterruptingServer:
@@ -1522,7 +1485,8 @@ def test_run_resume_startup_keyboard_interrupt_preserves_exact_traceback(tmp_pat
         def add_observer(self, obs) -> None:
             pass
 
-    rt.OpenCodeServer = InterruptingServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", InterruptingServer)
     try:
         with pytest.raises(KeyboardInterrupt) as excinfo:
             run_resume(tmp_path / "repo", run_id)
@@ -1537,7 +1501,7 @@ def test_run_resume_startup_keyboard_interrupt_preserves_exact_traceback(tmp_pat
             tail_func="start",
         )
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
 
 def test_run_new_startup_system_exit_preserves_identity(tmp_path):
@@ -1546,7 +1510,6 @@ def test_run_new_startup_system_exit_preserves_identity(tmp_path):
     _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
     the_exit = SystemExit(2)
 
     class ExitingServer:
@@ -1562,13 +1525,14 @@ def test_run_new_startup_system_exit_preserves_identity(tmp_path):
         def add_observer(self, obs) -> None:
             pass
 
-    rt.OpenCodeServer = ExitingServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", ExitingServer)
     try:
         with pytest.raises(SystemExit) as excinfo:
             run_new(tmp_path / "repo", _make_options())
         assert excinfo.value is the_exit
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
 
 def test_run_new_startup_system_exit_preserves_exact_traceback(tmp_path):
@@ -1580,7 +1544,6 @@ def test_run_new_startup_system_exit_preserves_exact_traceback(tmp_path):
     _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
     the_exit = SystemExit(2)
 
     class ExitingServer:
@@ -1596,7 +1559,8 @@ def test_run_new_startup_system_exit_preserves_exact_traceback(tmp_path):
         def add_observer(self, obs) -> None:
             pass
 
-    rt.OpenCodeServer = ExitingServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", ExitingServer)
     try:
         with pytest.raises(SystemExit) as excinfo:
             run_new(tmp_path / "repo", _make_options())
@@ -1611,7 +1575,7 @@ def test_run_new_startup_system_exit_preserves_exact_traceback(tmp_path):
             tail_func="start",
         )
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
 
 def test_run_new_startup_keyboard_interrupt_with_unresolved_cleanup_has_note(tmp_path):
@@ -1625,7 +1589,6 @@ def test_run_new_startup_keyboard_interrupt_with_unresolved_cleanup_has_note(tmp
     repo = _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
     the_interrupt = KeyboardInterrupt()
 
     class InterruptingServer:
@@ -1641,7 +1604,8 @@ def test_run_new_startup_keyboard_interrupt_with_unresolved_cleanup_has_note(tmp
         def add_observer(self, obs) -> None:
             pass
 
-    rt.OpenCodeServer = InterruptingServer
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", InterruptingServer)
     try:
         with pytest.raises(KeyboardInterrupt) as excinfo:
             run_new(tmp_path / "repo", _make_options())
@@ -1656,7 +1620,7 @@ def test_run_new_startup_keyboard_interrupt_with_unresolved_cleanup_has_note(tmp
             tail_func="start",
         )
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     notes = getattr(the_interrupt, "__notes__", [])
     assert any("cleanup" in n.lower() and "retained" in n.lower() for n in notes), notes
@@ -1672,7 +1636,6 @@ def test_run_new_runner_assignment_failure_still_cleans_started_server(tmp_path)
     _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
     call_log: list[str] = []
 
     class RecordingServer:
@@ -1699,9 +1662,9 @@ def test_run_new_runner_assignment_failure_still_cleans_started_server(tmp_path)
                 raise LoopError("simulated runner-assignment failure")
             self._runner = value
 
-    rt.OpenCodeServer = RecordingServer
-    original_supervisor = rt.Supervisor
-    rt.Supervisor = BoomOnRunnerSupervisor
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", RecordingServer)
+    mp.setattr(rt, "Supervisor", BoomOnRunnerSupervisor)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -1709,8 +1672,7 @@ def test_run_new_runner_assignment_failure_still_cleans_started_server(tmp_path)
         except LoopError:
             pass
     finally:
-        rt.OpenCodeServer = original_oc_server
-        rt.Supervisor = original_supervisor
+        mp.undo()
 
     assert "server_start" in call_log
     assert "server_stop" in call_log
@@ -1727,22 +1689,19 @@ def test_run_new_successful_run_transient_cleanup_failure_then_success(tmp_path,
     import loop_supervisor.runtime as rt
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
-    original_oc_server = rt.OpenCodeServer
     Server = _flaky_stop_server(fail_times=1)
-
-    original_run = Supervisor.run
 
     def _fake_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
-    rt.OpenCodeServer = Server
-    Supervisor.run = _fake_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", Server)
+    mp.setattr(Supervisor, "run", _fake_run)
     try:
         run_new(tmp_path / "repo", _make_options())
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     assert not _lock_path(repo.common_dir()).exists()
 
@@ -1756,17 +1715,15 @@ def test_run_new_successful_run_cleanup_exhaustion_retains_lock(tmp_path, monkey
     import loop_supervisor.runtime as rt
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
-    original_oc_server = rt.OpenCodeServer
     Server = _flaky_stop_server(fail_times=999)
-
-    original_run = Supervisor.run
 
     def _fake_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
-    rt.OpenCodeServer = Server
-    Supervisor.run = _fake_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", Server)
+    mp.setattr(Supervisor, "run", _fake_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -1774,8 +1731,7 @@ def test_run_new_successful_run_cleanup_exhaustion_retains_lock(tmp_path, monkey
         except RuntimeError_ as exc:
             assert "cleanup could not be confirmed" in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     assert _lock_path(repo.common_dir()).exists()
 
@@ -1791,16 +1747,14 @@ def test_run_new_failed_run_transient_cleanup_failure_then_success(tmp_path, mon
     import loop_supervisor.runtime as rt
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
-    original_oc_server = rt.OpenCodeServer
     Server = _flaky_stop_server(fail_times=1)
-
-    original_run = Supervisor.run
 
     def _boom_run(self, state, *, max_steps=None):
         raise LoopError("simulated supervisor failure")
 
-    rt.OpenCodeServer = Server
-    Supervisor.run = _boom_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", Server)
+    mp.setattr(Supervisor, "run", _boom_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -1808,8 +1762,7 @@ def test_run_new_failed_run_transient_cleanup_failure_then_success(tmp_path, mon
         except LoopError:
             pass
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     assert not _lock_path(repo.common_dir()).exists()
 
@@ -1828,17 +1781,16 @@ def test_run_new_failed_run_cleanup_exhaustion_retains_exact_primary_with_notes(
     import loop_supervisor.runtime as rt
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
-    original_oc_server = rt.OpenCodeServer
     Server = _flaky_stop_server(fail_times=999)
 
-    original_run = Supervisor.run
     the_failure = LoopError("simulated supervisor failure")
 
     def _boom_run(self, state, *, max_steps=None):
         raise the_failure
 
-    rt.OpenCodeServer = Server
-    Supervisor.run = _boom_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", Server)
+    mp.setattr(Supervisor, "run", _boom_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -1846,8 +1798,7 @@ def test_run_new_failed_run_cleanup_exhaustion_retains_exact_primary_with_notes(
         except LoopError as exc:
             assert exc is the_failure
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     notes = getattr(the_failure, "__notes__", [])
     assert any("cleanup" in n.lower() and "retained" in n.lower() for n in notes), notes
@@ -1862,8 +1813,6 @@ def test_run_new_run_time_keyboard_interrupt_preserves_identity(tmp_path):
     _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class RecordingServer:
         def __init__(self, *a, **kw) -> None:
             self.base_url = "http://127.0.0.1:9999"
@@ -1877,21 +1826,20 @@ def test_run_new_run_time_keyboard_interrupt_preserves_identity(tmp_path):
         def add_observer(self, obs) -> None:
             pass
 
-    original_run = Supervisor.run
     the_interrupt = KeyboardInterrupt()
 
     def _boom_run(self, state, *, max_steps=None):
         raise the_interrupt
 
-    rt.OpenCodeServer = RecordingServer
-    Supervisor.run = _boom_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", RecordingServer)
+    mp.setattr(Supervisor, "run", _boom_run)
     try:
         with pytest.raises(KeyboardInterrupt) as excinfo:
             run_new(tmp_path / "repo", _make_options())
         assert excinfo.value is the_interrupt
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
 
 def test_run_new_cleanup_time_keyboard_interrupt_does_not_replace_primary(tmp_path):
@@ -1904,8 +1852,6 @@ def test_run_new_cleanup_time_keyboard_interrupt_does_not_replace_primary(tmp_pa
 
     repo = _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
-
-    original_oc_server = rt.OpenCodeServer
 
     class InterruptingStopServer:
         def __init__(self, *a, **kw) -> None:
@@ -1920,14 +1866,14 @@ def test_run_new_cleanup_time_keyboard_interrupt_does_not_replace_primary(tmp_pa
         def add_observer(self, obs) -> None:
             pass
 
-    original_run = Supervisor.run
     the_failure = LoopError("simulated supervisor failure")
 
     def _boom_run(self, state, *, max_steps=None):
         raise the_failure
 
-    rt.OpenCodeServer = InterruptingStopServer
-    Supervisor.run = _boom_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", InterruptingStopServer)
+    mp.setattr(Supervisor, "run", _boom_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -1935,8 +1881,7 @@ def test_run_new_cleanup_time_keyboard_interrupt_does_not_replace_primary(tmp_pa
         except LoopError as exc:
             assert exc is the_failure
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     assert _lock_path(repo.common_dir()).exists()
 
@@ -1955,7 +1900,6 @@ def test_run_new_persistence_failure_plus_cleanup_failure(tmp_path, monkeypatch)
     import loop_supervisor.runtime as rt
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
-    original_oc_server = rt.OpenCodeServer
 
     class FailingEverythingServer:
         def __init__(self, *a, **kw) -> None:
@@ -1967,13 +1911,12 @@ def test_run_new_persistence_failure_plus_cleanup_failure(tmp_path, monkeypatch)
         def stop(self) -> None:
             raise RuntimeError("simulated cleanup failure")
 
-    original_record_external_failure = Supervisor.record_external_failure
-
     def _boom_record_external_failure(self, *a, **kw):
         raise RuntimeError("simulated persistence failure")
 
-    rt.OpenCodeServer = FailingEverythingServer
-    Supervisor.record_external_failure = _boom_record_external_failure
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", FailingEverythingServer)
+    mp.setattr(Supervisor, "record_external_failure", _boom_record_external_failure)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -1983,8 +1926,7 @@ def test_run_new_persistence_failure_plus_cleanup_failure(tmp_path, monkeypatch)
             assert "could not be persisted" in message
             assert "cleanup could not be confirmed" in message
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.record_external_failure = original_record_external_failure
+        mp.undo()
 
     assert _lock_path(repo.common_dir()).exists()
 
@@ -1999,8 +1941,6 @@ def test_run_new_lock_release_failure_with_existing_primary_attaches_note(tmp_pa
     _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class CleanServer:
         def __init__(self, *a, **kw) -> None:
             self.base_url = "http://127.0.0.1:9999"
@@ -2014,19 +1954,17 @@ def test_run_new_lock_release_failure_with_existing_primary_attaches_note(tmp_pa
         def add_observer(self, obs) -> None:
             pass
 
-    original_run = Supervisor.run
     the_failure = LoopError("simulated supervisor failure")
 
     def _boom_run(self, state, *, max_steps=None):
         raise the_failure
 
-    original_lock_release = rt._LockLease.release
-
     def _boom_release(self):
         raise LockError("simulated lock-release failure")
 
-    rt.OpenCodeServer = CleanServer
-    Supervisor.run = _boom_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", CleanServer)
+    mp.setattr(Supervisor, "run", _boom_run)
     monkeypatch.setattr(rt._LockLease, "release", _boom_release)
     try:
         try:
@@ -2035,9 +1973,7 @@ def test_run_new_lock_release_failure_with_existing_primary_attaches_note(tmp_pa
         except LoopError as exc:
             assert exc is the_failure
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
-        rt._LockLease.release = original_lock_release
+        mp.undo()
 
     notes = getattr(the_failure, "__notes__", [])
     assert any("lock could not be released" in n.lower() for n in notes), notes
@@ -2056,8 +1992,6 @@ def test_run_new_lock_release_failure_with_unprintable_str_attaches_safe_note(
     _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
-    original_oc_server = rt.OpenCodeServer
-
     class CleanServer:
         def __init__(self, *a, **kw) -> None:
             self.base_url = "http://127.0.0.1:9999"
@@ -2071,7 +2005,6 @@ def test_run_new_lock_release_failure_with_unprintable_str_attaches_safe_note(
         def add_observer(self, obs) -> None:
             pass
 
-    original_run = Supervisor.run
     the_failure = LoopError("simulated supervisor failure")
 
     def _boom_run(self, state, *, max_steps=None):
@@ -2081,13 +2014,12 @@ def test_run_new_lock_release_failure_with_unprintable_str_attaches_safe_note(
         def __str__(self) -> str:
             raise RuntimeError("simulated str failure in lock error")
 
-    original_lock_release = rt._LockLease.release
-
     def _boom_release(self):
         raise _UnprintableLockError("simulated lock-release failure")
 
-    rt.OpenCodeServer = CleanServer
-    Supervisor.run = _boom_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", CleanServer)
+    mp.setattr(Supervisor, "run", _boom_run)
     monkeypatch.setattr(rt._LockLease, "release", _boom_release)
     try:
         try:
@@ -2096,9 +2028,7 @@ def test_run_new_lock_release_failure_with_unprintable_str_attaches_safe_note(
         except LoopError as exc:
             assert exc is the_failure
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
-        rt._LockLease.release = original_lock_release
+        mp.undo()
 
     notes = getattr(the_failure, "__notes__", [])
     assert any(
@@ -2116,7 +2046,6 @@ def test_lock_file_released_only_after_confirmed_cleanup(tmp_path, monkeypatch):
     import loop_supervisor.runtime as rt
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
-    original_oc_server = rt.OpenCodeServer
 
     lock_present_during_stop: list[bool] = []
 
@@ -2137,19 +2066,17 @@ def test_lock_file_released_only_after_confirmed_cleanup(tmp_path, monkeypatch):
         def add_observer(self, obs) -> None:
             pass
 
-    original_run = Supervisor.run
-
     def _fake_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
-    rt.OpenCodeServer = ObservingServer
-    Supervisor.run = _fake_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", ObservingServer)
+    mp.setattr(Supervisor, "run", _fake_run)
     try:
         run_new(tmp_path / "repo", _make_options())
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     assert lock_present_during_stop == [True, True]
     assert not _lock_path(repo.common_dir()).exists()
@@ -2193,10 +2120,6 @@ def test_run_new_uses_supplied_input_provider(tmp_path):
     received_providers: list[object] = []
     sentinel_provider = object()
 
-    original_supervisor = rt.Supervisor
-    original_oc_server = rt.OpenCodeServer
-    original_git_repo = rt.GitRepo
-
     class FakeGitRepo:
         def __init__(self, *a, **kw):
             self.root = repo.root
@@ -2236,15 +2159,20 @@ def test_run_new_uses_supplied_input_provider(tmp_path):
         def runner(self, v):
             pass
 
-    rt.GitRepo = FakeGitRepo
-    rt.OpenCodeServer = FakeOCServer
-    rt.Supervisor = SpySupervisor
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "GitRepo", FakeGitRepo)
+    mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+    mp.setattr(rt, "Supervisor", SpySupervisor)
     try:
-        run_new(tmp_path / "repo", _make_options(), input_provider=sentinel_provider)
+        # sentinel_provider is a bare object() used only for identity
+        # comparison below, not a real InputProvider.
+        run_new(
+            tmp_path / "repo",
+            _make_options(),
+            input_provider=sentinel_provider,  # type: ignore[arg-type]
+        )
     finally:
-        rt.GitRepo = original_git_repo
-        rt.OpenCodeServer = original_oc_server
-        rt.Supervisor = original_supervisor
+        mp.undo()
 
     assert received_providers == [sentinel_provider]
 
@@ -2260,10 +2188,6 @@ def test_run_new_defaults_to_stdin_input_provider_when_not_supplied(tmp_path):
 
     received_providers: list[object] = []
 
-    original_supervisor = rt.Supervisor
-    original_oc_server = rt.OpenCodeServer
-    original_git_repo = rt.GitRepo
-
     class FakeGitRepo:
         def __init__(self, *a, **kw):
             self.root = repo.root
@@ -2303,15 +2227,14 @@ def test_run_new_defaults_to_stdin_input_provider_when_not_supplied(tmp_path):
         def runner(self, v):
             pass
 
-    rt.GitRepo = FakeGitRepo
-    rt.OpenCodeServer = FakeOCServer
-    rt.Supervisor = SpySupervisor
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "GitRepo", FakeGitRepo)
+    mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+    mp.setattr(rt, "Supervisor", SpySupervisor)
     try:
         run_new(tmp_path / "repo", _make_options())
     finally:
-        rt.GitRepo = original_git_repo
-        rt.OpenCodeServer = original_oc_server
-        rt.Supervisor = original_supervisor
+        mp.undo()
 
     assert len(received_providers) == 1
     assert isinstance(received_providers[0], StdinInputProvider)
@@ -2377,9 +2300,13 @@ def test_characterize_startup_failure_stop_attempts_are_bounded(tmp_path, monkey
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     counter = [0]
-    original_oc_server = rt.OpenCodeServer
-    rt.OpenCodeServer = _characterization_server(
-        counter, start_exc=ServerStartupError("simulated startup failure")
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        rt,
+        "OpenCodeServer",
+        _characterization_server(
+            counter, start_exc=ServerStartupError("simulated startup failure")
+        ),
     )
     try:
         try:
@@ -2388,7 +2315,7 @@ def test_characterize_startup_failure_stop_attempts_are_bounded(tmp_path, monkey
         except RuntimeError_:
             pass
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     assert counter[0] == rt._CLEANUP_ATTEMPTS
 
@@ -2402,14 +2329,13 @@ def test_characterize_run_failure_stop_attempts_are_bounded(tmp_path, monkeypatc
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     counter = [0]
-    original_oc_server = rt.OpenCodeServer
-    original_run = Supervisor.run
 
     def _boom_run(self, state, *, max_steps=None):
         raise LoopError("simulated supervisor failure")
 
-    rt.OpenCodeServer = _characterization_server(counter)
-    Supervisor.run = _boom_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", _characterization_server(counter))
+    mp.setattr(Supervisor, "run", _boom_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -2417,8 +2343,7 @@ def test_characterize_run_failure_stop_attempts_are_bounded(tmp_path, monkeypatc
         except LoopError:
             pass
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     assert counter[0] == rt._CLEANUP_ATTEMPTS
 
@@ -2433,15 +2358,14 @@ def test_characterize_successful_run_stop_attempts_are_bounded(tmp_path, monkeyp
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     counter = [0]
-    original_oc_server = rt.OpenCodeServer
-    original_run = Supervisor.run
 
     def _ok_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
-    rt.OpenCodeServer = _characterization_server(counter)
-    Supervisor.run = _ok_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", _characterization_server(counter))
+    mp.setattr(Supervisor, "run", _ok_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -2449,8 +2373,7 @@ def test_characterize_successful_run_stop_attempts_are_bounded(tmp_path, monkeyp
         except RuntimeError_:
             pass
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     assert counter[0] == rt._CLEANUP_ATTEMPTS
 
@@ -2470,15 +2393,14 @@ def test_characterize_run_failure_unresolved_cleanup_note_exact_wording(tmp_path
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     counter = [0]
-    original_oc_server = rt.OpenCodeServer
-    original_run = Supervisor.run
     the_failure = LoopError("simulated supervisor failure")
 
     def _boom_run(self, state, *, max_steps=None):
         raise the_failure
 
-    rt.OpenCodeServer = _characterization_server(counter)
-    Supervisor.run = _boom_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", _characterization_server(counter))
+    mp.setattr(Supervisor, "run", _boom_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -2486,8 +2408,7 @@ def test_characterize_run_failure_unresolved_cleanup_note_exact_wording(tmp_path
         except LoopError as exc:
             assert exc is the_failure
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     notes = getattr(the_failure, "__notes__", [])
     assert len(notes) == 1, notes
@@ -2508,9 +2429,13 @@ def test_characterize_startup_failure_unresolved_cleanup_note_exact_wording(tmp_
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     counter = [0]
-    original_oc_server = rt.OpenCodeServer
-    rt.OpenCodeServer = _characterization_server(
-        counter, start_exc=ServerStartupError("simulated startup failure")
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        rt,
+        "OpenCodeServer",
+        _characterization_server(
+            counter, start_exc=ServerStartupError("simulated startup failure")
+        ),
     )
     try:
         try:
@@ -2524,7 +2449,7 @@ def test_characterize_startup_failure_unresolved_cleanup_note_exact_wording(tmp_
             ), notes[0]
             assert str(exc).startswith("failed to start OpenCode server:"), str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
 
 def test_characterize_successful_run_unresolved_cleanup_message_exact_wording(
@@ -2541,15 +2466,14 @@ def test_characterize_successful_run_unresolved_cleanup_message_exact_wording(
 
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     counter = [0]
-    original_oc_server = rt.OpenCodeServer
-    original_run = Supervisor.run
 
     def _ok_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
-    rt.OpenCodeServer = _characterization_server(counter)
-    Supervisor.run = _ok_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", _characterization_server(counter))
+    mp.setattr(Supervisor, "run", _ok_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -2560,8 +2484,7 @@ def test_characterize_successful_run_unresolved_cleanup_message_exact_wording(
             ), str(exc)
             assert getattr(exc, "__notes__", []) == []
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
 
 def test_characterize_startup_keyboard_interrupt_successful_cleanup_releases_lock(tmp_path):
@@ -2580,14 +2503,18 @@ def test_characterize_startup_keyboard_interrupt_successful_cleanup_releases_loc
 
     counter = [0]
     the_interrupt = KeyboardInterrupt()
-    original_oc_server = rt.OpenCodeServer
-    rt.OpenCodeServer = _characterization_server(counter, start_exc=the_interrupt, stop_fails=False)
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        rt,
+        "OpenCodeServer",
+        _characterization_server(counter, start_exc=the_interrupt, stop_fails=False),
+    )
     try:
         with pytest.raises(KeyboardInterrupt) as excinfo:
             run_new(tmp_path / "repo", _make_options())
         assert excinfo.value is the_interrupt
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     assert counter[0] == 1
     assert getattr(the_interrupt, "__notes__", []) == []
@@ -2605,14 +2532,18 @@ def test_characterize_startup_system_exit_successful_cleanup_releases_lock(tmp_p
 
     counter = [0]
     the_exit = SystemExit(2)
-    original_oc_server = rt.OpenCodeServer
-    rt.OpenCodeServer = _characterization_server(counter, start_exc=the_exit, stop_fails=False)
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        rt,
+        "OpenCodeServer",
+        _characterization_server(counter, start_exc=the_exit, stop_fails=False),
+    )
     try:
         with pytest.raises(SystemExit) as excinfo:
             run_new(tmp_path / "repo", _make_options())
         assert excinfo.value is the_exit
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     assert counter[0] == 1
     assert getattr(the_exit, "__notes__", []) == []
@@ -2632,14 +2563,18 @@ def test_characterize_startup_interrupt_unresolved_cleanup_retains_lock_with_one
 
     counter = [0]
     the_interrupt = KeyboardInterrupt()
-    original_oc_server = rt.OpenCodeServer
-    rt.OpenCodeServer = _characterization_server(counter, start_exc=the_interrupt, stop_fails=True)
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        rt,
+        "OpenCodeServer",
+        _characterization_server(counter, start_exc=the_interrupt, stop_fails=True),
+    )
     try:
         with pytest.raises(KeyboardInterrupt) as excinfo:
             run_new(tmp_path / "repo", _make_options())
         assert excinfo.value is the_interrupt
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
     assert counter[0] == rt._CLEANUP_ATTEMPTS
     notes = getattr(the_interrupt, "__notes__", [])
@@ -2666,8 +2601,6 @@ def test_characterize_runner_handoff_failure_is_raw_and_not_persisted(tmp_path):
     import loop_supervisor.runtime as rt
 
     counter = [0]
-    original_oc_server = rt.OpenCodeServer
-    original_supervisor = rt.Supervisor
 
     class BoomOnRunnerSupervisor(Supervisor):
         @property
@@ -2680,8 +2613,9 @@ def test_characterize_runner_handoff_failure_is_raw_and_not_persisted(tmp_path):
                 raise LoopError("simulated runner-assignment failure")
             self._runner = value
 
-    rt.OpenCodeServer = _characterization_server(counter, stop_fails=False)
-    rt.Supervisor = BoomOnRunnerSupervisor
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", _characterization_server(counter, stop_fails=False))
+    mp.setattr(rt, "Supervisor", BoomOnRunnerSupervisor)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -2690,8 +2624,7 @@ def test_characterize_runner_handoff_failure_is_raw_and_not_persisted(tmp_path):
             assert not isinstance(exc, rt.RuntimeError_)
             assert "simulated runner-assignment failure" in str(exc)
     finally:
-        rt.OpenCodeServer = original_oc_server
-        rt.Supervisor = original_supervisor
+        mp.undo()
 
     runs = list_run_ids(tmp_path / "repo")
     assert len(runs) == 1
@@ -2782,14 +2715,11 @@ def _patched_session_env(repo, *, server_cls=None, supervisor_cls=None, call_log
             call_log.append("runner_set")
             self._runner = value
 
-    originals = (rt.GitRepo, rt.OpenCodeServer, rt.Supervisor)
-    rt.GitRepo = FakeGitRepo
-    rt.OpenCodeServer = server_cls or DefaultServer
-    rt.Supervisor = supervisor_cls or DefaultSupervisor
-    try:
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(rt, "GitRepo", FakeGitRepo)
+        mp.setattr(rt, "OpenCodeServer", server_cls or DefaultServer)
+        mp.setattr(rt, "Supervisor", supervisor_cls or DefaultSupervisor)
         yield call_log
-    finally:
-        rt.GitRepo, rt.OpenCodeServer, rt.Supervisor = originals
 
 
 # --- state machine: happy path ---------------------------------------
@@ -3088,6 +3018,7 @@ def test_run_session_start_server_installs_runner(tmp_path):
         session = rt.new_run_session(repo.root, _make_options())
         with session:
             session.start_server()
+            assert session._supervisor is not None
             assert session._supervisor.runner is session._server
     assert "runner_set" in call_log
     assert call_log.index("server_start") < call_log.index("runner_set")
@@ -3109,7 +3040,7 @@ def test_run_session_advance_dispatches_against_started_server(tmp_path):
 
     class RunnerSensitiveSupervisor:
         def __init__(self, *a, **kw):
-            self._runner = None
+            self._runner: Any = None
 
         def start_new_run(self):
             state = MagicMock()
@@ -3400,19 +3331,18 @@ def test_run_session_enter_lock_release_failure_attaches_note(tmp_path):
         def start_new_run(self):
             raise RuntimeError("state creation failed")
 
-    original_release = rt._LockLease.release
-
     def _boom_release(self):
         raise LockError("release failed")
 
     with _patched_session_env(repo, supervisor_cls=BoomSupervisor):
-        rt._LockLease.release = _boom_release
+        mp = pytest.MonkeyPatch()
+        mp.setattr(rt._LockLease, "release", _boom_release)
         try:
             session = rt.new_run_session(repo.root, _make_options())
             with pytest.raises(RuntimeError, match="state creation failed") as excinfo:
                 session.__enter__()
         finally:
-            rt._LockLease.release = original_release
+            mp.undo()
 
     notes = getattr(excinfo.value, "__notes__", [])
     assert any("lock could not be released" in n.lower() for n in notes), notes
@@ -3524,6 +3454,7 @@ def test_run_session_cleanup_unresolved_stays_unresolved_on_repeated_failure(tmp
             # before cleanup is confirmed. Asserting only the lock file is
             # not enough -- it is written at acquire time, so a wrongly
             # released lease is invisible until something calls release().
+            assert session._lease is not None
             assert not session._lease.releasable
 
 
@@ -3596,13 +3527,12 @@ def test_run_session_close_raising_does_not_replace_body_exception(tmp_path):
     repo = _init_repo(tmp_path / "repo")
     the_error = ValueError("body blew up")
 
-    original_release = rt._LockLease.release
-
     def _boom_release(self):
         raise LockError("release failed")
 
     with _patched_session_env(repo):
-        rt._LockLease.release = _boom_release
+        mp = pytest.MonkeyPatch()
+        mp.setattr(rt._LockLease, "release", _boom_release)
         try:
             session = rt.new_run_session(repo.root, _make_options())
             with pytest.raises(ValueError) as excinfo:
@@ -3610,7 +3540,7 @@ def test_run_session_close_raising_does_not_replace_body_exception(tmp_path):
                     session.start_server()
                     raise the_error
         finally:
-            rt._LockLease.release = original_release
+            mp.undo()
 
     assert excinfo.value is the_error
     frame_names = [tb.tb_frame.f_code.co_name for tb in _traceback_frames(excinfo.value)]
@@ -3645,7 +3575,13 @@ def test_run_session_server_observer_installed_before_start(tmp_path):
             pass
 
     with _patched_session_env(repo, server_cls=SpyServer):
-        session = rt.new_run_session(repo.root, _make_options(), server_observer=sentinel)
+        # sentinel is a bare object() used only for identity comparison
+        # above, not a real InvocationObserver.
+        session = rt.new_run_session(
+            repo.root,
+            _make_options(),
+            server_observer=sentinel,  # type: ignore[arg-type]
+        )
         with session:
             session.start_server()
 
@@ -3661,7 +3597,7 @@ def test_run_session_add_observer_rejected_before_enter(tmp_path):
     repo = _init_repo(tmp_path / "repo")
     session = rt.new_run_session(repo.root, _make_options())
     with pytest.raises(RuntimeError_, match="entered session"):
-        session.add_observer(object())
+        session.add_observer(object())  # type: ignore[arg-type]
 
 
 def test_run_session_abort_active_invocations_is_safe_before_enter(tmp_path):
@@ -3717,7 +3653,13 @@ def test_run_session_passes_supplied_input_provider(tmp_path):
             self._runner = v
 
     with _patched_session_env(repo, supervisor_cls=SpySupervisor):
-        session = rt.new_run_session(repo.root, _make_options(), input_provider=sentinel)
+        # sentinel is a bare object() used only for identity comparison
+        # below, not a real InputProvider.
+        session = rt.new_run_session(
+            repo.root,
+            _make_options(),
+            input_provider=sentinel,  # type: ignore[arg-type]
+        )
         with session:
             pass
 
@@ -3972,7 +3914,8 @@ def test_retry_close_after_release_failure_releases_lock(tmp_path):
         original_release(self)
 
     with _patched_session_env(repo):
-        rt._LockLease.release = flaky_release
+        mp = pytest.MonkeyPatch()
+        mp.setattr(rt._LockLease, "release", flaky_release)
         try:
             session = rt.new_run_session(repo.root, _make_options())
             session.__enter__()
@@ -3986,7 +3929,7 @@ def test_retry_close_after_release_failure_releases_lock(tmp_path):
             # release() would now succeed; the session must let it.
             session.close()
         finally:
-            rt._LockLease.release = original_release
+            mp.undo()
 
     assert session.state is rt.SessionState.CLOSED
     assert not _lock_path(repo.common_dir()).exists()
@@ -4017,7 +3960,8 @@ def test_retry_close_after_enter_release_failure_releases_lock(tmp_path):
         original_release(self)
 
     with _patched_session_env(repo, supervisor_cls=BoomSupervisor):
-        rt._LockLease.release = flaky_release
+        mp = pytest.MonkeyPatch()
+        mp.setattr(rt._LockLease, "release", flaky_release)
         try:
             session = rt.new_run_session(repo.root, _make_options())
             with pytest.raises(RuntimeError, match="state creation failed"):
@@ -4026,7 +3970,7 @@ def test_retry_close_after_enter_release_failure_releases_lock(tmp_path):
 
             session.close()
         finally:
-            rt._LockLease.release = original_release
+            mp.undo()
 
     assert not _lock_path(repo.common_dir()).exists()
 
@@ -4064,7 +4008,8 @@ def test_retry_release_does_not_respend_stop_budget(tmp_path):
         original_release(self)
 
     with _patched_session_env(repo, server_cls=CountingServer):
-        rt._LockLease.release = flaky_release
+        mp = pytest.MonkeyPatch()
+        mp.setattr(rt._LockLease, "release", flaky_release)
         try:
             session = rt.new_run_session(repo.root, _make_options())
             session.__enter__()
@@ -4075,7 +4020,7 @@ def test_retry_release_does_not_respend_stop_budget(tmp_path):
             after_first = stop_calls[0]
             session.close()
         finally:
-            rt._LockLease.release = original_release
+            mp.undo()
 
     assert after_first == 1, stop_calls
     assert stop_calls[0] == 1, stop_calls
@@ -4097,9 +4042,9 @@ def test_startup_interrupt_traceback_excludes_exit_and_close_frames(tmp_path, mo
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
 
     the_interrupt = KeyboardInterrupt()
-    original_oc_server = rt.OpenCodeServer
     # stop_fails=True so close() runs the full bounded retry before returning.
-    rt.OpenCodeServer = _retry_server(start_exc=the_interrupt, stop_fails=True)
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", _retry_server(start_exc=the_interrupt, stop_fails=True))
     try:
         with pytest.raises(KeyboardInterrupt) as excinfo:
             run_new(tmp_path / "repo", _make_options())
@@ -4111,7 +4056,7 @@ def test_startup_interrupt_traceback_excludes_exit_and_close_frames(tmp_path, mo
         assert frames.count("start_server") == 1, frames
         assert frames[-1] == "start", frames
     finally:
-        rt.OpenCodeServer = original_oc_server
+        mp.undo()
 
 
 def test_resume_run_session_full_lifecycle(tmp_path):
@@ -4154,8 +4099,6 @@ def test_resume_run_session_full_lifecycle(tmp_path):
         def run_agent(self, **kwargs):
             return "ok"
 
-    original_oc_server = rt.OpenCodeServer
-    original_run = Supervisor.run
     original_resume = Supervisor.resume
 
     def _ok_run(self, state, *, max_steps=None):
@@ -4166,9 +4109,10 @@ def test_resume_run_session_full_lifecycle(tmp_path):
         events.append("resume")
         return original_resume(self, state)
 
-    rt.OpenCodeServer = RecordingServer
-    Supervisor.run = _ok_run
-    Supervisor.resume = _tracked_resume
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", RecordingServer)
+    mp.setattr(Supervisor, "run", _ok_run)
+    mp.setattr(Supervisor, "resume", _tracked_resume)
     try:
         session = rt.resume_run_session(repo.root, run_id)
         assert session.state is rt.SessionState.NEW
@@ -4178,9 +4122,7 @@ def test_resume_run_session_full_lifecycle(tmp_path):
             assert session.state is rt.SessionState.STARTED
             final = session.run_to_completion()
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
-        Supervisor.resume = original_resume
+        mp.undo()
 
     assert final.run_id == run_id
     assert final.phase == "done"
@@ -4223,21 +4165,18 @@ def test_resume_run_session_validation_failure_is_wrapped_and_releases_lock(tmp_
         def add_observer(self, obs) -> None:
             pass
 
-    original_oc_server = rt.OpenCodeServer
-    original_resume = Supervisor.resume
-
     def _boom_resume(self, state):
         raise LoopError("integration branch moved")
 
-    rt.OpenCodeServer = NeverStartedServer
-    Supervisor.resume = _boom_resume
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", NeverStartedServer)
+    mp.setattr(Supervisor, "resume", _boom_resume)
     try:
         session = rt.resume_run_session(repo.root, run_id)
         with pytest.raises(rt.RuntimeError_, match="resume validation failed"):
             session.__enter__()
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.resume = original_resume
+        mp.undo()
 
     assert started == []
     assert session.state is rt.SessionState.FAILED
@@ -4297,7 +4236,8 @@ def test_release_pending_after_body_failure_annotates_and_stays_retryable(tmp_pa
         original_release(self)
 
     with _patched_session_env(repo):
-        rt._LockLease.release = flaky_release
+        mp = pytest.MonkeyPatch()
+        mp.setattr(rt._LockLease, "release", flaky_release)
         try:
             session = rt.new_run_session(repo.root, _make_options())
             with pytest.raises(ValueError) as excinfo:
@@ -4311,7 +4251,7 @@ def test_release_pending_after_body_failure_annotates_and_stays_retryable(tmp_pa
 
             session.close()
         finally:
-            rt._LockLease.release = original_release
+            mp.undo()
 
     notes = getattr(the_error, "__notes__", [])
     assert any("lock could not be released" in n.lower() for n in notes), notes
@@ -4376,13 +4316,13 @@ def test_close_detached_caller_with_release_failure_raises(tmp_path):
 
     repo = _init_repo(tmp_path / "repo")
     the_error = ValueError("body blew up")
-    original_release = rt._LockLease.release
 
     def _always_fail_release(self):
         raise LockError("release still failing")
 
     with _patched_session_env(repo):
-        rt._LockLease.release = _always_fail_release
+        mp = pytest.MonkeyPatch()
+        mp.setattr(rt._LockLease, "release", _always_fail_release)
         try:
             session = rt.new_run_session(repo.root, _make_options())
             session.__enter__()
@@ -4398,7 +4338,7 @@ def test_close_detached_caller_with_release_failure_raises(tmp_path):
             with pytest.raises(LockError):
                 session.close(outcome=rt._RunOutcome.FAILED, error=the_error)
         finally:
-            rt._LockLease.release = original_release
+            mp.undo()
 
     assert session.state is rt.SessionState.RELEASE_PENDING
     assert _lock_path(repo.common_dir()).exists()
@@ -4444,15 +4384,14 @@ def test_close_exit_success_path_wording_unchanged(tmp_path, monkeypatch):
     _init_repo(tmp_path / "repo")
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     counter = [0]
-    original_oc_server = rt.OpenCodeServer
-    original_run = Supervisor.run
 
     def _ok_run(self, state, *, max_steps=None):
         state.phase = "done"
         return state
 
-    rt.OpenCodeServer = _characterization_server(counter)
-    Supervisor.run = _ok_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", _characterization_server(counter))
+    mp.setattr(Supervisor, "run", _ok_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -4463,8 +4402,7 @@ def test_close_exit_success_path_wording_unchanged(tmp_path, monkeypatch):
             ), str(exc)
             assert getattr(exc, "__notes__", []) == []
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
 
 def test_close_exit_failure_path_wording_unchanged(tmp_path, monkeypatch):
@@ -4478,15 +4416,14 @@ def test_close_exit_failure_path_wording_unchanged(tmp_path, monkeypatch):
     _init_repo(tmp_path / "repo")
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     counter = [0]
-    original_oc_server = rt.OpenCodeServer
-    original_run = Supervisor.run
     the_failure = LoopError("simulated supervisor failure")
 
     def _boom_run(self, state, *, max_steps=None):
         raise the_failure
 
-    rt.OpenCodeServer = _characterization_server(counter)
-    Supervisor.run = _boom_run
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "OpenCodeServer", _characterization_server(counter))
+    mp.setattr(Supervisor, "run", _boom_run)
     try:
         try:
             run_new(tmp_path / "repo", _make_options())
@@ -4494,8 +4431,7 @@ def test_close_exit_failure_path_wording_unchanged(tmp_path, monkeypatch):
         except LoopError as exc:
             assert exc is the_failure
     finally:
-        rt.OpenCodeServer = original_oc_server
-        Supervisor.run = original_run
+        mp.undo()
 
     notes = getattr(the_failure, "__notes__", [])
     assert len(notes) == 1, notes

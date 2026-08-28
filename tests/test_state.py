@@ -1,4 +1,5 @@
 import json
+from typing import Any
 
 import pytest
 
@@ -18,7 +19,7 @@ from loop_supervisor.state import (
 
 
 def _make_options(**overrides) -> RunOptions:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         max_accepted_tasks=20,
         max_revisions_per_task=5,
         max_replans_per_task=3,
@@ -35,7 +36,7 @@ def _make_options(**overrides) -> RunOptions:
 
 
 def _make_state(run_id: str, **overrides) -> RunState:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         schema_version=STATE_SCHEMA_VERSION,
         run_id=run_id,
         git_common_dir="/repo/.git",
@@ -191,6 +192,7 @@ def test_save_load_preserves_decision_request(tmp_path):
 
     loaded = load_state(tmp_path, state.run_id)
     assert loaded.decision_request == request.to_dict()
+    assert loaded.decision_request is not None
     assert DecisionRequest.from_dict(loaded.decision_request) == request
 
 
@@ -201,7 +203,7 @@ def test_decision_request_rejects_invalid_origin():
 
 def _make_cleanup_state(run_id: str, phase: str, **overrides) -> RunState:
     """Make a state with full task identity in a cleanup phase."""
-    base = dict(
+    base: dict[str, Any] = dict(
         schema_version=3,
         run_id=run_id,
         git_common_dir="/repo/.git",
@@ -291,6 +293,7 @@ def test_operational_failure_validates_last_error_schema(tmp_path):
     save_state(tmp_path, state)
     loaded = load_state(tmp_path, state.run_id)
     assert loaded.phase == "operational_failure"
+    assert loaded.last_error is not None
     assert loaded.last_error["kind"] == "git"
 
 

@@ -312,8 +312,15 @@ truth.
 pytest
 ruff check .
 ruff format --check .
-mypy src
+mypy src tests
 ```
+
+`mypy` covers both `src` and `tests` in a single invocation. Checking
+both roots together lets mypy compare test fakes against the real
+types they stand in for, which is a stronger check than checking
+either root alone — see "Patch module attributes with
+`monkeypatch.setattr`" below for the one pattern this combined check
+is sensitive to.
 
 ### Testing discipline
 
@@ -362,6 +369,19 @@ instead:
   pure addition. A test needing a change beyond a declared,
   pre-authorised surface should stop and be reported rather than edited
   around silently.
+- **Patch module attributes with `monkeypatch.setattr` (or
+  `pytest.MonkeyPatch()` where no fixture is in scope), not direct
+  assignment.** `rt.GitRepo = FakeGitRepo` type-checks clean when
+  `tests/` is checked in isolation, but fails once `src` and `tests`
+  are checked together in the same `mypy` invocation, because mypy can
+  then see `GitRepo`'s real type and compare it against the fake —
+  `monkeypatch.setattr` accepts a bare attribute-name string, so this
+  comparison never happens. Because the failure was invisible under
+  the split-invocation gate this project ran for a while, this exact
+  pattern accumulated to roughly 250 errors in `tests/test_runtime.py`
+  alone before being converted; write new patches the
+  `monkeypatch`/`MonkeyPatch()` way from the start rather than
+  discovering the gap the next time the gate tightens.
 
 ## Current limitations
 

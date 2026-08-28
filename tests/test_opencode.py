@@ -1529,6 +1529,7 @@ def test_leak_safe_finally_on_descendant_assertion_failure(tmp_path):
     )
     server = _FakeServer(tmp_path, config)
     server.start()
+    assert server._owner is not None
     launcher_pid = server._owner.launcher.pid
     descendant_pid: int | None = None
     try:
@@ -1895,9 +1896,9 @@ def test_bounded_close_attempt_reports_hang(monkeypatch):
     client = httpx.Client(transport=httpx.MockTransport(_json_handler(200, {})))
     release = threading.Event()
     monkeypatch.setattr(httpx.Client, "close", _make_hanging_close(release))
+    attempt = _start_bounded_close(client)
+    assert isinstance(attempt, _BoundedCloseAttempt)
     try:
-        attempt = _start_bounded_close(client)
-        assert isinstance(attempt, _BoundedCloseAttempt)
         assert attempt.wait(0.1) is False
     finally:
         release.set()
