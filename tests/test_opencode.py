@@ -23,6 +23,7 @@ from loop_supervisor.opencode import (
     _close_request_local_client,
     _extract_text,
     _start_bounded_close,
+    build_agent_env,
 )
 
 FIXTURE = str(Path(__file__).parent / "fixtures" / "fake_opencode.py")
@@ -56,6 +57,64 @@ class _FakeServer(OpenCodeServer):
             "--port",
             str(port),
         ]
+
+
+def test_build_agent_env_prepends_relative_venv_bin_unconditionally(tmp_path):
+    # A project with no .venv at all yet: the relative entry is still
+    # prepended, since it is resolved per-agent-invocation against that
+    # invocation's own cwd, not against project_root or this process's cwd.
+    env = build_agent_env(tmp_path, base_env={"PATH": "/usr/bin:/bin"})
+    entries = env["PATH"].split(os.pathsep)
+    assert entries[0] == os.path.join(".venv", "bin")
+    assert entries[-2:] == ["/usr/bin", "/bin"]
+
+
+def test_build_agent_env_prepends_absolute_project_venv_when_present(tmp_path):
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    env = build_agent_env(tmp_path, base_env={"PATH": "/usr/bin"})
+    entries = env["PATH"].split(os.pathsep)
+    assert entries[0] == os.path.join(".venv", "bin")
+    assert entries[1] == str(tmp_path / ".venv" / "bin")
+    assert entries[2] == "/usr/bin"
+
+
+def test_build_agent_env_omits_absolute_entry_when_project_venv_missing(tmp_path):
+    env = build_agent_env(tmp_path, base_env={"PATH": "/usr/bin"})
+    entries = env["PATH"].split(os.pathsep)
+    assert str(tmp_path / ".venv" / "bin") not in entries
+
+
+def test_build_agent_env_does_not_duplicate_existing_entries(tmp_path):
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    existing = f"{tmp_path / '.venv' / 'bin'}{os.pathsep}/usr/bin"
+    env = build_agent_env(tmp_path, base_env={"PATH": existing})
+    entries = env["PATH"].split(os.pathsep)
+    assert entries.count(str(tmp_path / ".venv" / "bin")) == 1
+
+
+def test_build_agent_env_preserves_other_env_vars(tmp_path):
+    env = build_agent_env(tmp_path, base_env={"PATH": "/usr/bin", "MY_VAR": "hello"})
+    assert env["MY_VAR"] == "hello"
+
+
+def test_build_agent_env_does_not_mutate_base_env(tmp_path):
+    base = {"PATH": "/usr/bin"}
+    build_agent_env(tmp_path, base_env=base)
+    assert base == {"PATH": "/usr/bin"}
+
+
+def test_build_agent_env_handles_missing_path_key(tmp_path):
+    env = build_agent_env(tmp_path, base_env={"OTHER": "x"})
+    assert env["PATH"] == os.path.join(".venv", "bin")
+    assert env["OTHER"] == "x"
+
+
+def test_build_agent_env_defaults_to_os_environ(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env = build_agent_env(tmp_path)
+    entries = env["PATH"].split(os.pathsep)
+    assert entries[0] == os.path.join(".venv", "bin")
+    assert "/usr/bin" in entries
 
 
 def test_server_starts_and_health_check(tmp_path):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -3034,6 +3035,47 @@ def test_run_session_run_to_completion_stops_early_without_error_and_cleans_up(t
 
 
 # --- runner handoff ---------------------------------------------------
+
+
+def test_run_session_constructs_server_with_venv_path_env(tmp_path):
+    """RunSession.__enter__ must build the OpenCodeServer's env via
+    build_agent_env(), so agent invocations can find a project-local
+    .venv/bin without needing an external_directory permission to look
+    for tools elsewhere (see ADR 0014)."""
+    import loop_supervisor.runtime as rt
+
+    repo = _init_repo(tmp_path / "repo")
+    (repo.root / ".venv" / "bin").mkdir(parents=True)
+    captured_configs = []
+
+    class CapturingServer:
+        def __init__(self, project_root, config, *a, **kw):
+            captured_configs.append(config)
+            self.base_url = "http://127.0.0.1:9999"
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def add_observer(self, obs):
+            pass
+
+        def abort_active_sessions(self):
+            pass
+
+    with _patched_session_env(repo, server_cls=CapturingServer):
+        session = rt.new_run_session(repo.root, _make_options())
+        with session:
+            pass
+
+    assert len(captured_configs) == 1
+    env = captured_configs[0].env
+    assert env is not None
+    entries = env["PATH"].split(os.pathsep)
+    assert entries[0] == os.path.join(".venv", "bin")
+    assert str(repo.root / ".venv" / "bin") in entries
 
 
 def test_run_session_start_server_installs_runner(tmp_path):
