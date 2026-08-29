@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import shutil
+import signal
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -31,6 +34,60 @@ _EXPECTED_CLI_ERRORS: tuple[type[Exception], ...] = (
 )
 
 _TEMPLATE_MARKERS = ("pyproject.toml", "src/loop_supervisor", ".opencode/agents")
+
+
+@contextlib.contextmanager
+def _bridge_sigterm_to_keyboard_interrupt() -> Iterator[None]:
+    """Make SIGTERM drive the same cleanup path SIGINT already does.
+
+    Every cleanup obligation in this codebase -- stopping the OpenCode
+    process group, stopping the permission denier, releasing the
+    supervisor lock -- is reached exclusively through Python exception
+    unwinding (`RunSession.__exit__` / `OpenCodeServer.__exit__`; see ADR
+    0015). SIGINT's default disposition already raises
+    `KeyboardInterrupt` in the main thread, so a plain Ctrl-C gets that
+    cleanup for free. SIGTERM's default disposition is immediate process
+    termination with no Python-level unwinding at all, so absent this
+    handler a bare `kill <pid>` strands the lock file and orphans the
+    OpenCode process group.
+
+    The handler is deliberately one-shot: on first delivery it restores
+    the platform default disposition (`SIG_DFL`) before raising, so a
+    *second* SIGTERM -- e.g. a process supervisor escalating after a
+    grace period -- kills immediately rather than raising a second
+    `KeyboardInterrupt` into whatever cleanup retry loop the first one
+    triggered. This mirrors the existing double-Ctrl-C behavior
+    documented in runtime.py (a second interrupt during cleanup aborts
+    the retry loop rather than being ignored).
+
+    Scoped to `cmd_run`/`cmd_resume` (the headless entry points) only --
+    never installed in library code such as `RunSession` or
+    `OpenCodeServer`, so importing loop_supervisor does not silently
+    change a host application's signal disposition, and never wrapped
+    around `cmd_tui`: Textual's Linux driver already strips the
+    terminal's ISIG flag in raw mode (Ctrl-C is read as an ordinary
+    keypress, not delivered as SIGINT) and injecting an externally
+    raised KeyboardInterrupt into Textual's running asyncio event loop is
+    untested and could leave the terminal stuck in raw mode. TUI-side
+    signal handling needs its own UX decision and is deliberately out of
+    scope here (see ADR 0015).
+    """
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def _on_sigterm(signum: int, frame: object) -> None:
+        signal.signal(signal.SIGTERM, previous)
+        print(
+            "loop-supervisor: received SIGTERM, shutting down "
+            "(a second SIGTERM will terminate immediately)",
+            file=sys.stderr,
+        )
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def _project_root(path: str | None) -> Path:
@@ -119,13 +176,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
     try:
-        final = run_new(
-            project_root,
-            options,
-            input_provider=StdinInputProvider(),
-            recover_stale_lock=getattr(args, "recover_stale_lock", False),
-            max_steps=max_steps,
-        )
+        with _bridge_sigterm_to_keyboard_interrupt():
+            final = run_new(
+                project_root,
+                options,
+                input_provider=StdinInputProvider(),
+                recover_stale_lock=getattr(args, "recover_stale_lock", False),
+                max_steps=max_steps,
+            )
     except _EXPECTED_CLI_ERRORS as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -163,13 +221,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        final = run_resume(
-            project_root,
-            args.run_id,
-            input_provider=StdinInputProvider(),
-            recover_stale_lock=getattr(args, "recover_stale_lock", False),
-            max_steps=max_steps,
-        )
+        with _bridge_sigterm_to_keyboard_interrupt():
+            final = run_resume(
+                project_root,
+                args.run_id,
+                input_provider=StdinInputProvider(),
+                recover_stale_lock=getattr(args, "recover_stale_lock", False),
+                max_steps=max_steps,
+            )
     except _EXPECTED_CLI_ERRORS as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

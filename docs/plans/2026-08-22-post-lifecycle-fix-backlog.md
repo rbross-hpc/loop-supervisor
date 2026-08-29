@@ -252,11 +252,51 @@ after the fact get written down.
 21. **Correct merge-conflict repair instructions.**
     `README.md:267-272`.
 
-22. **Add missing end-to-end tests** for signals (SIGINT/SIGTERM against
-    a real headless process), app-level exit refusal/retry against a real
+22a. ~~Add missing end-to-end tests for signals (SIGINT/SIGTERM against
+    a real headless process)~~ **Resolved.**
+    `src/loop_supervisor/cli.py` (`_bridge_sigterm_to_keyboard_interrupt`,
+    `cmd_run`, `cmd_resume`), `tests/test_signal_handling.py`,
+    `docs/decisions/0015-sigterm-bridged-into-exception-driven-cleanup.md`.
+
+    Originally filed as a testing gap, but writing the described tests
+    against the as-shipped code would have encoded a real, unfixed
+    behavior gap: the supervisor's entire cleanup path (stopping the
+    OpenCode process group, stopping the permission denier, releasing
+    the lock) is reached exclusively through Python exception
+    unwinding. SIGINT's default disposition already raises
+    `KeyboardInterrupt`, so Ctrl-C gets that cleanup for free; SIGTERM's
+    default disposition is immediate termination with no Python-level
+    unwinding at all. Confirmed empirically and against the real CLI
+    spawned as a subprocess: a bare `kill <pid>` left the supervisor
+    lock on disk and orphaned the OpenCode process group. This matches
+    orphaned `opencode serve` processes and stale locks observed after
+    killing stuck supervisor runs in earlier sessions.
+
+    Fixed by bridging SIGTERM into the same `KeyboardInterrupt` path
+    SIGINT already takes, scoped narrowly to the headless `run`/`resume`
+    entry points (never `tui`, and never inside library code — see ADR
+    0015 for the full scoping rationale, including the accepted
+    exit-code tradeoff: a SIGTERM-terminated run reports 130, not 143).
+    Verified end-to-end in `tests/test_signal_handling.py` by spawning
+    the real CLI as a subprocess against the real OpenCode fixture and
+    delivering a real SIGTERM; that test is confirmed to fail against
+    the pre-fix code (lock retained, server orphaned) and pass once the
+    handler is installed.
+
+22b. **Add the remaining end-to-end coverage item 22 originally asked
+    for**, now against a codebase where SIGTERM already behaves
+    correctly (22a): app-level exit refusal/retry against a real
     OpenCode process, TUI initialization races beyond what this round's
     fakes exercise, and cleanup failures under real process-kill
-    scenarios rather than monkeypatched `stop()`.
+    scenarios rather than monkeypatched `stop()`. Also covers TUI-side
+    signal handling itself, which 22a deliberately left untouched: a
+    real SIGTERM against a running `loop-supervisor tui` process still
+    terminates at default disposition today (same orphan/stale-lock
+    exposure 22a fixed for the headless path), and fixing it needs its
+    own UX decision — does an externally raised interrupt need to
+    restore the terminal before anything else, does it reuse
+    `RunScreen`'s existing shutdown worker, etc. — not just a copy of
+    22a's bridge.
 
 23. ~~Investigate hidden `ResourceWarning`s in the full test suite~~
     **Closed: investigated, no cleanup gap found.** Originally raised

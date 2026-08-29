@@ -3,6 +3,8 @@ failures into a single sanitized stderr line and exit code 1, and never
 let a traceback escape for failures the runtime is documented to raise."""
 
 import argparse
+import os
+import signal
 
 import pytest
 
@@ -397,3 +399,122 @@ def test_cmd_tui_normalizes_prelaunch_errors(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert captured.err.startswith("error: ")
     assert "Traceback" not in captured.err
+
+
+# -- SIGTERM-to-KeyboardInterrupt bridge (backlog item 22a / ADR 0015) --
+#
+# These are in-process unit tests of the bridge's own hygiene (handler
+# install/restore, raise behavior, one-shot semantics). The end-to-end
+# proof that this actually drives real cleanup against a real subprocess
+# is tests/test_signal_handling.py; that is what a test claiming "SIGTERM
+# releases the lock" must be backed by, not this file's synthetic raises.
+
+
+def test_bridge_installs_and_restores_previous_handler():
+    previous = signal.getsignal(signal.SIGTERM)
+    with cli_mod._bridge_sigterm_to_keyboard_interrupt():
+        assert signal.getsignal(signal.SIGTERM) is not previous
+    assert signal.getsignal(signal.SIGTERM) is previous
+
+
+def test_bridge_restores_previous_handler_even_if_body_raises():
+    previous = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(ValueError):
+        with cli_mod._bridge_sigterm_to_keyboard_interrupt():
+            raise ValueError("boom")
+    assert signal.getsignal(signal.SIGTERM) is previous
+
+
+def test_sigterm_inside_bridge_raises_keyboard_interrupt():
+    with pytest.raises(KeyboardInterrupt):
+        with cli_mod._bridge_sigterm_to_keyboard_interrupt():
+            os.kill(os.getpid(), signal.SIGTERM)
+
+
+def test_bridge_is_one_shot_second_sigterm_hits_default_disposition(capsys):
+    """The first delivery must restore SIG_DFL before raising, so a
+    caller that catches the resulting KeyboardInterrupt and re-enters
+    ordinary code is not left with the handler still installed."""
+    with pytest.raises(KeyboardInterrupt):
+        with cli_mod._bridge_sigterm_to_keyboard_interrupt():
+            os.kill(os.getpid(), signal.SIGTERM)
+    assert signal.getsignal(signal.SIGTERM) in (signal.SIG_DFL, signal.default_int_handler)
+    captured = capsys.readouterr()
+    assert "received SIGTERM" in captured.err
+
+
+def test_cmd_run_wraps_run_new_in_the_sigterm_bridge(tmp_path, monkeypatch):
+    """cmd_run must wrap run_new in the bridge, not just call it plainly.
+
+    Checked by observing the SIGTERM disposition from *inside* run_new,
+    rather than by actually delivering a real SIGTERM to this test
+    process: if the bridge were ever removed, a real self-signal here
+    would kill the whole pytest process at default disposition instead
+    of failing this one test cleanly (confirmed by direct reproduction
+    while developing this test). test_signal_handling.py is where a real
+    SIGTERM against a real subprocess belongs; this test only needs to
+    know the handler was installed for the duration of the call.
+    """
+    seen = {}
+
+    def fake_run_new(*args, **kwargs):
+        seen["disposition"] = signal.getsignal(signal.SIGTERM)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(cli_mod, "run_new", fake_run_new)
+    with pytest.raises(KeyboardInterrupt):
+        cli_mod.cmd_run(_run_args(tmp_path))
+
+    assert seen["disposition"] not in (signal.SIG_DFL, signal.default_int_handler)
+    assert signal.getsignal(signal.SIGTERM) in (signal.SIG_DFL, signal.default_int_handler), (
+        "the bridge must restore the prior disposition once cmd_run returns/raises"
+    )
+
+
+def test_cmd_resume_wraps_run_resume_in_the_sigterm_bridge(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run_resume(*args, **kwargs):
+        seen["disposition"] = signal.getsignal(signal.SIGTERM)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(cli_mod, "run_resume", fake_run_resume)
+    with pytest.raises(KeyboardInterrupt):
+        cli_mod.cmd_resume(_resume_args(tmp_path))
+
+    assert seen["disposition"] not in (signal.SIG_DFL, signal.default_int_handler)
+    assert signal.getsignal(signal.SIGTERM) in (signal.SIG_DFL, signal.default_int_handler), (
+        "the bridge must restore the prior disposition once cmd_resume returns/raises"
+    )
+
+
+def test_cmd_tui_is_not_wrapped_by_the_sigterm_bridge(tmp_path, monkeypatch):
+    """cmd_tui must not install the SIGTERM bridge: Textual's Linux
+    driver already disables terminal-level SIGINT delivery in raw mode,
+    and injecting an externally raised KeyboardInterrupt into Textual's
+    running event loop is untested and could leave the terminal stuck in
+    raw mode. Verified by observing the disposition *during* the
+    LoopSupervisorApp construction call, not just before/after cmd_tui
+    returns -- checking only before/after is insufficient because the
+    bridge's own `finally` restores the prior disposition before
+    propagating, which would mask an accidental wrap. Actually
+    delivering a real SIGTERM with default disposition here would
+    terminate this test process outright, which is the whole point:
+    that must not be caught and converted."""
+    import loop_supervisor.tui.app as app_mod
+
+    before = signal.getsignal(signal.SIGTERM)
+    seen = {}
+
+    def fake_init(self, *args, **kwargs):
+        seen["disposition"] = signal.getsignal(signal.SIGTERM)
+        raise LockError("lock is held by another process")
+
+    monkeypatch.setattr(app_mod.LoopSupervisorApp, "__init__", fake_init)
+
+    rc = cli_mod.cmd_tui(_resume_args(tmp_path, run_id=None))
+    after = signal.getsignal(signal.SIGTERM)
+
+    assert rc == 1
+    assert seen["disposition"] is before, "cmd_tui must not touch SIGTERM disposition at all"
+    assert after is before
