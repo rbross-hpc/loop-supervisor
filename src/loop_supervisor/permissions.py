@@ -32,6 +32,19 @@ denial count/summary is purely an in-memory diagnostic aid (see
 ``RunSession.denied_permission_count`` / ``denied_permission_summary``)
 consumed by the CLI, not persisted to ``RunState`` (see the backlog
 item on squashing schema migrations for why persistence was deferred).
+
+Never failing a run is not the same as never being observable. A
+denial is only counted/reported if the server actually accepted the
+reject (2xx); a non-2xx or transport failure prints a distinct
+"failed to deny" warning instead, since an unconfirmed reject leaves
+the agent still blocked, which the run-outcome-safe swallow above
+must not hide. Reaching a live SSE subscription is itself reported
+(one line, once, on the transition to ``SSEConnectionState.LIVE``),
+and SSE-level notices (reconnects, malformed events, non-2xx stream
+responses) are forwarded rather than discarded. Together these close
+an observability gap where "the denier attached and saw nothing" and
+"the denier never attached at all" were indistinguishable from the
+outside -- both looked like silence.
 """
 
 from __future__ import annotations
@@ -43,7 +56,7 @@ from typing import Any
 import httpx
 
 from .opencode_events import OpenCodeEventError, normalize_global_event
-from .sse import SSEClient
+from .sse import SSEClient, SSEConnectionState
 
 _REPLY_TIMEOUT_SECONDS = 5.0
 
@@ -55,6 +68,13 @@ class PermissionDenier:
     the given OpenCode server. Call :meth:`start` once the server is
     ready and :meth:`stop` during teardown, before the server itself is
     stopped.
+
+    Every externally observable outcome (a successful subscription, a
+    denial the server actually accepted, a denial attempt the server
+    rejected, and any SSE-level notice) is printed to stderr. This
+    matters because "the denier attached and saw nothing to deny" and
+    "the denier never attached at all" are otherwise indistinguishable
+    from the outside -- both look like silence.
     """
 
     def __init__(self, base_url: str) -> None:
@@ -65,6 +85,7 @@ class PermissionDenier:
         self._sse = SSEClient(
             base_url,
             on_event=self._on_event,
+            on_state_change=self._on_state_change,
             on_notice=self._on_notice,
         )
 
@@ -110,7 +131,13 @@ class PermissionDenier:
         permission = properties.get("permission")
         permission_key = permission if isinstance(permission, str) else "<unknown>"
 
-        self._reply_reject(request_id)
+        if not self._reply_reject(request_id):
+            print(
+                f"loop-supervisor: failed to deny permission request {request_id!r} "
+                f"({permission_key!r}); the request may still be pending",
+                file=sys.stderr,
+            )
+            return
 
         with self._lock:
             self._denied_count += 1
@@ -122,23 +149,36 @@ class PermissionDenier:
             file=sys.stderr,
         )
 
-    def _reply_reject(self, request_id: str) -> None:
+    def _reply_reject(self, request_id: str) -> bool:
+        """POST the reject reply. Returns True only if the server actually
+        accepted it (2xx) -- a denial must never be counted or reported
+        unless the reject was confirmed, since an uncounted failure here
+        leaves the agent still blocked on the original ask, which is a
+        materially different (and worse) situation than a clean denial."""
         try:
             client = httpx.Client(base_url=self._base_url, timeout=_REPLY_TIMEOUT_SECONDS)
         except Exception:
-            return
+            return False
         try:
-            client.post(
+            response = client.post(
                 f"/permission/{request_id}/reply",
                 json={"reply": "reject"},
             )
+            return response.status_code < 400
         except Exception:
-            pass
+            return False
         finally:
             try:
                 client.close()
             except Exception:
                 pass
 
-    def _on_notice(self, _notice: str) -> None:
-        pass
+    def _on_state_change(self, state: SSEConnectionState, _reason: str) -> None:
+        if state == SSEConnectionState.LIVE:
+            print(
+                f"loop-supervisor: permission denier watching {self._base_url}",
+                file=sys.stderr,
+            )
+
+    def _on_notice(self, notice: str) -> None:
+        print(f"loop-supervisor: {notice}", file=sys.stderr)
