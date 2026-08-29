@@ -635,7 +635,16 @@ class RunScreen(Screen):
             f"phase: {escape(state.phase)}"
         )
         self.query_one("#banner-text", Static).update(banner)
-        self.query_one("#durable-content", Static).update(render_durable_summary(state))
+        session = self._session
+        denied_count = session.denied_permission_count if session is not None else 0
+        denied_summary = session.denied_permission_summary if session is not None else []
+        self.query_one("#durable-content", Static).update(
+            render_durable_summary(
+                state,
+                denied_permission_count=denied_count,
+                denied_permission_summary=denied_summary,
+            )
+        )
         self._update_input_panel(state)
 
     def _update_input_panel(self, state: RunState) -> None:
@@ -742,9 +751,18 @@ class RunScreen(Screen):
         outcome = message.outcome
         if outcome.status in (
             AdvanceStatus.INPUT_REQUIRED,
+            AdvanceStatus.INPUT_UNAVAILABLE,
             AdvanceStatus.TERMINAL,
             AdvanceStatus.OPERATIONAL_FAILURE,
         ):
+            # INPUT_UNAVAILABLE currently also gets stopped by
+            # _start_advance()'s own PHASE_AWAITING_INPUT guard (the
+            # phase this status always leaves the state in), so this
+            # arm was previously reachable only via that guard rather
+            # than this match. Listed explicitly so the stop is a
+            # documented consequence of the status, not an incidental
+            # side effect of which phase the status happens to leave
+            # the state in.
             pass
         else:
             self._start_advance()

@@ -39,8 +39,24 @@ def _run_git(args, cwd):
 
 
 def _static_text(widget: app_mod.Static) -> str:
-    """Extract the current text content of a Static widget for assertions."""
-    return str(getattr(widget, "_Static__content", ""))
+    """Extract the current text content of a Static widget for assertions.
+
+    ``str()`` on the stored renderable is only useful when it is itself
+    a plain string (``render_pending_input``/``render_operational_
+    failure``); a ``rich.table.Table`` (``render_durable_summary``/
+    ``render_live_summary``) stringifies to its Python repr instead, so
+    those are rendered through a real Rich ``Console`` to get their
+    displayed text.
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    content = getattr(widget, "_Static__content", "")
+    if isinstance(content, Table):
+        console = Console(record=True, width=100)
+        console.print(content)
+        return console.export_text()
+    return str(content)
 
 
 def _init_repo(path: Path) -> GitRepo:
@@ -143,6 +159,114 @@ async def test_new_run_acquires_lock_before_state_creation(tmp_path, monkeypatch
                 break
             await pilot.pause(0.05)
         assert not _lock_path(repo.common_dir()).exists()
+
+
+@pytest.mark.asyncio
+async def test_refresh_durable_shows_denied_permissions_from_session(tmp_path, monkeypatch):
+    """RunSession.denied_permission_count/_summary (runtime.py) are read
+    every time _refresh_durable() runs; they are not part of RunState.
+    Backlog item 31 and ADR 0021 note the TUI already runs the same
+    headless permission denier via start_server() without previously
+    surfacing what it denied."""
+    repo = _init_repo(tmp_path / "repo")
+    _patch_server(monkeypatch)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        app.push_screen(RunScreen(tmp_path / "repo", run_id=None))
+        await pilot.pause()
+        for _ in range(50):
+            screen = app.screen
+            if isinstance(screen, RunScreen) and screen._state is not None:
+                break
+            await pilot.pause(0.05)
+        screen = app.screen
+        assert isinstance(screen, RunScreen)
+        assert screen._session is not None
+
+        content_before = _static_text(screen.query_one("#durable-content", app_mod.Static))
+        assert "Denied permissions" not in content_before
+
+        # No live PermissionDenier exists in this fake-server setup
+        # (base_url stays None, per _FakeServer.start()), so the
+        # count/summary RunSession falls back to are these two private
+        # snapshot attributes -- exactly what close() itself populates
+        # once a real denier has run (runtime.py:1263-1267).
+        monkeypatch.setattr(screen._session, "_denied_permission_count", 2)
+        monkeypatch.setattr(screen._session, "_denied_permission_summary", ["bash", "webfetch"])
+
+        screen._refresh_durable()
+        content_after = _static_text(screen.query_one("#durable-content", app_mod.Static))
+        assert "Denied permissions" in content_after
+        assert "2" in content_after
+        assert "bash" in content_after
+        assert "webfetch" in content_after
+
+        screen.action_request_shutdown()
+        for _ in range(50):
+            if not _lock_path(repo.common_dir()).exists():
+                break
+            await pilot.pause(0.05)
+
+
+@pytest.mark.asyncio
+async def test_on_advance_completed_does_not_reloop_on_input_unavailable(tmp_path, monkeypatch):
+    """INPUT_UNAVAILABLE must stop on_advance_completed()'s own status
+    match, not merely rely on _start_advance()'s separate
+    PHASE_AWAITING_INPUT guard to swallow a redundant call -- the two
+    are currently coincident (INPUT_UNAVAILABLE always leaves the
+    state in PHASE_AWAITING_INPUT), but the status match should not
+    depend on that coincidence to be correct. See ADR 0021."""
+    from loop_supervisor.phases import PHASE_AWAITING_INPUT
+    from loop_supervisor.state import STATE_SCHEMA_VERSION, RunState
+    from loop_supervisor.supervisor import AdvanceOutcome, AdvanceStatus
+    from loop_supervisor.tui.messages import AdvanceCompleted
+
+    repo = _init_repo(tmp_path / "repo")
+    _patch_server(monkeypatch)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        app.push_screen(RunScreen(tmp_path / "repo", run_id=None))
+        await pilot.pause()
+        for _ in range(50):
+            screen = app.screen
+            if isinstance(screen, RunScreen) and screen._state is not None:
+                break
+            await pilot.pause(0.05)
+        screen = app.screen
+        assert isinstance(screen, RunScreen)
+        assert screen._state is not None
+
+        started_again: list[bool] = []
+        monkeypatch.setattr(screen, "_start_advance", lambda: started_again.append(True))
+
+        awaiting_state = RunState(
+            schema_version=STATE_SCHEMA_VERSION,
+            run_id=screen._state.run_id,
+            git_common_dir=screen._state.git_common_dir,
+            integration_path=screen._state.integration_path,
+            integration_branch=screen._state.integration_branch,
+            integration_commit_at_start=screen._state.integration_commit_at_start,
+            options=screen._state.options,
+            integration_expected_head=screen._state.integration_expected_head,
+            integration_status_snapshot=screen._state.integration_status_snapshot,
+            phase=PHASE_AWAITING_INPUT,
+        )
+        outcome = AdvanceOutcome(
+            status=AdvanceStatus.INPUT_UNAVAILABLE,
+            state=awaiting_state,
+            phase_before=PHASE_AWAITING_INPUT,
+            phase_after=PHASE_AWAITING_INPUT,
+        )
+        screen.on_advance_completed(AdvanceCompleted(outcome))
+        assert started_again == []
+
+        screen.action_request_shutdown()
+        for _ in range(50):
+            if not _lock_path(repo.common_dir()).exists():
+                break
+            await pilot.pause(0.05)
 
 
 @pytest.mark.asyncio
