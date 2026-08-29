@@ -225,8 +225,21 @@ after the fact get written down.
     incomplete relative to documented scope. Either implement the
     missing rendering or narrow the README/plan language for this slice.
 
-17. **`tui` should validate new-run options the same way `run` does.**
-    `src/loop_supervisor/cli.py:257-302`.
+17. **`tui` should validate new-run options the same way `run` does,
+    and accept the same run-behavior flags instead of a hardcoded
+    default.** `src/loop_supervisor/cli.py:416-422` (the `tui`
+    subparser accepts only `--project`/`--recover-stale-lock`, none of
+    `run`'s nine flags), `src/loop_supervisor/tui/app.py:159-170`
+    (`_DEFAULT_OPTIONS`). (Citation to `cli.py:257-302` in an earlier
+    version of this item had drifted from the `tui` parser it was
+    meant to describe; corrected here.) Also covers `max_steps`/
+    `--step`, which have no TUI equivalent at all — the TUI's step
+    loop (`tui/app.py:689-750`) runs to completion or to the first
+    pause with no budget concept, unlike `Supervisor.run()`'s
+    `max_steps` (`supervisor.py:718-735`). See
+    `docs/decisions/0021-tui-drives-runsession-in-process.md` for the
+    full accounting of where the TUI's step loop diverges from the
+    headless one.
 
 18. **Define and propagate meaningful TUI process exit status.**
     `src/loop_supervisor/cli.py:234-250`.
@@ -696,25 +709,31 @@ after the fact get written down.
     the project ever acquires a real installed user base whose
     in-flight run state would need to survive an upgrade.
 
-31. **Route `permission.asked` auto-denial through the TUI's own live
-    SSE connection too.** `src/loop_supervisor/tui/app.py`,
+31. **Decide whether the TUI should get its own say over
+    `permission.asked` auto-denial, rather than silently inheriting
+    the headless denier.** `src/loop_supervisor/tui/app.py`,
     `src/loop_supervisor/permissions.py`.
 
-    Item 27's `PermissionDenier` was deliberately scoped to the
-    headless path only (`RunSession.start_server()`/`close()`), where
-    it closes a real gap: SSE was previously TUI-only, so a headless
-    run had no permission-response channel at all. The TUI already
-    subscribes to `GET /global/event` via its own `SSEClient`
-    (`RunScreen._on_sse_event` in `tui/app.py`) and already renders
-    permission-adjacent state, so an operator watching the TUI can, in
-    principle, notice and react to an `ask` — the case for an
-    automatic responder there is weaker and the UX tradeoff (should
-    the TUI ever auto-deny on the operator's behalf, or only surface
-    the pending request?) is a real design question, not just a
-    wiring change. Tracked separately rather than folded into item 27
-    because it needs its own answer to that question plus a second SSE
-    consumer sharing one connection's event dispatch, not just
-    reusing `PermissionDenier` as-is.
+    Corrected premise (see `docs/decisions/0021-tui-drives-
+    runsession-in-process.md`): `PermissionDenier` is **not**
+    headless-only today. It is constructed inside
+    `RunSession.start_server()` (`runtime.py:983`), and the TUI calls
+    that exact method (`tui/app.py:597`) — so a permission `ask`
+    raised during a TUI-driven run is already being auto-denied by
+    the same denier the headless CLI uses, with no TUI involvement in
+    the decision. What is genuinely headless-only is the
+    *reporting*: `_report_denied_permissions` (`runtime.py:1449`) is
+    called only from `run_new`/`run_resume`, so the TUI silently
+    inherits the denial behavior without surfacing it (see the fix
+    that reads `denied_permission_count`/`denied_permission_summary`
+    into the durable pane, addressing the reporting half only). The
+    open question this item still tracks is a real UX/design one: is
+    "the headless denier decides, TUI just gets told" the right
+    answer, or should an operator watching the TUI be able to see the
+    request and reply themselves before it is auto-rejected? That
+    needs its own answer plus a second SSE consumer sharing one
+    connection's event dispatch, not just reusing `PermissionDenier`
+    as-is.
 
 32. **Consider having the supervisor provision each task worktree's
     `.venv` itself, instead of relying on the builder agent to do it.**
