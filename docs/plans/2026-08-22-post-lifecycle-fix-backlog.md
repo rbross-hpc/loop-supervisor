@@ -959,6 +959,35 @@ after the fact get written down.
     content (a commit message, a file path, an error string) that
     could contain literal Rich markup syntax.
 
+43. **Opt-in pruning for OpenCode sessions the supervisor created.**
+    (Tier 5 — documentation/testing debt)
+    `src/loop_supervisor/opencode.py` (`run_agent`, `create_session`),
+    `docs/decisions/0020-opencode-server-and-session-lifetimes.md`.
+    The supervisor never deletes an OpenCode session; every agent
+    invocation leaves one behind in OpenCode's on-disk, machine-global
+    SQLite store (observed at
+    `~/.local/share/opencode/opencode.db`), shared with interactive
+    OpenCode use. Measured on one long-lived development machine:
+    supervisor sessions (`title LIKE 'loop:%'`) were 51 of 265 total
+    and roughly 22 MB of a 1.4 GB database (~1.6%, ~116 KB/session).
+    This is real but slow-moving housekeeping, not a stability or
+    memory problem — the server process itself holds no session state
+    in memory (see ADR 0020) — and is deliberately not fixed here: the
+    `event`/`part` rows for a session are the forensic record of what
+    an agent did during a phase, and unconditionally deleting them on
+    run completion would remove exactly the evidence needed to debug a
+    failed run. If this is worth fixing, the likely shape is an
+    opt-in, explicit pruning command (e.g. `loop-supervisor prune
+    --older-than N`) rather than automatic deletion, and it must
+    filter strictly on `title LIKE 'loop:%'` since the database is
+    shared with non-supervisor OpenCode usage. Two implementation
+    notes for whoever picks this up: OpenCode 1.18.22 does expose
+    `DELETE /session/{sessionID}`, but the supervisor does not call it
+    today and `tests/fixtures/fake_opencode.py` has no route for it
+    yet; and a bare `DELETE` will not shrink `opencode.db` on disk
+    without a subsequent `VACUUM`, since SQLite only frees the pages
+    for reuse.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in
