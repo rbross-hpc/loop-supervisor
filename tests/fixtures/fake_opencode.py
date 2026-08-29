@@ -35,10 +35,25 @@ test process can configure it before spawning:
 - FAKE_OPENCODE_SSE_PERMISSION_ASK: if set to a request id, the SSE
     stream emits one `permission.asked` event (with that id and a fixed
     `permission` key of "bash") immediately after `server.connected`.
+- FAKE_OPENCODE_SSE_PERMISSION_ASK_DIRECTORY: overrides the `directory`
+    field of that `permission.asked` event's envelope (default "/repo").
+    Used to simulate an ask raised by a different OpenCode instance
+    (e.g. a task worktree) than whatever directory a reply might
+    default to, together with
+    FAKE_OPENCODE_PERMISSION_REPLY_REQUIRE_DIRECTORY below.
 - FAKE_OPENCODE_PERMISSION_REPLY_LOG: if set, every
     `POST /permission/{requestID}/reply` appends one JSON line
-    `{"request_id": ..., "body": ...}` to this file, then responds
-    `200 true`.
+    `{"request_id": ..., "body": ..., "directory": ...}` to this file
+    (`directory` is the request's own `?directory=` query parameter, or
+    null if absent), then responds `200 true`.
+- FAKE_OPENCODE_PERMISSION_REPLY_REQUIRE_DIRECTORY: if set, every
+    `POST /permission/{requestID}/reply` is scoped: the reply succeeds
+    only if the request's own `?directory=` query parameter equals this
+    value exactly. A missing or mismatched `directory` gets a 404, the
+    same instance-mismatch failure mode confirmed against the real
+    OpenCode 1.18.22 server (see ADR 0016) -- the real server resolves
+    this route against whatever instance the query's `directory`
+    identifies, not against the session that raised the ask.
 - FAKE_OPENCODE_SELF_PID_FILE: if set, this process writes its own pid
     to this path immediately after it starts listening, so a test
     driving the real supervisor CLI as a subprocess (rather than calling
@@ -54,6 +69,7 @@ import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
 
 def _parse_args(argv: list[str]) -> tuple[str, int]:
@@ -107,9 +123,10 @@ class Handler(BaseHTTPRequestHandler):
 
         ask_request_id = os.environ.get("FAKE_OPENCODE_SSE_PERMISSION_ASK")
         if ask_request_id:
+            ask_directory = os.environ.get("FAKE_OPENCODE_SSE_PERMISSION_ASK_DIRECTORY", "/repo")
             ask_payload = json.dumps(
                 {
-                    "directory": "/repo",
+                    "directory": ask_directory,
                     "payload": {
                         "type": "permission.asked",
                         "properties": {
@@ -217,6 +234,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            required_directory = os.environ.get("FAKE_OPENCODE_PERMISSION_REPLY_REQUIRE_DIRECTORY")
+            if required_directory is not None:
+                query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                given_directory = parse_qs(query).get("directory", [None])[0]
+                if given_directory != required_directory:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
             log_path = os.environ.get("FAKE_OPENCODE_PERMISSION_REPLY_LOG")
             if log_path:
                 reply_body: object = None
@@ -224,8 +250,19 @@ class Handler(BaseHTTPRequestHandler):
                     reply_body = json.loads(raw or b"{}")
                 except json.JSONDecodeError:
                     pass
+                query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                logged_directory = parse_qs(query).get("directory", [None])[0]
                 with open(log_path, "a") as f:
-                    f.write(json.dumps({"request_id": request_id, "body": reply_body}) + "\n")
+                    f.write(
+                        json.dumps(
+                            {
+                                "request_id": request_id,
+                                "body": reply_body,
+                                "directory": logged_directory,
+                            }
+                        )
+                        + "\n"
+                    )
             self._send_json(200, True)
             return
 
