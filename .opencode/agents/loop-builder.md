@@ -29,6 +29,13 @@ Before modifying code:
 - read applicable design documentation, including docs/decisions/
 - retrieve relevant Falda memory when necessary
 
+Follow the "Testing discipline" section of README.md for every test
+you write or extend (failing-first verification against the actual
+prior defect, never a hand-written injection alone; assertions are
+additive only; `monkeypatch.setattr`, not direct attribute
+assignment; and the other rules there) — these are standing
+conventions for this project, not suggestions.
+
 After implementation:
 - write or extend tests covering the task's acceptance criteria
 - run the project's tests

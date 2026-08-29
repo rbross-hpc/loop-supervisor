@@ -41,7 +41,13 @@ Evaluate:
 - unnecessary complexity
 - inconsistency with canonical design decisions
 - accidental preservation of prototype mistakes
-- test adequacy
+- test adequacy, against the "Testing discipline" section of
+  README.md (failing-first verification against the actual prior
+  defect rather than a hand-written injection alone, additive-only
+  assertions, `monkeypatch.setattr` over direct attribute assignment,
+  and the other rules there) — a REVISE citing test adequacy should
+  point at the specific rule a new test violates, not a general
+  impression
 - realistic edge cases for this project's domain
 
 If you believe a genuine design decision is required before this task can
@@ -92,4 +98,3 @@ The object must have this structure:
   "decision_question": null,
   "decision_rationale": null
 }
-
