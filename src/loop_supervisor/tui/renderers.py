@@ -32,7 +32,19 @@ def render_phase_badge(phase: str) -> Text:
     return Text(phase.upper(), style=f"bold {color}")
 
 
-def render_durable_summary(state: RunState) -> Table:
+def render_durable_summary(
+    state: RunState,
+    *,
+    denied_permission_count: int = 0,
+    denied_permission_summary: list[str] | None = None,
+) -> Table:
+    """`denied_permission_count`/`denied_permission_summary` come from
+    `RunSession.denied_permission_count`/`denied_permission_summary`
+    (`runtime.py`), not from `RunState` -- the headless permission
+    denier's tally is an in-memory diagnostic, never persisted. See
+    backlog item 31 and ADR 0021 for why the TUI runs this same denier
+    (via `RunSession.start_server()`) without previously surfacing what
+    it denied."""
     grid = Table.grid(padding=(0, 1))
     grid.add_column(style="dim", min_width=18)
     grid.add_column()
@@ -47,6 +59,13 @@ def render_durable_summary(state: RunState) -> Table:
         grid.add_row("Accepted tasks", str(state.accepted_task_count))
     if state.revision_count:
         grid.add_row("Revisions", str(state.revision_count))
+
+    if denied_permission_count:
+        keys = ", ".join(denied_permission_summary or [])
+        grid.add_row(
+            "Denied permissions",
+            Text(f"{denied_permission_count} ({keys})", style="yellow"),
+        )
 
     if state.last_error:
         err_msg = escape(str(state.last_error.get("message", ""))[:120])
