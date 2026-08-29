@@ -236,18 +236,23 @@ after the fact get written down.
 
 ## Tier 5 — documentation/testing debt
 
-20. **Document `LiveActivityReducer`'s single-owner-thread contract in
-    ADR 0008.** `src/loop_supervisor/tui/live.py:104-127`. The reducer
-    asserts (`_assert_owner()`) that only the Textual event-loop thread
-    ever touches it, constructed with `owner_thread=threading.current_thread()`
-    at `RunScreen.__init__`; ADR 0008 does not document this contract or
-    the assertion that enforces it. (The other half of this item — the
-    ADR's blanket "worker threads do not share state with the event
-    loop" claim — was corrected during the `RunSession` TUI migration:
-    see ADR 0008's Consequences section, which now distinguishes UI/
-    widget state, which is not shared, from lifecycle state, which is
-    deliberately shared and guarded by `threading.Event`/`RunSession`'s
-    own concurrency primitives.)
+20. ~~**Document `LiveActivityReducer`'s single-owner-thread contract in
+    ADR 0008.**~~ **Resolved.**
+    `src/loop_supervisor/tui/live.py:104-127`. The reducer asserts
+    (`_assert_owner()`) that only the Textual event-loop thread ever
+    touches it, constructed with `owner_thread=threading.current_thread()`
+    at `RunScreen.__init__`. Fixed by adding this contract to ADR
+    0008's Consequences section directly (the "other half" of this
+    item — the ADR's blanket "worker threads do not share state with
+    the event loop" claim — was already corrected during the
+    `RunSession` TUI migration). Additionally, while auditing this
+    code, promoted the reducer's own bounds (`_MAX_INVOCATIONS`,
+    `_MAX_FEED_RECORDS`, `_MAX_TEXT_TAIL`, etc.) and its exact-
+    directory-match (never prefix-match) event-attribution rule to a
+    new companion ADR, since both were real, tested, load-bearing
+    invariants with no ADR home. See
+    `docs/decisions/0019-live-activity-reducer-bounds-and-event-
+    filtering.md`.
 
 21. **Correct merge-conflict repair instructions.**
     `README.md:267-272`.

@@ -51,6 +51,21 @@ concurrency contract (ADR 0009) — a re-entrant state lock serializing
 lock is never released mid-transition — is what makes this safe across
 three threads that are never coordinated by Textual's own message queue.
 
+`LiveActivityReducer` (`tui/live.py`) — the mutable accumulator behind
+the ephemeral live-activity snapshot — is owned exclusively by the
+Textual event-loop thread, not by any worker thread. It is constructed
+with `owner_thread=threading.current_thread()` at `RunScreen.__init__`
+(captured on the event-loop thread, before any worker exists), and
+every one of its methods calls `_assert_owner()` first, raising
+`RuntimeError` if invoked from any thread other than that one. This is
+consistent with, and not an exception to, the UI/widget-state rule
+above: worker callbacks (SSE reception, `advance()` completion) must
+post typed `Message`s and let the event-loop-thread message handler
+invoke the reducer, exactly as they must for any other widget
+mutation. See `docs/decisions/0019-live-activity-reducer-bounds-and-
+event-filtering.md` for the reducer's own bounds and event-attribution
+invariants.
+
 ## Consequences
 
 - Supervisor core remains testable without any Textual dependency.
@@ -62,6 +77,9 @@ three threads that are never coordinated by Textual's own message queue.
   fields (`_shutdown_requested`, `_shutdown_clean`, `_init_done_event`,
   `_advance_done_event`) directly, guarded by `RunSession`'s own
   concurrency primitives (ADR 0009) rather than by the message queue.
+  `LiveActivityReducer` is not part of this exception: it is
+  event-loop-thread-only, enforced by its own runtime assertion
+  (`test_owner_thread_assertion` in `tests/test_live_reducer.py`).
 - SSE failure leaves the durable UI fully usable; no run is failed due to
   an SSE transport error.
 - `loop-supervisor tui --project PATH` is the new entry point for the UI.
