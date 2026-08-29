@@ -825,6 +825,135 @@ after the fact get written down.
     `loop-supervisor` version and a project's own copied agent
     definitions.
 
+36. **TUI startup-failure deadlock: the single reusable
+    `_shutdown_complete_event` can be awaited by a caller with no
+    attempt in flight to ever set it.** (Tier 1 — correctness)
+    `src/loop_supervisor/tui/app.py:407`, `:906` (`_maybe_start_-
+    shutdown_attempt`), `:931` (`await_shutdown_complete`).
+    Migrated from `docs/plans/2026-08-22-second-lifecycle-fix-
+    plan.md`'s Step 5 (blocker 1), which is the only place this defect
+    was tracked; it does not appear anywhere in this backlog before
+    now. Confirmed still present: `app.py:407` still constructs one
+    `threading.Event()` per `RunScreen`, not one per shutdown attempt.
+    Successful cleanup after a failed `_do_initialize_locked()` can set
+    `shutdown_clean = True` without ever setting this event (no
+    `_shutdown_worker` attempt ran to signal it); a later app exit or
+    "q" press that awaits the event then waits forever. Step 4's TUI
+    ownership registry fix (resolved, this backlog's item 12) narrowly
+    worked around one instance of this ("already clean with nothing to
+    signal" is checked before awaiting) without redesigning the
+    underlying single-event design, and its own commit says so
+    explicitly.
+
+    Fix design carried over from the source plan: replace the single
+    reusable event with a per-attempt handle (generation counter + its
+    own `threading.Event`); `request_shutdown()`/
+    `_maybe_start_shutdown_attempt()` returns the existing in-flight
+    attempt, a newly started one, or "already clean" (nothing to wait
+    for), synchronized under a dedicated attempt lock; every caller
+    (`_on_exit_app()`, `"q"`, "Return to runs") awaits only a real
+    attempt handle it holds, never a bare shared event. Needed tests:
+    app exit after clean startup-failure cleanup completes without
+    deadlock; `"q"`/"Return to runs" work after clean startup-failure
+    cleanup; distinct attempt generations don't cross-signal; app exit
+    requested mid-failed-init-cleanup waits correctly and then
+    proceeds.
+
+37. **`_confirm_server_stopped()`'s inter-attempt backoff uses
+    `time.sleep()`, which is not interrupt-safe.** (Tier 1 —
+    correctness)
+    `src/loop_supervisor/runtime.py:121` (module docstring's own
+    "Known limitation"), `:156` (`_CLEANUP_ATTEMPTS = 3`), `:228`
+    (`time.sleep(_CLEANUP_BACKOFF_SECONDS * (attempt + 1))`).
+    Migrated from the same Step 3 audit trail as the now-resolved
+    denial-routing and traceback-preservation findings (this backlog's
+    items 26/27's neighbors in that plan), but explicitly called out
+    there as remaining open across three separate remediation rounds
+    ("Findings 3–4 ... remain unresolved") and never carried into this
+    backlog. A `KeyboardInterrupt`/`SystemExit` delivered while
+    `_confirm_server_stopped()` is inside this `time.sleep()` call is
+    not guaranteed the same primary-error precedence the rest of
+    `runtime.py`'s cleanup path establishes for every other window —
+    the module's own docstring already admits this rather than
+    claiming a guarantee it doesn't hold.
+
+38. **Cleanup-time `KeyboardInterrupt`/`SystemExit` retry/exhaustion
+    edge cases across `_confirm_server_stopped()`'s bounded retry loop
+    lack test coverage.** (Tier 5 — documentation/testing debt)
+    `src/loop_supervisor/runtime.py:200-232`.
+    Migrated from the same Step 3 finding as item 37 (the two were
+    always paired as "findings 3–4" in the source plan and never
+    resolved). Distinct from item 37: this is a coverage gap for
+    behavior that may already be adequate, not a known defect: what
+    happens if an interrupt arrives between individual retry attempts
+    (not during the `time.sleep()` itself, which is item 37's
+    concern), or during the final attempt when the budget is about to
+    be exhausted, is untested either way.
+
+39. **Unsafe `str()` interpolation of arbitrary exceptions in three
+    `opencode.py` HTTP-error-message sites, outside the one path Step
+    3's remediation already fixed.** (Tier 1 — correctness/security)
+    `src/loop_supervisor/opencode.py:784` (`_parse_anchor_identity`'s
+    `getpgid` failure message), `:1177` (`create_session`'s
+    `httpx.RequestError` message), `:1238` (`send_prompt`'s), `:1297`
+    (`_abort_session_bounded`'s).
+    Migrated from `second-lifecycle-fix-plan.md`'s Step 3 remediation
+    trail, which fixed exactly one instance of this pattern (the
+    `OSError`→`ServerStartupError` normalization in `start()`, this
+    backlog's resolved item 27's neighbor) via `_safe_exception_text()`
+    and explicitly named these four as "out of scope for this narrowly
+    targeted fix." All four remain plain f-string `{exc}` interpolation
+    of an exception whose `__str__` this code does not control (a
+    third-party `httpx` exception, or a `getpgid` `OSError`); a
+    throwing `__str__` on any of them would raise from inside message
+    construction itself, escaping in place of the intended
+    `AgentInvocationError`/`ServerStartupError` and losing whatever
+    that intended error was reporting — the same class of bug ADR-
+    adjacent Step 2 (`opencode._safe_exception_text`) and Step 3's
+    fixed instance both exist specifically to prevent. Fix is
+    mechanical: route all four through the existing
+    `_safe_exception_text()` helper, matching the fixed instance's
+    pattern exactly.
+
+40. **TUI module layout never matched the planned split; `tui/app.py`
+    has grown to ~1,400 lines holding both `RunBrowserScreen` and
+    `RunScreen`.** (Tier 5 — documentation/testing debt)
+    `docs/plans/2026-08-21-tui-vertical-slice.md` (archived; see below)
+    §16 named a `tui/` package with separate `screens.py` and
+    `widgets.py` modules; the actual package is `__init__.py`,
+    `app.py`, `live.py`, `messages.py`, `renderers.py`, with both
+    screen classes living in `app.py`. This is a maintainability
+    observation, not a defect: nothing is currently broken by the
+    combined file. Worth a real decision (revisit the split, or
+    formally drop it) rather than carrying it as silent drift from an
+    abandoned plan.
+
+41. **`tests/fixtures/fake_opencode.py` emits only the legacy
+    `structured_output` response shape; the canonical `info.structured`
+    shape it was supposed to gain has no test coverage on this
+    fixture.** (Tier 5 — documentation/testing debt)
+    `tests/fixtures/fake_opencode.py:19,209`.
+    `docs/plans/2026-08-21-tui-vertical-slice.md` §26 asked for both
+    the canonical and legacy shapes; only the legacy one
+    (`{"structured_output": ...}`) was ever implemented. `opencode.py`
+    itself already supports the canonical shape with a legacy fallback
+    (`info["structured"]`, per that plan's §9) — this is purely a gap
+    in what the test fixture can simulate, not in production code.
+
+42. **No rendering-level TUI test coverage: run-browser rendering,
+    narrow-layout behavior, Rich-markup escaping, and bounded live
+    output are all untested.** (Tier 5 — documentation/testing debt)
+    `tests/test_tui_app.py` (30 tests, confirmed all lifecycle/
+    registry/shutdown-focused; none touch rendering).
+    Migrated from `docs/plans/2026-08-21-tui-vertical-slice.md` §28,
+    which named these specifically. Distinct from this backlog's item
+    22b (real-process exit/init/cleanup/signal behavior): this item is
+    about what the TUI *displays*, not its process lifecycle. In
+    particular, "Rich markup escaping" is a real correctness concern
+    if any rendered text ever includes agent- or repository-controlled
+    content (a commit message, a file path, an error string) that
+    could contain literal Rich markup syntax.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in

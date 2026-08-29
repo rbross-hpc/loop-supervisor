@@ -1,5 +1,20 @@
 # Plan: second-round lifecycle fixes (fresh independent audit, NO-GO)
 
+> **ARCHIVED.** Despite this file's title, 4 of its 6 steps are done
+> and independently audited GO by the time of archival (Steps 1, 2,
+> 4, and the ADR-update half of Step 6); do not read "NO-GO" as a
+> current verdict on the whole plan. All branch names and code line
+> numbers in this file are stale. The genuinely unresolved remainder
+> — Step 5 in full (blocker 1, the TUI startup-failure deadlock),
+> Step 3's findings 3-4 (interrupt-unsafe backoff, cleanup-interrupt
+> retry/exhaustion coverage), and the `opencode.py` unsafe-`str()`
+> sites Step 3 explicitly deferred — was migrated to
+> `docs/plans/2026-08-22-post-lifecycle-fix-backlog.md` items 36-39.
+> This is not a live planning document; its `## Execution status`
+> section below remains an accurate historical record of what was
+> actually done and by which commits/branches, which is why it is
+> kept rather than deleted.
+
 Branch: `feature/tui-vertical-slice`
 
 Context: a fresh, independent read-only lifecycle audit (distinct from the
