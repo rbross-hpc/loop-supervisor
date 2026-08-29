@@ -1,0 +1,95 @@
+# __LOOP_SUPERVISOR_PROJECT_NAME__
+
+Describe your project here. This file, along with `docs/OBJECTIVE.md`
+and `docs/decisions/`, is what the loop-supervisor agents read to
+understand what to build — replace this paragraph with a real
+description before starting a run.
+
+This project is driven by [loop-supervisor](https://opencode.ai), an
+OpenCode planner/architect/builder/auditor loop that implements work
+one bounded task at a time over Git worktrees, with an independent
+review step before anything merges.
+
+## How the loop works
+
+```
+planner --> [architect] --> builder --> auditor --> supervisor merge
+   ^                                        |
+   +---------------- REPLAN ----------------+
+                        |
+                     REVISE --> builder (same task)
+```
+
+Four OpenCode agents, each with a narrow permission boundary:
+
+- **`loop-planner`** (`.opencode/agents/loop-planner.md`) — read-only.
+  Reads `docs/OBJECTIVE.md`, `README.md`, `docs/decisions/`, and
+  `docs/plans/` to choose the next coherent unit of work, or reports
+  that the project is `COMPLETE`.
+- **`loop-architect`** (`.opencode/agents/loop-architect.md`) —
+  read-only, invoked only when the planner or auditor escalates a
+  focused design question. Proposes an ADR or asks for input.
+- **`loop-builder`** (`.opencode/agents/loop-builder.md`) —
+  read/write, full shell access except merge/push. Implements the
+  task, runs tests, and commits to the task branch.
+- **`loop-auditor`** (`.opencode/agents/loop-auditor.md`) —
+  read-only plus test/lint tooling. Independently inspects the actual
+  repository state and returns `ACCEPT`, `REVISE`, or `REPLAN` against
+  the task's own stated acceptance criteria.
+
+The `loop-supervisor` tool (installed as a dependency of this project;
+see `pyproject.toml`) owns everything the agents are not trusted to do
+themselves: starting `opencode serve`, creating and merging Git
+worktrees, validating structured agent output, persisting resumable
+run state, and asking a human when an agent can't proceed alone.
+
+## Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+
+cp .env.example .env
+# edit .env and fill in ARGO_API_KEY and FALDA_TOKEN (or your
+# provider's equivalents) -- .env is gitignored and never committed
+```
+
+## Before your first run
+
+1. Write `docs/OBJECTIVE.md` — the project's actual goal. This is the
+   first thing every agent role reads.
+2. Replace this README's placeholder description above.
+3. Record any known design constraints as ADRs under
+   `docs/decisions/` (see `docs/decisions/README.md` for the format).
+4. Commit these on a clean branch.
+
+## Running
+
+```bash
+loop-supervisor run --project /path/to/this/checkout
+```
+
+Useful flags: `--worktree-root`, `--max-tasks`, `--max-revisions`,
+`--max-replans`, `--max-architect-retries`, `--role-timeout`,
+`--require-decision-approval`, `--opencode-executable`, `--max-steps`.
+
+The checkout must be a clean Git working tree on a real branch (not
+detached `HEAD`) before a run starts.
+
+## Textual TUI
+
+```bash
+loop-supervisor tui --project /path/to/this/checkout
+```
+
+See the `loop-supervisor` package's own documentation for the full
+run/resume/TUI/lock/retry model — that behavior is unchanged from the
+tool this project depends on, not something this project redefines.
+
+## Testing and quality checks
+
+Set these up for your own project's language and tooling; the
+auditor's permission block in `.opencode/agents/loop-auditor.md`
+allows `pytest`, `ruff`, and `mypy` by default — adjust it if your
+project uses different tools.

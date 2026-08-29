@@ -273,37 +273,36 @@ Retry in the TUI).
 
 ## Bootstrapping a new project
 
-Two ways to start a fresh project from this template:
-
-**Copy to a new directory** (safe, non-destructive, works from anywhere):
+`loop-supervisor` is a dependency your new project installs, not
+something you fork or vendor. `init --destination` writes a small,
+project-specific skeleton — agent definitions, `opencode.json`,
+`.gitignore`, `.env.example`, a stub `docs/OBJECTIVE.md`, a starter
+`README.md`, and a `pyproject.toml` that depends on `loop-supervisor` —
+into a fresh directory:
 
 ```bash
 loop-supervisor init --destination ../my-new-project
 ```
 
-Copies only this checkout's Git-**tracked** files (via `git ls-files`) —
-never `.git` itself, and never any untracked or ignored file (`.env`,
-local caches, `.opencode/node_modules/`, stray secrets, etc.), regardless
-of name. This requires the source to be a real Git checkout with a
-readable index; it does not currently work from an installed wheel with
-no `.git` present. The destination has no Git repository yet — `cd` in,
-review `.env.example`, and `git init` when ready.
+By default the generated `pyproject.toml`'s `loop-supervisor` dependency
+points at this project's own Git URL; pass `--loop-supervisor-git-url`
+to point at a fork, and `--project-name` to override the name derived
+from the destination directory. The destination must not already exist
+non-empty, and has no Git repository yet — `cd` in, review
+`.env.example`, and `git init` when ready.
 
-**Remove history in place** (destructive, for when you've already cloned
-this template as the seed for a new repo and want to drop its history):
+This is a plain filesystem write with no dependency on `.git` or on
+being run from a source checkout at all: it works the same way whether
+`loop-supervisor` itself is an editable install or a real installed
+package (see [ADR
+0018](docs/decisions/0018-bootstrap-generates-a-dependent-skeleton-not-a-vendored-copy.md)).
 
-```bash
-loop-supervisor init --in-place --yes
-```
-
-Requires a clean tree (or `--force`) and permanently deletes `.git` from
-the current checkout. Files, including your local `.env`, are left in
-place; no new repository is initialized automatically.
-
-After bootstrapping either way, replace this README's project-specific
-content and anything under `docs/` with your new project's actual goals
-and design. All four agents read `docs/OBJECTIVE.md`, `README.md`,
-`docs/decisions/`, and `docs/plans/` as their canonical source of truth.
+The generated project never receives this repository's own source,
+tests, ADRs, or working plans — only the small set of files a new
+project actually needs. After bootstrapping, write `docs/OBJECTIVE.md`
+and replace the generated `README.md`'s placeholder content with your
+new project's actual goals and design; see "Handing off from a
+standalone session" below.
 
 ## Handing off from a standalone session
 
