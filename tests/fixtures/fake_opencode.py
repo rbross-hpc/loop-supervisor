@@ -39,6 +39,11 @@ test process can configure it before spawning:
     `POST /permission/{requestID}/reply` appends one JSON line
     `{"request_id": ..., "body": ...}` to this file, then responds
     `200 true`.
+- FAKE_OPENCODE_SELF_PID_FILE: if set, this process writes its own pid
+    to this path immediately after it starts listening, so a test
+    driving the real supervisor CLI as a subprocess (rather than calling
+    OpenCodeServer directly) can still discover this process's pid to
+    assert on its liveness after signaling the supervisor.
 """
 
 from __future__ import annotations
@@ -337,6 +342,10 @@ def main() -> int:
         return 0
 
     print(f"opencode server listening on http://{hostname}:{actual_port}", flush=True)
+    self_pid_file = os.environ.get("FAKE_OPENCODE_SELF_PID_FILE")
+    if self_pid_file:
+        with open(self_pid_file, "w") as f:
+            f.write(str(os.getpid()))
     if mode == "exit_after_ready":
         import time as _time
 

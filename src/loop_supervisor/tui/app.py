@@ -34,10 +34,25 @@ The overall shutdown is therefore two-stage: a bounded cooperative grace
 release that never abandons the lock while a mutation worker may be live.
 
 App-level exit ownership: pressing "q" on a run screen, the "Return to
-runs" button, an unexpected unmount, and app-level exit (ctrl+q, an
-explicit ``App.exit()`` call, or the driver posting ``ExitApp`` on
-SIGINT/SIGTERM) all funnel into the same idempotent, retryable cleanup
-via ``RunScreen.action_request_shutdown()``/``_shutdown_worker()``. At
+runs" button, an unexpected unmount, and app-level exit (ctrl+q or an
+explicit ``App.exit()`` call) all funnel into the same idempotent,
+retryable cleanup via
+``RunScreen.action_request_shutdown()``/``_shutdown_worker()``. This
+does NOT include OS-level SIGINT/SIGTERM: Textual's Linux driver strips
+the terminal's ``ISIG`` flag in raw mode (so Ctrl-C does not even
+generate SIGINT — it is read as an ordinary keypress) and installs no
+SIGTERM handler at all; only Textual's web driver bridges those signals
+into ``ExitApp``. Unlike the headless `run`/`resume` commands (which
+bridge SIGTERM into this same cleanup path — see
+``cli._bridge_sigterm_to_keyboard_interrupt`` and ADR 0015), `cmd_tui`
+deliberately installs no such bridge: injecting an externally raised
+``KeyboardInterrupt`` into Textual's running event loop is untested and
+could leave the terminal stuck in raw mode. A `kill <pid>` against a
+running `loop-supervisor tui` process still terminates at default
+disposition today, with the same orphan/stale-lock exposure the CLI
+bridge fixes for the headless path; giving the TUI equivalent protection
+needs its own UX decision and is tracked separately (backlog item 22b),
+not solved here. At
 most one cleanup attempt runs at a time per screen
 (``_shutdown_attempt_lock``/``_shutdown_in_progress``); a completed
 attempt that did not achieve a clean teardown (``shutdown_clean`` is
