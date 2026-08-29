@@ -766,6 +766,29 @@ after the fact get written down.
     supervisor-created (it does not today, since `git worktree
     remove` already takes the whole directory, `.venv` included).
 
+33. ~~**No objective channel exists between a standalone OpenCode
+    session and the loop supervisor; `docs/plans/` is invisible to
+    every agent prompt.**~~ **Resolved.** A fresh run's planner prompt
+    was the single line `"Determine the next unit of work."`
+    (`supervisor.py:1528`), with no supervisor-read project files and
+    no `objective`/`goal`/`spec`/`brief` field anywhere in `RunState`,
+    `RunOptions`, or the CLI. All scope derived from
+    `.opencode/agents/loop-planner.md` naming exactly `README.md` and
+    `docs/decisions/`; `docs/plans/` was tracked and actively used but
+    named by zero agent prompts. `AGENTS.md` could not fill this role:
+    gitignored, never copied by `init`, referenced by zero code and
+    zero prompts, and its actual content (RTK/Falda host tooling) was
+    the wrong artifact regardless. Fixed by adding `docs/OBJECTIVE.md`
+    as a named canonical source in all four agent prompts (ahead of
+    `README.md`/`docs/decisions/`), adding `docs/plans/` to the
+    planner and architect prompts, documenting the handoff procedure
+    in `README.md`, and writing this repository's own
+    `docs/OBJECTIVE.md` as the worked example. See
+    `docs/decisions/0017-objective-channel-is-a-tracked-file.md` for
+    why this is a tracked file rather than a `--objective`/`RunState`
+    prompt-injection parameter, and what would supersede it once item
+    30's schema squash lands.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in

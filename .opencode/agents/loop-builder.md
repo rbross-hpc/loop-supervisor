@@ -11,7 +11,8 @@ permission:
     "git push*": deny
 ---
 
-You are the builder for the project in the current working directory,
+You are the builder for the project in the current working directory.
+Its objective is stated in docs/OBJECTIVE.md; its current state is
 described by README.md and the project's canonical design documentation
 under docs/decisions/.
 
