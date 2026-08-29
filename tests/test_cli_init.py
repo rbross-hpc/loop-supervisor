@@ -1,6 +1,78 @@
+import difflib
 import tomllib
+from pathlib import Path
 
 from loop_supervisor.cli import _DEFAULT_LOOP_SUPERVISOR_GIT_URL, build_parser, cmd_init_copy
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_LIVE_AGENTS_DIR = _REPO_ROOT / ".opencode" / "agents"
+_SKELETON_AGENTS_DIR = _REPO_ROOT / "src" / "loop_supervisor" / "_skeleton" / ".opencode" / "agents"
+
+# This repository's own live agent prompts are allowed to name
+# repository-specific content the generic skeleton (a new project's
+# starting point, per ADR 0018) must not reference -- most notably the
+# "Testing discipline" section of this repository's own README.md,
+# which assumes this project's own language/tooling (pytest, ruff,
+# mypy) and would be actively wrong advice pasted into an arbitrary
+# new project. Divergence in loop-builder.md and loop-auditor.md is
+# therefore intentional, not drift; loop-planner.md and
+# loop-architect.md have no such repository-specific content and are
+# expected to match exactly. This allowlist exists so a *future*,
+# unintended divergence in the two allowed-to-differ files is still
+# caught if it stops being about "Testing discipline" specifically --
+# see test_skeleton_agent_divergence_is_limited_to_testing_discipline
+# below.
+_EXPECTED_IDENTICAL = ("loop-planner.md", "loop-architect.md")
+_EXPECTED_TO_DIVERGE = ("loop-builder.md", "loop-auditor.md")
+
+
+def test_skeleton_agents_planner_and_architect_match_live_exactly():
+    """loop-planner.md and loop-architect.md have no repository-
+    specific content, so the packaged skeleton copy `init` ships to
+    every new project must be byte-identical to this repository's own
+    -- any difference here is unintended drift (see backlog item 35),
+    not an intentional divergence."""
+    for name in _EXPECTED_IDENTICAL:
+        live = (_LIVE_AGENTS_DIR / name).read_text()
+        skeleton = (_SKELETON_AGENTS_DIR / name).read_text()
+        assert skeleton == live, (
+            f"{name}: skeleton copy has drifted from the live agent prompt; "
+            "sync src/loop_supervisor/_skeleton/.opencode/agents/ from "
+            ".opencode/agents/ (or update this test if the divergence is "
+            "now intentional)"
+        )
+
+
+def test_skeleton_agent_divergence_is_limited_to_testing_discipline():
+    """loop-builder.md and loop-auditor.md are allowed to differ from
+    their skeleton copies, but only by the deliberate reference to
+    this repository's own README "Testing discipline" section --
+    anything else differing (including an unrelated line dropped from
+    the skeleton copy, which a pure "every extra live line is
+    accounted for" check would miss) is unintended drift.
+
+    Approach: delete every *contiguous run* of live-only lines that
+    mentions "Testing discipline" from the live text, then require the
+    result to match the skeleton exactly. This catches both extra
+    unaccounted-for lines in live and any line present in skeleton but
+    missing from live, unlike a one-directional line-membership diff.
+    """
+    for name in _EXPECTED_TO_DIVERGE:
+        live_lines = (_LIVE_AGENTS_DIR / name).read_text().splitlines()
+        skeleton_lines = (_SKELETON_AGENTS_DIR / name).read_text().splitlines()
+
+        matcher = difflib.SequenceMatcher(a=skeleton_lines, b=live_lines, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+            live_only = live_lines[j1:j2]
+            assert tag in ("insert", "replace") and any(
+                "Testing discipline" in line for line in live_only
+            ), (
+                f"{name}: skeleton copy differs from the live agent prompt in a way "
+                f"not accounted for by the Testing-discipline reference "
+                f"(op={tag!r}, skeleton={skeleton_lines[i1:i2]!r}, live={live_only!r})"
+            )
 
 
 def _run_init(tmp_path, destination_name="new-project", **extra_args):
