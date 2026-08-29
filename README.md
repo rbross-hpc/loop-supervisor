@@ -302,9 +302,36 @@ place; no new repository is initialized automatically.
 
 After bootstrapping either way, replace this README's project-specific
 content and anything under `docs/` with your new project's actual goals
-and design — the loop-planner, loop-builder, and loop-auditor agents all
-read `README.md` and `docs/decisions/` as their canonical source of
-truth.
+and design. All four agents read `docs/OBJECTIVE.md`, `README.md`,
+`docs/decisions/`, and `docs/plans/` as their canonical source of truth.
+
+## Handing off from a standalone session
+
+A run's planner is given no objective by the supervisor itself — its
+first prompt is literally "Determine the next unit of work." All scope
+comes from what the agents are told to read. To hand a project to the
+loop from an interactive, standalone OpenCode session:
+
+1. In the standalone session, write or update `docs/OBJECTIVE.md` with
+   the project's current objective — what you actually want built, in
+   plain language. This is the one file every agent role reads first.
+2. Record any accompanying design decisions as ADRs under
+   `docs/decisions/` (see [Design decisions and the
+   architect](#design-decisions-and-the-architect) above for the
+   expected ADR shape), and any working notes under `docs/plans/`.
+3. Commit these on a clean branch, then start the loop:
+
+   ```bash
+   loop-supervisor run --project /path/to/integration/checkout
+   ```
+
+The planner will read `docs/OBJECTIVE.md` on every invocation, so
+updating it between runs (or between tasks, via a new commit on the
+integration branch) is the supported way to redirect an in-progress
+loop without restarting it. There is currently no `--objective` CLI
+flag or `RunState` field — see [ADR
+0017](docs/decisions/0017-objective-channel-is-a-tracked-file.md) for
+why, and what would supersede this.
 
 ## Testing and quality checks
 
