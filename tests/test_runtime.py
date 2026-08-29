@@ -5916,10 +5916,14 @@ def test_run_new_prints_nothing_when_no_permissions_were_denied(tmp_path, capsys
     assert "denied" not in captured.err
 
 
-def test_denier_start_failure_does_not_fail_start_server(tmp_path):
+def test_denier_start_failure_does_not_fail_start_server(tmp_path, capsys):
     """A PermissionDenier that raises from start() must not prevent
     start_server() from succeeding -- a denier fault must never fail an
-    otherwise-healthy run, matching sse.py's own non-fatal contract."""
+    otherwise-healthy run, matching sse.py's own non-fatal contract. But
+    the failure must still be visible on stderr: a silently-swallowed
+    denier-start failure is indistinguishable from a healthy denier that
+    simply saw no asks, which is precisely the ambiguity that made an
+    early live verification run inconclusive."""
     _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
@@ -5954,3 +5958,7 @@ def test_denier_start_failure_does_not_fail_start_server(tmp_path):
             assert session.denied_permission_count == 0
     finally:
         mp.undo()
+
+    captured = capsys.readouterr()
+    assert "permission denier failed to start" in captured.err
+    assert "denier boom" in captured.err

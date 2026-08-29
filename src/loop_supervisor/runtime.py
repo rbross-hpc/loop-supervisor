@@ -983,8 +983,11 @@ class RunSession:
             denier = PermissionDenier(base_url)
             try:
                 denier.start()
-            except Exception:
-                pass
+            except Exception as exc:
+                print(
+                    f"loop-supervisor: permission denier failed to start: {exc}",
+                    file=sys.stderr,
+                )
             else:
                 self._permission_denier = denier
 

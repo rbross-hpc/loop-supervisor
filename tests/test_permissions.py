@@ -136,10 +136,12 @@ def test_denied_count_and_summary_track_permission_key(tmp_path):
         server.stop()
 
 
-def test_reply_http_failure_is_swallowed(tmp_path):
+def test_reply_http_failure_is_not_counted_as_denied(tmp_path, capsys):
     """A reply POST that gets a non-2xx status must not raise out of the
-    SSE event handler or otherwise propagate; SSE failure is strictly
-    non-fatal per sse.py's own contract."""
+    SSE event handler (SSE failure is strictly non-fatal per sse.py's own
+    contract), and must NOT be counted as a denial: the server never
+    accepted the reject, so the agent is still blocked on the ask, not
+    denied. Counting it anyway would overstate what actually happened."""
     server = _FakeServer(
         {
             "FAKE_OPENCODE_SSE_PERMISSION_ASK": "per_fail",
@@ -150,22 +152,25 @@ def test_reply_http_failure_is_swallowed(tmp_path):
     denier = PermissionDenier(server.base_url)
     try:
         denier.start()
-        # No exception should escape; the SSE client thread must stay
-        # alive and the denial is still counted (the reply attempt was
-        # made, whether or not the server accepted it).
-        assert _wait_for(lambda: denier.denied_count == 1)
+        assert _wait_for(
+            lambda: "failed to deny permission request 'per_fail'" in capsys.readouterr().err
+        )
+        assert denier.denied_count == 0
+        assert denier.denied_summary == []
     finally:
         denier.stop()
         server.stop()
 
 
-def test_reply_transport_error_is_swallowed(monkeypatch):
+def test_reply_transport_error_is_not_counted_as_denied(monkeypatch, capsys):
     """A network-level failure posting the reply (not just a bad HTTP
-    status) must not raise out of the event handler. Exercised directly
-    against _on_event/_reply_reject (rather than through a live SSE
-    connection) because both PermissionDenier and SSEClient share the
-    same httpx module, so a global httpx.Client patch would also break
-    the SSE transport itself, not just the reply POST.
+    status) must not raise out of the event handler, and must not be
+    counted as a denial for the same reason as a non-2xx status: the
+    reject was never actually accepted. Exercised directly against
+    _on_event/_reply_reject (rather than through a live SSE connection)
+    because both PermissionDenier and SSEClient share the same httpx
+    module, so a global httpx.Client patch would also break the SSE
+    transport itself, not just the reply POST.
     """
     import loop_supervisor.permissions as permissions_module
 
@@ -192,7 +197,9 @@ def test_reply_transport_error_is_swallowed(monkeypatch):
             },
         }
     )
-    assert denier.denied_count == 1
+    assert denier.denied_count == 0
+    assert denier.denied_summary == []
+    assert "failed to deny permission request 'per_neterr'" in capsys.readouterr().err
 
 
 def test_malformed_permission_asked_missing_id_is_ignored(tmp_path):
@@ -206,6 +213,57 @@ def test_malformed_permission_asked_missing_id_is_ignored(tmp_path):
         }
     )
     assert denier.denied_count == 0
+
+
+def test_start_prints_attach_confirmation_once_live(capsys):
+    """A successful SSE attach must be positively observable, not just
+    inferable from the absence of a start failure -- otherwise "the
+    denier attached and saw nothing" is indistinguishable from "the
+    denier never attached at all."""
+    server = _FakeServer()
+    server.start()
+    denier = PermissionDenier(server.base_url)
+    try:
+        denier.start()
+        assert _wait_for(
+            lambda: f"permission denier watching {server.base_url}" in capsys.readouterr().err
+        )
+    finally:
+        denier.stop()
+        server.stop()
+
+
+def test_successful_denial_still_counts_and_reports(tmp_path, capsys):
+    """A reply that the server actually accepts must still be counted
+    and reported, distinguishing the healthy path from the two failure
+    tests above."""
+    server = _FakeServer(
+        {
+            "FAKE_OPENCODE_SSE_PERMISSION_ASK": "per_ok",
+            "FAKE_OPENCODE_PERMISSION_REPLY_LOG": str(tmp_path / "replies.jsonl"),
+        }
+    )
+    server.start()
+    denier = PermissionDenier(server.base_url)
+    try:
+        denier.start()
+        assert _wait_for(lambda: denier.denied_count == 1)
+        assert denier.denied_summary == ["bash"]
+        assert "denied permission request 'per_ok'" in capsys.readouterr().err
+    finally:
+        denier.stop()
+        server.stop()
+
+
+def test_sse_notice_is_forwarded_to_stderr(capsys):
+    """SSE-level notices (reconnects, malformed events, non-2xx stream
+    responses) must not be silently discarded; they are diagnosable
+    conditions the operator should be able to see."""
+    denier = PermissionDenier("http://127.0.0.1:1")
+    denier._on_notice("SSE error: boom")
+    captured = capsys.readouterr()
+    assert "loop-supervisor:" in captured.err
+    assert "SSE error: boom" in captured.err
 
 
 def test_stop_before_start_is_safe():
