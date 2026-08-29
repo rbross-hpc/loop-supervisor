@@ -539,6 +539,24 @@ after the fact get written down.
     (config-level catch-all) remains worthwhile as defence-in-depth
     but is no longer required to close this item.
 
+    **Follow-up correction (still item 27, not a new item):** the
+    initial `PermissionDenier` implementation's reply omitted the
+    `directory` query parameter, which is not optional —
+    `POST /permission/{requestID}/reply` is not implicitly scoped to
+    the session that raised the ask, and an unscoped reply resolves
+    against the server's default/current instance. Because the project
+    root instance is only used by `loop-planner`, every ask from
+    `loop-architect`/`loop-builder`/`loop-auditor` (raised from a task
+    worktree's own instance) 404'd silently — confirmed live against a
+    real paused run, root-caused by comparing a succeeded (planner,
+    project root) and a failed (auditor, worktree) denial in OpenCode's
+    own log, and fixed by passing the ask's own `directory` (already
+    present on the event envelope) through to the reply. See ADR 0016.
+    Also fixed in the same pass: `_reply_reject` previously discarded
+    the HTTP status/exception on any failure, which is why root-causing
+    the live failure required manually reading OpenCode's own log
+    instead of the supervisor's own output explaining itself.
+
 28. **Add a config-level catch-all `deny` so no permission can ever
     evaluate to `ask`, closing the general case behind item 27.**
     `opencode.json`. Verified against the installed OpenCode 1.18.22

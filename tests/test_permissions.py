@@ -76,6 +76,75 @@ def test_permission_asked_triggers_reject_reply(tmp_path):
         record = json.loads(lines[0])
         assert record["request_id"] == "per_abc123"
         assert record["body"] == {"reply": "reject"}
+        assert record["directory"] == "/repo"
+    finally:
+        denier.stop()
+        server.stop()
+
+
+def test_reply_is_scoped_to_the_ask_s_own_directory(tmp_path, capsys):
+    """The bare POST /permission/{requestID}/reply route is not
+    implicitly scoped to whichever session raised the ask -- confirmed
+    live against the real OpenCode 1.18.22 server (ADR 0016), where a
+    reply omitting the `directory` query parameter resolved against the
+    server's default/current instance instead of the task-worktree
+    instance that actually issued the request, and 404'd. This exercises
+    the fixture's equivalent of that instance-mismatch: the ask reports
+    a directory the reply's scoping check does not match, so the reply
+    must fail exactly like the real server's 404 did, and must not be
+    counted as a denial."""
+    server = _FakeServer(
+        {
+            "FAKE_OPENCODE_SSE_PERMISSION_ASK": "per_wrongscope",
+            "FAKE_OPENCODE_SSE_PERMISSION_ASK_DIRECTORY": "/worktrees/task-001",
+            "FAKE_OPENCODE_PERMISSION_REPLY_REQUIRE_DIRECTORY": "/some/other/instance",
+        }
+    )
+    server.start()
+    denier = PermissionDenier(server.base_url)
+    seen_stderr = ""
+
+    def _saw_failure() -> bool:
+        nonlocal seen_stderr
+        seen_stderr += capsys.readouterr().err
+        return "failed to deny permission request 'per_wrongscope'" in seen_stderr
+
+    try:
+        denier.start()
+        assert _wait_for(_saw_failure)
+        assert "HTTP 404" in seen_stderr
+        assert denier.denied_count == 0
+        assert denier.denied_summary == []
+    finally:
+        denier.stop()
+        server.stop()
+
+
+def test_reply_carries_the_ask_s_own_directory_and_succeeds_when_scoped(tmp_path):
+    """The positive case for the same scoping mechanism: when the ask's
+    directory and the reply's required directory match, the reply must
+    succeed and be counted, and the reply the denier actually sent must
+    carry that same directory -- not a hardcoded default, and not the
+    project root, but whatever the specific ask's own envelope said."""
+    log_path = tmp_path / "replies.jsonl"
+    server = _FakeServer(
+        {
+            "FAKE_OPENCODE_SSE_PERMISSION_ASK": "per_rightscope",
+            "FAKE_OPENCODE_SSE_PERMISSION_ASK_DIRECTORY": "/worktrees/task-002",
+            "FAKE_OPENCODE_PERMISSION_REPLY_REQUIRE_DIRECTORY": "/worktrees/task-002",
+            "FAKE_OPENCODE_PERMISSION_REPLY_LOG": str(log_path),
+        }
+    )
+    server.start()
+    denier = PermissionDenier(server.base_url)
+    try:
+        denier.start()
+        assert _wait_for(lambda: denier.denied_count == 1)
+        assert denier.denied_summary == ["bash"]
+        lines = log_path.read_text().strip().splitlines()
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["directory"] == "/worktrees/task-002"
     finally:
         denier.stop()
         server.stop()
@@ -141,7 +210,13 @@ def test_reply_http_failure_is_not_counted_as_denied(tmp_path, capsys):
     SSE event handler (SSE failure is strictly non-fatal per sse.py's own
     contract), and must NOT be counted as a denial: the server never
     accepted the reject, so the agent is still blocked on the ask, not
-    denied. Counting it anyway would overstate what actually happened."""
+    denied. Counting it anyway would overstate what actually happened.
+
+    The warning must also name the actual HTTP status, not just say
+    "it failed": the one confirmed live occurrence of this failure mode
+    required manually cross-referencing OpenCode's own log to find out
+    why, specifically because the original bare bool discarded that
+    information at the source."""
     server = _FakeServer(
         {
             "FAKE_OPENCODE_SSE_PERMISSION_ASK": "per_fail",
@@ -150,11 +225,17 @@ def test_reply_http_failure_is_not_counted_as_denied(tmp_path, capsys):
     )
     server.start()
     denier = PermissionDenier(server.base_url)
+    seen_stderr = ""
+
+    def _saw_failure() -> bool:
+        nonlocal seen_stderr
+        seen_stderr += capsys.readouterr().err
+        return "failed to deny permission request 'per_fail'" in seen_stderr
+
     try:
         denier.start()
-        assert _wait_for(
-            lambda: "failed to deny permission request 'per_fail'" in capsys.readouterr().err
-        )
+        assert _wait_for(_saw_failure)
+        assert "HTTP 500" in seen_stderr
         assert denier.denied_count == 0
         assert denier.denied_summary == []
     finally:
@@ -199,7 +280,9 @@ def test_reply_transport_error_is_not_counted_as_denied(monkeypatch, capsys):
     )
     assert denier.denied_count == 0
     assert denier.denied_summary == []
-    assert "failed to deny permission request 'per_neterr'" in capsys.readouterr().err
+    stderr = capsys.readouterr().err
+    assert "failed to deny permission request 'per_neterr'" in stderr
+    assert "ConnectError" in stderr
 
 
 def test_malformed_permission_asked_missing_id_is_ignored(tmp_path):
