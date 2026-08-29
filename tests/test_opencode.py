@@ -29,6 +29,39 @@ from loop_supervisor.opencode import (
 FIXTURE = str(Path(__file__).parent / "fixtures" / "fake_opencode.py")
 
 
+@pytest.fixture(autouse=True)
+def _fast_cleanup_timeouts(monkeypatch):
+    """Shrink the module's own cleanup/readiness wait constants for every
+    test in this file.
+
+    These are real wall-clock `Popen.wait()`/`select.select()` bounds
+    that this suite's tests only ever hit on their *failure* paths (a
+    process that must be killed, a launcher event that must time out),
+    never their success paths -- so shrinking them changes nothing
+    about what is exercised, only how long an already-deterministic
+    failure takes to be observed. Without this, the four constants
+    below alone accounted for roughly 100s of a ~133s file (a launcher
+    that never sends its ready line waits the full
+    `_LAUNCHER_READY_TIMEOUT_SECONDS`; a process group that ignores
+    SIGTERM waits the full `_GROUP_TERM_WAIT_SECONDS` before escalating
+    to SIGKILL; and so on for every test exercising one of these paths).
+
+    `_GROUP_TERM_WAIT_SECONDS` was already monkeypatched individually
+    in two tests further down
+    (`test_stop_escalates_to_sigkill_when_descendant_ignores_sigterm`,
+    `test_term_grace_waits_when_child_ignores_sigterm`) before this
+    fixture existed; those per-test overrides are left as-is (they set
+    values tuned to their own assertions) and simply shadow this
+    fixture's default for the duration of that test.
+    """
+    import loop_supervisor.opencode as oc_module
+
+    monkeypatch.setattr(oc_module, "_GROUP_TERM_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(oc_module, "_GROUP_KILL_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(oc_module, "_LAUNCHER_READY_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(oc_module, "_ABORT_TIMEOUT_SECONDS", 0.3)
+
+
 def _config(**overrides) -> OpenCodeServerConfig:
     env = dict(os.environ)
     env.update(overrides.pop("env", {}))
@@ -43,7 +76,7 @@ def _config(**overrides) -> OpenCodeServerConfig:
 def _argv_config(**env_overrides) -> OpenCodeServerConfig:
     env = dict(os.environ)
     env.update(env_overrides)
-    return OpenCodeServerConfig(executable=sys.executable, startup_timeout=5.0, env=env)
+    return OpenCodeServerConfig(executable=sys.executable, startup_timeout=1.0, env=env)
 
 
 class _FakeServer(OpenCodeServer):
