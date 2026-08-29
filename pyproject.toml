@@ -29,6 +29,14 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+loop_supervisor = [
+  "_skeleton/**/*",
+  "_skeleton/.gitignore",
+  "_skeleton/.env.example",
+  "_skeleton/.opencode/agents/*.md",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # An exception escaping a worker thread (or a __del__/callback, for the

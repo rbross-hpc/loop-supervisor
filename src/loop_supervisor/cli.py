@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.resources
+import importlib.resources.abc
+import re
 import shutil
 import signal
-import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .git import GitError, GitRepo
+from .git import GitError
 from .input_providers import StdinInputProvider
 from .locking import LockError
 from .phases import PHASE_OPERATIONAL_FAILURE, TERMINAL_PHASES
@@ -33,7 +35,13 @@ _EXPECTED_CLI_ERRORS: tuple[type[Exception], ...] = (
     FailurePersistenceError,
 )
 
-_TEMPLATE_MARKERS = ("pyproject.toml", "src/loop_supervisor", ".opencode/agents")
+# The default source URL for a generated project's `loop-supervisor`
+# dependency. This is this project's own origin, which is also the only
+# fork this tool currently knows how to point a new project at; see ADR
+# 0018. Override with `init --loop-supervisor-git-url`.
+_DEFAULT_LOOP_SUPERVISOR_GIT_URL = "https://github.com/rbross-hpc/loop-tui-experiment.git"
+
+_PROJECT_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 
 
 @contextlib.contextmanager
@@ -240,122 +248,104 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0 if final.phase == "done" else 1
 
 
-def _looks_like_template(source: Path) -> bool:
-    return all((source / marker).exists() for marker in _TEMPLATE_MARKERS)
+def _skeleton_root() -> importlib.resources.abc.Traversable:
+    """The packaged project skeleton bundled inside the installed
+    `loop_supervisor` distribution (source tree in `_skeleton/`, shipped
+    as package data; see `pyproject.toml`'s `[tool.setuptools.package-
+    data]`). Resolves correctly whether `loop_supervisor` is an editable
+    install (points into this checkout's own `src/`) or a real wheel
+    install (points into `site-packages/`) -- unlike the old Git-
+    checkout-only template mechanism it replaces, this needs no `.git`
+    to be present at all. See ADR 0018."""
+    return importlib.resources.files("loop_supervisor").joinpath("_skeleton")
 
 
-def _template_source_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+def _iter_skeleton_files(
+    root: importlib.resources.abc.Traversable,
+) -> Iterator[tuple[str, importlib.resources.abc.Traversable]]:
+    """Yield (relative_posix_path, file) for every file under `root`,
+    recursively, including dotfiles and dotdirs (e.g. `.gitignore`,
+    `.opencode/agents/`) -- `Traversable.iterdir()` does not skip these
+    the way a shell glob would."""
+    stack: list[tuple[str, importlib.resources.abc.Traversable]] = [("", root)]
+    while stack:
+        prefix, entry = stack.pop()
+        for child in entry.iterdir():
+            relative = f"{prefix}{child.name}" if not prefix else f"{prefix}/{child.name}"
+            if child.is_dir():
+                stack.append((relative, child))
+            else:
+                yield relative, child
 
 
-def _tracked_files(source: Path) -> list[str]:
-    """List Git-tracked files in `source`, the only files copy-mode
-    bootstrap is allowed to touch. This is a positive allowlist, not a
-    denylist: untracked files (secrets, local caches, ignored artifacts)
-    are never copied, regardless of name."""
-    result = subprocess.run(
-        ["git", "ls-files", "-z"],
-        cwd=str(source),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise GitError(
-            f"could not list tracked files in {source} "
-            f"(is it a git checkout with a clean index?): {result.stderr.strip()}"
-        )
-    return [name for name in result.stdout.split("\0") if name]
+# Files copied verbatim; every other name in this map has its
+# `__LOOP_SUPERVISOR_..._` placeholders substituted as it is copied, and
+# has its `.tmpl` suffix stripped from the destination name.
+_SKELETON_PLACEHOLDER_FILES = {
+    "README.md.tmpl": "README.md",
+    "opencode.json.tmpl": "opencode.json",
+    "pyproject.toml.tmpl": "pyproject.toml",
+}
 
 
-def cmd_init_copy(args: argparse.Namespace, *, source: Path | None = None) -> int:
-    if source is None:
-        source = _template_source_root()
+def cmd_init_copy(args: argparse.Namespace) -> int:
     destination = Path(args.destination).resolve()
-
-    if not _looks_like_template(source):
-        print(f"error: {source} does not look like the loop-supervisor template", file=sys.stderr)
-        return 1
-
-    try:
-        tracked = _tracked_files(source)
-    except GitError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    if not tracked:
-        print(f"error: {source} has no git-tracked files to copy", file=sys.stderr)
+    project_name = args.project_name or destination.name
+    if not _PROJECT_NAME_PATTERN.fullmatch(project_name):
+        print(
+            f"error: {project_name!r} is not a valid project name "
+            "(use --project-name to set one explicitly)",
+            file=sys.stderr,
+        )
         return 1
 
     if destination.exists() and any(destination.iterdir()):
         print(f"error: destination {destination} already exists and is not empty", file=sys.stderr)
         return 1
 
+    # The `external_directory` permission is scoped to sibling task
+    # worktrees, which the supervisor creates one directory level above
+    # the project root by default (README: "Sibling task worktrees") --
+    # so the path that must be allowed is the destination's *parent*,
+    # not the destination itself.
+    allowed_external_directory = str(destination.parent)
+
+    substitutions = {
+        "__LOOP_SUPERVISOR_PROJECT_NAME__": project_name,
+        "__LOOP_SUPERVISOR_PROJECT_ROOT__": allowed_external_directory,
+        "__LOOP_SUPERVISOR_GIT_URL__": args.loop_supervisor_git_url,
+    }
+
     created_destination = not destination.exists()
     destination.mkdir(parents=True, exist_ok=True)
 
     try:
-        for relative_name in tracked:
-            src_path = source / relative_name
-            dst_path = destination / relative_name
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_path, dst_path)
+        root = _skeleton_root()
+        for relative_name, entry in _iter_skeleton_files(root):
+            dst_name = _SKELETON_PLACEHOLDER_FILES.get(relative_name)
+            if dst_name is not None:
+                text = entry.read_text(encoding="utf-8")
+                for placeholder, value in substitutions.items():
+                    text = text.replace(placeholder, value)
+                dst_path = destination / dst_name
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                dst_path.write_text(text, encoding="utf-8")
+            else:
+                dst_path = destination / relative_name
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                dst_path.write_bytes(entry.read_bytes())
     except OSError as exc:
         if created_destination:
             shutil.rmtree(destination, ignore_errors=True)
-        print(f"error: failed to copy template files: {exc}", file=sys.stderr)
+        print(f"error: failed to write project skeleton: {exc}", file=sys.stderr)
         return 1
 
-    print(f"template copied to {destination}")
+    print(f"project skeleton written to {destination}")
     print("next steps:")
     print(f"  cd {destination}")
     print("  cp .env.example .env   # then fill in credentials")
     print("  git init && git add -A && git commit -m 'Initial commit'")
-    return 0
-
-
-def cmd_init_in_place(args: argparse.Namespace) -> int:
-    project_root = _project_root(args.project)
-
-    if not _looks_like_template(project_root):
-        print(
-            f"error: {project_root} does not look like the loop-supervisor template root",
-            file=sys.stderr,
-        )
-        return 1
-
-    git_dir = project_root / ".git"
-    if not git_dir.exists():
-        print("error: no .git directory found; nothing to remove", file=sys.stderr)
-        return 1
-
-    try:
-        repo = GitRepo(project_root)
-        dirty = not repo.is_clean()
-    except GitError:
-        dirty = True
-
-    if dirty and not args.force:
-        print(
-            "error: repository has uncommitted changes; commit or discard them, "
-            "or pass --yes to proceed anyway",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(f"This will permanently remove {git_dir} (all Git history and remotes).")
-    print("Tracked files, .env, and other local content will be left in place.")
-    if not args.yes:
-        answer = input("Type 'delete-git-history' to confirm: ")
-        if answer.strip() != "delete-git-history":
-            print("aborted")
-            return 1
-
-    if git_dir.is_dir():
-        shutil.rmtree(git_dir)
-    else:
-        git_dir.unlink()
-
-    print(f"removed {git_dir}; this is now a plain directory with no Git repository")
-    print("next: git init && git add -A && git commit -m 'Initial commit'")
+    print("  edit docs/OBJECTIVE.md and README.md to describe your actual project")
     return 0
 
 
@@ -432,26 +422,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tui_parser.set_defaults(func=cmd_tui)
 
-    init_parser = sub.add_parser("init", help="Bootstrap a new project from this template")
-    init_mode = init_parser.add_mutually_exclusive_group(required=True)
-    init_mode.add_argument(
-        "--destination", default=None, help="Copy the template to a new directory"
+    init_parser = sub.add_parser(
+        "init", help="Write a new project skeleton that depends on loop-supervisor"
     )
-    init_mode.add_argument(
-        "--in-place", action="store_true", help="Remove Git history from the current checkout"
-    )
-    init_parser.add_argument("--project", default=None, help="Template root (for --in-place)")
-    init_parser.add_argument("--yes", action="store_true", help="Skip interactive confirmation")
     init_parser.add_argument(
-        "--force", action="store_true", help="Proceed with --in-place even if the tree is dirty"
+        "--destination", required=True, help="Directory to write the new project skeleton into"
     )
-
-    def _dispatch_init(args: argparse.Namespace) -> int:
-        if args.destination is not None:
-            return cmd_init_copy(args)
-        return cmd_init_in_place(args)
-
-    init_parser.set_defaults(func=_dispatch_init)
+    init_parser.add_argument(
+        "--project-name",
+        default=None,
+        help="Name for the new project (default: the destination directory's name)",
+    )
+    init_parser.add_argument(
+        "--loop-supervisor-git-url",
+        default=_DEFAULT_LOOP_SUPERVISOR_GIT_URL,
+        help="Git URL the generated pyproject.toml pins loop-supervisor to",
+    )
+    init_parser.set_defaults(func=cmd_init_copy)
 
     return parser
 

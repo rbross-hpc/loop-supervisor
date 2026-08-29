@@ -1,0 +1,23 @@
+/AGENTS.md
+.env
+
+# OpenCode local package install (node_modules etc.) — keep agents/config tracked
+/.opencode/node_modules/
+/.opencode/bun.lock
+/.opencode/package.json
+/.opencode/package-lock.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+
+# Supervisor local/runtime state (never committed; lives under .git, not here,
+# but keep this in case of future local artifacts)
+.loop-supervisor/

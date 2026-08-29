@@ -362,48 +362,47 @@ after the fact get written down.
     through `_handle_operational_failure()`, not introduced by item 1's
     `ContractError` fix; not previously called out in this backlog.
 
-25. **`init --destination` bootstraps a fork of the supervisor, not a
-    new project.**
-    `src/loop_supervisor/cli.py:211-253`,
-    `docs/decisions/0004-template-bootstrap.md`,
-    `docs/decisions/0007-tracked-files-only-bootstrap-copy.md`.
-    ADR 0004 states copy-mode exists to seed "new, unrelated projects."
-    In practice `cmd_init_copy()` copies every Git-tracked file — all 60
-    — of which only about 8 belong in a new project. The destination
-    receives the 21-file `src/loop_supervisor/` package, the 17-file
-    test suite, ADRs 0001-0009 (all describing supervisor internals:
-    lock leases, `RunSession`, TUI threading), this project's own
-    `docs/plans/`, a 380-line `README.md` about the supervisor, and a
-    `pyproject.toml` declaring `name = "loop-supervisor"` with its
-    dependencies and console script.
+25. ~~**`init --destination` bootstraps a fork of the supervisor, not a
+    new project.**~~ **Resolved.** ADR 0004 stated copy-mode exists to
+    seed "new, unrelated projects," but `cmd_init_copy()` copied every
+    Git-tracked file — the full `src/loop_supervisor/` package, the
+    test suite, ADRs 0001-0017 documenting supervisor internals, this
+    project's own `docs/plans/`, and a `pyproject.toml` declaring
+    `name = "loop-supervisor"`. Every agent role reads `README.md` and
+    `docs/decisions/` as canonical truth, so a bootstrapped project
+    pointed them at the supervisor's own design; the auditor's
+    `pytest *` would run the supervisor's ~860 tests; the builder held
+    `edit: allow` over supervisor source unrelated to its task.
 
-    This is not merely untidy. The planner, builder, and auditor all
-    read `README.md` and `docs/decisions/` as canonical truth, so a
-    freshly bootstrapped project points them at the supervisor's design
-    rather than their own. The auditor holds `pytest *` and is asked to
-    judge "test adequacy," so every audit would run the supervisor's
-    ~790 tests. The builder holds `edit: allow` over supervisor source
-    unrelated to its task.
+    Fixed by resolving the open question this item posed: a
+    bootstrapped project now **depends on** `loop-supervisor` as an
+    installed package rather than vendoring it. `init --destination`
+    writes a packaged skeleton (`src/loop_supervisor/_skeleton/`,
+    shipped as package data and read via `importlib.resources`, so it
+    needs no `.git` at all) containing only `.opencode/agents/*.md`,
+    `opencode.json`, `.gitignore`, `.env.example`,
+    `pyrightconfig.json`, `docs/decisions/README.md`, a stub
+    `docs/OBJECTIVE.md`, and generated `README.md`/`pyproject.toml`
+    scaffolds. `--in-place` (whose only purpose was de-`git`-ing a
+    checkout that already looked like the supervisor's own source
+    tree — a shape nothing produces under the dependency model) is
+    removed outright. See
+    `docs/decisions/0018-bootstrap-generates-a-dependent-skeleton-not-a-vendored-copy.md`,
+    which supersedes ADR 0007's copy mechanism and narrows ADR 0004's
+    two-bootstrap-mode design to one.
 
-    Wanted in a new project: `.opencode/agents/*` (4),
-    `docs/decisions/README.md` (the ADR format contract),
-    `opencode.json`, `.gitignore`, `.env.example`. Not wanted:
-    everything else.
+    Verified live with the same method as item 33/ADR 0017:
+    `init --destination`, a distinctive `docs/OBJECTIVE.md`, then
+    `run --max-steps 1` produced a `task-001` matching it exactly.
+    `tests/test_cli_init.py` was rewritten (every prior test pinned
+    the removed Git-checkout mechanism).
 
-    ADR 0007 tightened copy-mode's *safety* (tracked-files allowlist
-    instead of a name denylist) but did not revisit its *scope*; the
-    two ADRs together still promise a project seed and deliver a fork.
-
-    Fixing this is a design change, not a filter tweak, and should
-    resolve an open question first: does a bootstrapped project
-    **depend on** `loop-supervisor` as an installed tool, or **vendor**
-    it? Today it implicitly vendors. The tool model would additionally
-    require the packaged-resource bootstrap ADR 0007 defers, since
-    copy-mode currently cannot run from an installed wheel. A real fix
-    also needs generated (not copied) `README.md` and `pyproject.toml`
-    scaffolds — the codebase has no templating today — and would
-    require amending ADRs 0004 and 0007 and reworking
-    `tests/test_cli_init.py`, which pins current behavior.
+    Flagged, not fixed, as follow-up items: 34 (self-hosting
+    regression: no supported way for a new project to also hack on
+    `loop-supervisor`'s own source) and 35 (versioning: generated
+    projects pin `loop-supervisor` to a Git URL with no released
+    version yet, and agent-definition compatibility across upgrades is
+    unenforced).
 
 26. ~~`mypy src tests` (checked together) surfaces ~331 errors that
     `mypy src` and `mypy tests` (checked separately) do not.~~
@@ -788,6 +787,43 @@ after the fact get written down.
     why this is a tracked file rather than a `--objective`/`RunState`
     prompt-injection parameter, and what would supersede it once item
     30's schema squash lands.
+
+34. **No supported way for a new project to also hack on
+    `loop-supervisor`'s own source (self-hosting regression from item
+    25's fix).**
+    `docs/decisions/0018-bootstrap-generates-a-dependent-skeleton-not-a-vendored-copy.md`.
+    This repository improves itself via its own loop today — the
+    builder can freely edit `src/loop_supervisor/` because that source
+    is right there in the checkout. Once a new project depends on
+    `loop-supervisor` as an installed package (item 25's fix), it has
+    no supervisor source to edit at all, and no supported bootstrap
+    mode reintroduces one. A project that specifically wants to
+    co-develop the supervisor alongside its own work (as this
+    repository does) has no path there other than manually cloning
+    `loop-supervisor` itself and switching its dependency to a local
+    editable path. If this is judged to matter, the likely shape is an
+    `init --fork` mode that vendors (today's old behavior, minus the
+    scope problem item 25 fixed) as an explicit opt-in alternative to
+    the new default, not a repurposing of the removed `--in-place`.
+
+35. **Versioning: generated projects pin `loop-supervisor` to a Git
+    URL with no released version, and agent-definition compatibility
+    across upgrades is unenforced.**
+    `src/loop_supervisor/_skeleton/pyproject.toml.tmpl`,
+    `docs/decisions/0018-bootstrap-generates-a-dependent-skeleton-not-a-vendored-copy.md`.
+    The generated `pyproject.toml`'s dependency is `loop-supervisor @
+    git+<url>` with an explicit "TODO: pin this to a released version
+    or tag once one exists" comment, because no released version
+    exists yet. Once one does, a generated project and the
+    `loop-supervisor` version it depends on can drift: the four
+    `.opencode/agents/*.md` files are a point-in-time copy made at
+    `init` time, not something re-synced on a `pip install --upgrade`,
+    so an upgraded supervisor's expectations about, e.g., the
+    structured JSON contract (`contracts.py`) or prompt content could
+    silently diverge from what the copied agent definitions actually
+    say. No compatibility check exists between an installed
+    `loop-supervisor` version and a project's own copied agent
+    definitions.
 
 ## Out of scope for this backlog
 

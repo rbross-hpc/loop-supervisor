@@ -1,0 +1,32 @@
+[project]
+name = "__LOOP_SUPERVISOR_PROJECT_NAME__"
+version = "0.1.0"
+description = "TODO: describe this project."
+requires-python = ">=3.11"
+dependencies = [
+  # TODO: pin this to a released version or tag once one exists.
+  "loop-supervisor @ git+__LOOP_SUPERVISOR_GIT_URL__",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "ruff>=0.6,<1",
+  "mypy>=1.10,<2",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+ignore_missing_imports = true
