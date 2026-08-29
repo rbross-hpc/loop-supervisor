@@ -654,6 +654,60 @@ after the fact get written down.
     consumer sharing one connection's event dispatch, not just
     reusing `PermissionDenier` as-is.
 
+32. **Consider having the supervisor provision each task worktree's
+    `.venv` itself, instead of relying on the builder agent to do it.**
+    `src/loop_supervisor/supervisor.py` (`_do_creating_worktree`),
+    `src/loop_supervisor/opencode.py` (`build_agent_env`),
+    `docs/decisions/0014-server-mode-permission-defaults-and-venv-path.md`.
+
+    ADR 0014 already establishes that each task worktree must have its
+    own `.venv` — never symlinked or shared with the integration
+    project's, because an editable install's `.pth` file (and every
+    console-script shebang under `.venv/bin`) embeds an absolute path,
+    so a shared venv would silently run verification against the
+    wrong checkout's source. Today, creating that venv is left
+    entirely to the builder agent's own initiative: ADR 0014's
+    consequences note that `test-run-task-002`'s builder "already did
+    unprompted," which is another way of saying it works because an
+    agent happened to choose to, not because the supervisor's design
+    guarantees it. `build_agent_env` (`opencode.py`) already prepends
+    a *relative* `.venv/bin` to `PATH` unconditionally, specifically
+    so it resolves per-worktree at each command's exec-time — the
+    supervisor already anticipates a per-worktree venv existing; it
+    just doesn't create one.
+
+    Provisioning is unlikely to belong as unconditional behavior of
+    `_do_creating_worktree` itself: `GitRepo` and the worktree
+    lifecycle are language-agnostic, while `python3 -m venv &&
+    pip install -e ".[dev]"` is a Python-specific convention that
+    happens to be this project's own. The likelier shape is an
+    opt-in hook on `RunOptions` (a configurable provisioning command,
+    or none), defaulting to today's behavior — nothing changes for an
+    existing project unless it opts in.
+
+    One appealing refinement is having the supervisor learn what to
+    provision from the agents' own prior work rather than requiring
+    static configuration — e.g. `BuilderResult.tests_run` or
+    `implementation_strategy` (`contracts.py`) already carry signal
+    about what tooling a build actually needed. This does not work
+    today without a further change: `state.builder_result` is reset
+    to `None` at every task boundary (`supervisor.py`, in both the
+    replan and task-acceptance paths), specifically so a new task
+    starts from a clean slate, so nothing currently survives from one
+    task's builder run to inform the next worktree's setup. Making
+    this work would mean persisting some distilled form of that
+    signal across task boundaries, which — per item 30's rationale —
+    means a `RunState` schema change and should be scoped and decided
+    on its own merits, not assumed as part of provisioning itself.
+
+    Also unresolved: who owns a provisioning failure (hard-fail the
+    `creating_worktree` phase, or proceed and let the builder cope as
+    today), the per-task cost of a full editable install versus the
+    agent turns currently spent redoing it, and whether
+    `cleanup_worktree` needs any awareness that a venv was
+    supervisor-created (it does not today, since `git worktree
+    remove` already takes the whole directory, `.venv` included).
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in
