@@ -202,37 +202,6 @@ class GitRepo:
         result = _run(["show-ref", "--verify", f"refs/heads/{branch}"], cwd=self.root, check=False)
         return result.returncode == 0
 
-    def create_task_worktree(
-        self,
-        original_task_id: str,
-        *,
-        worktree_root: Path | None = None,
-    ) -> TaskWorktree:
-        path = self.default_worktree_path(original_task_id, worktree_root=worktree_root)
-        branch = self.branch_name(original_task_id)
-
-        if path.exists():
-            raise GitError(
-                f"task worktree path {path} already exists; "
-                "remove it or resume the existing run instead"
-            )
-        if self.branch_exists(branch):
-            raise GitError(
-                f"branch {branch!r} already exists; remove it or resume the existing run instead"
-            )
-
-        base_commit = self.head_commit()
-        _run(
-            ["worktree", "add", "-b", branch, str(path), base_commit],
-            cwd=self.root,
-        )
-        return TaskWorktree(
-            path=path,
-            branch=branch,
-            original_task_id=original_task_id,
-            base_commit=base_commit,
-        )
-
     def create_or_reconcile_task_worktree(
         self,
         *,

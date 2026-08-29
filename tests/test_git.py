@@ -7,6 +7,7 @@ from loop_supervisor.git import (
     GitError,
     GitRepo,
     MergeConflictError,
+    TaskWorktree,
     sanitize_task_id,
 )
 
@@ -28,6 +29,18 @@ def _init_repo(path: Path) -> GitRepo:
     return GitRepo(path)
 
 
+def _make_worktree(repo: GitRepo, task_id: str = "task-007") -> TaskWorktree:
+    """Create a task worktree via the production path, for tests whose
+    subject is some other GitRepo method and just need a worktree to exist.
+    """
+    return repo.create_or_reconcile_task_worktree(
+        original_task_id=task_id,
+        path=repo.default_worktree_path(task_id),
+        branch=repo.branch_name(task_id),
+        base_commit=repo.head_commit(),
+    )
+
+
 def test_sanitize_task_id_basic():
     assert sanitize_task_id("task-007") == "task-007"
 
@@ -41,23 +54,6 @@ def test_sanitize_task_id_empty_raises():
         sanitize_task_id("///")
 
 
-def test_create_task_worktree_is_sibling(tmp_path):
-    repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
-
-    assert worktree.path == tmp_path / "project-task-007"
-    assert worktree.path.exists()
-    assert worktree.branch == "loop/task-007"
-    assert (worktree.path / "README.md").exists()
-
-
-def test_create_task_worktree_rejects_collision(tmp_path):
-    repo = _init_repo(tmp_path / "project")
-    repo.create_task_worktree("task-007")
-    with pytest.raises(GitError):
-        repo.create_task_worktree("task-007")
-
-
 def test_require_clean_integration_fails_when_dirty(tmp_path):
     repo = _init_repo(tmp_path / "project")
     (repo.root / "dirty.txt").write_text("oops\n")
@@ -67,7 +63,7 @@ def test_require_clean_integration_fails_when_dirty(tmp_path):
 
 def test_verify_builder_commit_success(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -80,7 +76,7 @@ def test_verify_builder_commit_success(tmp_path):
 
 def test_verify_builder_commit_rejects_wrong_commit(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -92,7 +88,7 @@ def test_verify_builder_commit_rejects_wrong_commit(tmp_path):
 
 def test_verify_builder_commit_rejects_no_new_commits(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
     head = repo.head_commit(cwd=worktree.path)
 
     with pytest.raises(GitError):
@@ -101,7 +97,7 @@ def test_verify_builder_commit_rejects_no_new_commits(tmp_path):
 
 def test_verify_builder_commit_rejects_dirty_worktree(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -115,7 +111,7 @@ def test_verify_builder_commit_rejects_dirty_worktree(tmp_path):
 
 def test_verify_builder_commit_accepts_seven_char_abbreviation(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -128,7 +124,7 @@ def test_verify_builder_commit_accepts_seven_char_abbreviation(tmp_path):
 
 def test_verify_builder_commit_accepts_twelve_char_abbreviation(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -141,7 +137,7 @@ def test_verify_builder_commit_accepts_twelve_char_abbreviation(tmp_path):
 
 def test_verify_builder_commit_always_returns_full_hash(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -155,7 +151,7 @@ def test_verify_builder_commit_always_returns_full_hash(tmp_path):
 
 def test_verify_builder_commit_rejects_empty_string(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -167,7 +163,7 @@ def test_verify_builder_commit_rejects_empty_string(tmp_path):
 
 def test_verify_builder_commit_rejects_whitespace_only(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -182,7 +178,7 @@ def test_verify_builder_commit_rejects_head_revspec(tmp_path):
     # worktree happens to be at, defeating the point of verification.
     # Only hash-shaped values are ever resolved.
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -194,7 +190,7 @@ def test_verify_builder_commit_rejects_head_revspec(tmp_path):
 
 def test_verify_builder_commit_rejects_branch_name(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -206,7 +202,7 @@ def test_verify_builder_commit_rejects_branch_name(tmp_path):
 
 def test_verify_builder_commit_rejects_nonexistent_hex_prefix(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -218,7 +214,7 @@ def test_verify_builder_commit_rejects_nonexistent_hex_prefix(tmp_path):
 
 def test_verify_builder_commit_rejects_abbreviation_of_different_commit(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     base = repo.head_commit(cwd=worktree.path)
     (worktree.path / "feature.txt").write_text("new feature\n")
@@ -234,7 +230,7 @@ def test_verify_builder_commit_rejects_abbreviation_of_different_commit(tmp_path
 
 def test_merge_accepted_task_and_cleanup(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -254,7 +250,7 @@ def test_remove_task_worktree_only_preserves_tracked_modification(tmp_path):
     preserved: removal must fail rather than force-delete unreviewed
     content."""
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -276,7 +272,7 @@ def test_remove_task_worktree_only_preserves_untracked_file(tmp_path):
     merged must be preserved: removal must fail rather than force-delete
     it."""
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -295,7 +291,7 @@ def test_remove_task_worktree_only_preserves_untracked_file(tmp_path):
 
 def test_remove_task_worktree_only_succeeds_when_clean(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -309,7 +305,7 @@ def test_remove_task_worktree_only_succeeds_when_clean(tmp_path):
 
 def test_remove_task_worktree_only_idempotent_when_already_removed(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -325,7 +321,7 @@ def test_delete_task_branch_only_idempotent_when_already_deleted(tmp_path):
     branch is deleted but before state records it, a resumed cleanup_branch
     that deletes again must not fail."""
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -341,7 +337,7 @@ def test_delete_task_branch_only_idempotent_when_already_deleted(tmp_path):
 
 def test_merge_conflict_preserves_task_branch(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "README.md").write_text("task version\n")
     _run(["add", "-A"], worktree.path)
@@ -361,7 +357,7 @@ def test_merge_conflict_preserves_task_branch(tmp_path):
 
 def test_merge_allows_integration_drift_when_no_conflict(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
 
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
@@ -379,7 +375,7 @@ def test_merge_allows_integration_drift_when_no_conflict(tmp_path):
 
 def test_reopen_task_worktree_recovers_handle(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    created = repo.create_task_worktree("task-007")
+    created = _make_worktree(repo)
 
     (created.path / "wip.txt").write_text("partial\n")
     _run(["add", "-A"], created.path)
@@ -392,7 +388,7 @@ def test_reopen_task_worktree_recovers_handle(tmp_path):
 
 def test_common_dir_resolves_for_worktree(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
     task_repo = GitRepo(worktree.path)
 
     assert task_repo.common_dir() == repo.common_dir()
@@ -522,7 +518,7 @@ def test_create_or_reconcile_rejects_missing_base_commit(tmp_path):
 
 def test_reconcile_or_merge_performs_fresh_merge(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
     _run(["commit", "-m", "implement feature"], worktree.path)
@@ -540,7 +536,7 @@ def test_reconcile_or_merge_recognizes_existing_merge_after_crash(tmp_path):
     was saved: reconciliation must recognize the exact existing merge
     rather than merging again."""
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
     _run(["commit", "-m", "implement feature"], worktree.path)
@@ -556,7 +552,7 @@ def test_reconcile_or_merge_recognizes_existing_merge_after_crash(tmp_path):
 
 def test_reconcile_or_merge_finds_merge_past_unrelated_commits(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
     _run(["commit", "-m", "implement feature"], worktree.path)
@@ -576,7 +572,7 @@ def test_reconcile_or_merge_rejects_fast_forward_impersonation(tmp_path):
     """A fast-forward or cherry-pick that happens to contain the task's
     content must not be accepted as satisfying the merge intent."""
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
     _run(["commit", "-m", "implement feature"], worktree.path)
@@ -592,7 +588,7 @@ def test_reconcile_or_merge_rejects_fast_forward_impersonation(tmp_path):
 
 def test_reconcile_or_merge_rejects_diverged_integration(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
     _run(["commit", "-m", "implement feature"], worktree.path)
@@ -618,7 +614,7 @@ def test_reconcile_or_merge_rejects_diverged_integration(tmp_path):
 
 def test_reconcile_or_merge_conflict_raises_merge_conflict_error(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
     (worktree.path / "README.md").write_text("task version\n")
     _run(["add", "-A"], worktree.path)
     _run(["commit", "-m", "task edits README"], worktree.path)
@@ -638,7 +634,7 @@ def test_reconcile_or_merge_conflict_raises_merge_conflict_error(tmp_path):
 
 def test_reconcile_or_merge_rejects_missing_pre_head(tmp_path):
     repo = _init_repo(tmp_path / "project")
-    worktree = repo.create_task_worktree("task-007")
+    worktree = _make_worktree(repo)
     (worktree.path / "feature.txt").write_text("new feature\n")
     _run(["add", "-A"], worktree.path)
     _run(["commit", "-m", "implement feature"], worktree.path)
