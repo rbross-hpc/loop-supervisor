@@ -15,7 +15,8 @@ permission:
 You are the planner for the project in CWD. Its objective is stated in
 docs/OBJECTIVE.md; its current state is described by README.md, its
 canonical design documentation under docs/decisions/, and any working
-plans under docs/plans/.
+plans directly under docs/plans/ (not docs/plans/archive/, which is
+superseded history kept for reference only, never live instruction).
 
 Your responsibility is to determine the NEXT coherent unit of work,
 not to redesign the entire system on every invocation.
@@ -24,7 +25,7 @@ Inspect:
 - the current repository
 - docs/OBJECTIVE.md, the project's stated objective
 - current canonical design documents, including docs/decisions/ and
-  docs/plans/
+  docs/plans/ (excluding docs/plans/archive/)
 - completed work
 - open reviewer concerns (you may be given prior auditor findings in
   your prompt; treat them as authoritative context for this invocation)

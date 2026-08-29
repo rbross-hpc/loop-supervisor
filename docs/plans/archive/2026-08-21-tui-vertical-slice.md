@@ -1,5 +1,22 @@
 # Plan: first Textual TUI vertical slice
 
+> **ARCHIVED.** This plan's own `Status:` line below is stale and
+> wrong — it says "not started" but the work described is almost
+> entirely complete and has been for some time (verify against the
+> current repository, not this line). All code/branch/worktree
+> references in this file are stale. Kept for historical design
+> rationale only (e.g. the live-reducer bounds and event-filtering
+> invariants, and the lock record schema — see
+> `docs/decisions/0008-textual-tui-and-execution-model.md` and
+> `docs/decisions/0009-supervisor-lock-and-operational-failure-
+> semantics.md`, which supersede this file's narrative for anything
+> they cover). The small residue of genuinely unfinished work this
+> file described (module layout, fake-server structured-mode
+> coverage, TUI rendering tests) was migrated to
+> `docs/plans/2026-08-22-post-lifecycle-fix-backlog.md` items 40-42.
+> This is not a live planning document. Do not treat any instruction
+> below as current.
+
 Branch: `feature/tui-vertical-slice`
 Worktree: `/workspaces/loop-tui-experiment/loop-tui-experiment-tui-vertical-slice`
 Status: not started (persisted before context compaction)
