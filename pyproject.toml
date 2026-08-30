@@ -35,6 +35,7 @@ loop_supervisor = [
   "_skeleton/.gitignore",
   "_skeleton/.env.example",
   "_skeleton/.opencode/agents/*.md",
+  "_skeleton/.opencode/agents/*.tmpl",
 ]
 
 [tool.pytest.ini_options]

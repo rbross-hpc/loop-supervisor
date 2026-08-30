@@ -1,7 +1,7 @@
 # Architecture decision records
 
-This directory records consequential design decisions for the
-loop-supervisor project, using a lightweight ADR format.
+This directory records consequential design decisions for this
+project, using a lightweight ADR format.
 
 ## Format
 
@@ -31,20 +31,16 @@ The decision itself, stated plainly.
 
 ## How new ADRs are created
 
-Numbers `0001`–`0014` were written by hand to record the initial loop
-design, its hardening (schema v3, durable side-effect phases, operational
-failure semantics, repository lock), the Textual TUI execution model,
-agent-output parse leniency, downstream-role objective-restatement
-tolerance, auditor-output routing to downstream roles, tolerance for
-abbreviated builder commit hashes, and server-mode permission defaults
-and venv PATH handling. From here on, ADRs are proposed by
-the `loop-architect` agent (read-only) when the planner or auditor
-escalates a design question with `decision_required: true`. The
-supervisor — never the architect directly — writes the exact approved
-text into the active task worktree as the next available
-`NNNN-title.md`, so the builder's own commit captures it.
+Write the first ADR yourself, by hand, to record any design constraint
+you already know you want the loop to respect before starting a run.
+From then on, ADRs are proposed by the `loop-architect` agent
+(read-only) when the planner or auditor escalates a design question
+with `decision_required: true`. The supervisor — never the architect
+directly — writes the exact approved text into the active task
+worktree as the next available `NNNN-title.md`, so the builder's own
+commit captures it.
 
-`Status` is currently always `Accepted` in this project: there is no
+`Status` is currently always `Accepted`: there is no
 superseding/deprecation workflow yet. If a later decision reverses an
-earlier one, note that in the newer ADR's `Context` section and reference
-the older ADR by number.
+earlier one, note that in the newer ADR's `Context` section and
+reference the older ADR by number.
