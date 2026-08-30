@@ -47,6 +47,18 @@ def _resume_args(tmp_path, run_id="run-1", **overrides):
     return argparse.Namespace(**defaults)
 
 
+def _stub_load_run(monkeypatch, *, phase="building", accepted_task_count=0):
+    """cmd_resume() now checks load_run() before run_resume() to reject a
+    terminal run early (backlog item 29). Tests exercising cmd_resume()'s
+    behavior *after* that check (paused-message wording, max_steps
+    passthrough, error normalization from run_resume() itself, signal
+    handling) stub load_run() to report a non-terminal phase by default,
+    so load_run()'s own real-repository requirement does not interfere
+    with what each test is actually exercising."""
+    existing = argparse.Namespace(phase=phase, accepted_task_count=accepted_task_count)
+    monkeypatch.setattr(cli_mod, "load_run", lambda *a, **k: existing)
+
+
 @pytest.mark.parametrize(
     "exc",
     [
@@ -85,6 +97,7 @@ def test_cmd_resume_normalizes_expected_errors(tmp_path, monkeypatch, capsys, ex
     def fake_run_resume(*args, **kwargs):
         raise exc
 
+    _stub_load_run(monkeypatch)
     monkeypatch.setattr(cli_mod, "run_resume", fake_run_resume)
     rc = cli_mod.cmd_resume(_resume_args(tmp_path))
 
@@ -168,6 +181,7 @@ def test_cmd_resume_does_not_catch_keyboard_interrupt(tmp_path, monkeypatch):
     def fake_run_resume(*args, **kwargs):
         raise KeyboardInterrupt()
 
+    _stub_load_run(monkeypatch)
     monkeypatch.setattr(cli_mod, "run_resume", fake_run_resume)
     with pytest.raises(KeyboardInterrupt):
         cli_mod.cmd_resume(_resume_args(tmp_path))
@@ -305,6 +319,7 @@ def test_cmd_resume_passes_max_steps_through(tmp_path, monkeypatch):
         received.update(kwargs)
         return FakeState()
 
+    _stub_load_run(monkeypatch)
     monkeypatch.setattr(cli_mod, "run_resume", fake_run_resume)
     rc = cli_mod.cmd_resume(_resume_args(tmp_path, max_steps=2))
 
@@ -322,6 +337,7 @@ def test_cmd_resume_step_is_shorthand_for_max_steps_one(tmp_path, monkeypatch):
         received.update(kwargs)
         return FakeState()
 
+    _stub_load_run(monkeypatch)
     monkeypatch.setattr(cli_mod, "run_resume", fake_run_resume)
     cli_mod.cmd_resume(_resume_args(tmp_path, step=True))
 
@@ -375,10 +391,57 @@ def test_cmd_resume_invalid_max_steps_with_no_run_id_is_rejected_not_listed(
     assert "available runs" not in captured.out
 
 
+@pytest.mark.parametrize("phase", ["done", "failed"])
+def test_cmd_resume_rejects_terminal_run_before_starting(tmp_path, monkeypatch, capsys, phase):
+    """Resuming a run whose persisted phase is already terminal must be
+    rejected up front -- before run_resume() (and therefore before the
+    lock is acquired or an OpenCode process is spawned) -- with an
+    actionable, non-zero-exit message, not a silent no-op reported
+    identically to a resume that did real work."""
+
+    def fake_run_resume(*args, **kwargs):
+        raise AssertionError("run_resume must not be called for an already-terminal run")
+
+    _stub_load_run(monkeypatch, phase=phase, accepted_task_count=6)
+    monkeypatch.setattr(cli_mod, "run_resume", fake_run_resume)
+    rc = cli_mod.cmd_resume(_resume_args(tmp_path, run_id="2dba05654b5e"))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert "2dba05654b5e" in captured.err
+    assert phase in captured.err
+    assert "6" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cmd_resume_terminal_run_rejection_reports_load_run_failure(tmp_path, monkeypatch, capsys):
+    """If load_run() itself fails (e.g. the run_id does not exist), that
+    failure must be reported the same sanitized way as every other
+    expected cmd_resume failure, not let a traceback escape."""
+
+    def fake_load_run(*args, **kwargs):
+        raise RuntimeError_("cannot load run 'nonexistent': no saved state")
+
+    def fake_run_resume(*args, **kwargs):
+        raise AssertionError("run_resume must not be called when load_run() fails")
+
+    monkeypatch.setattr(cli_mod, "load_run", fake_load_run)
+    monkeypatch.setattr(cli_mod, "run_resume", fake_run_resume)
+    rc = cli_mod.cmd_resume(_resume_args(tmp_path, run_id="nonexistent"))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("error: ")
+    assert "Traceback" not in captured.err
+
+
 def test_cmd_resume_paused_message_printed_to_stdout_on_early_stop(tmp_path, monkeypatch, capsys):
     class FakeState:
         phase = "building"
 
+    _stub_load_run(monkeypatch)
     monkeypatch.setattr(cli_mod, "run_resume", lambda *a, **k: FakeState())
     rc = cli_mod.cmd_resume(_resume_args(tmp_path, max_steps=2))
 
@@ -392,6 +455,7 @@ def test_cmd_resume_paused_message_printed_even_without_max_steps(tmp_path, monk
     class FakeState:
         phase = "building"
 
+    _stub_load_run(monkeypatch)
     monkeypatch.setattr(cli_mod, "run_resume", lambda *a, **k: FakeState())
     rc = cli_mod.cmd_resume(_resume_args(tmp_path))
 
@@ -407,6 +471,7 @@ def test_cmd_resume_no_paused_message_on_failure_phases(tmp_path, monkeypatch, c
 
     FakeState.phase = phase
 
+    _stub_load_run(monkeypatch)
     monkeypatch.setattr(cli_mod, "run_resume", lambda *a, **k: FakeState())
     rc = cli_mod.cmd_resume(_resume_args(tmp_path, max_steps=2))
 
@@ -419,6 +484,7 @@ def test_cmd_resume_no_paused_message_on_done(tmp_path, monkeypatch, capsys):
     class FakeState:
         phase = "done"
 
+    _stub_load_run(monkeypatch)
     monkeypatch.setattr(cli_mod, "run_resume", lambda *a, **k: FakeState())
     rc = cli_mod.cmd_resume(_resume_args(tmp_path, max_steps=2))
 
@@ -538,6 +604,7 @@ def test_cmd_resume_wraps_run_resume_in_the_sigterm_bridge(tmp_path, monkeypatch
         seen["disposition"] = signal.getsignal(signal.SIGTERM)
         raise KeyboardInterrupt()
 
+    _stub_load_run(monkeypatch)
     monkeypatch.setattr(cli_mod, "run_resume", fake_run_resume)
     with pytest.raises(KeyboardInterrupt):
         cli_mod.cmd_resume(_resume_args(tmp_path))

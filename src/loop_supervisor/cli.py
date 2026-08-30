@@ -19,7 +19,7 @@ from .git import GitError
 from .input_providers import StdinInputProvider
 from .locking import LockError
 from .phases import PHASE_OPERATIONAL_FAILURE, TERMINAL_PHASES
-from .runtime import RuntimeError_, list_run_ids, run_new, run_resume
+from .runtime import RuntimeError_, list_run_ids, load_run, run_new, run_resume
 from .state import RunOptions, StateError
 from .supervisor import FailurePersistenceError, LoopError
 
@@ -244,6 +244,31 @@ def cmd_resume(args: argparse.Namespace) -> int:
         for run_id in runs:
             print(f"  {run_id}")
         return 0
+
+    # Reject a terminal run before acquiring the lock or starting
+    # OpenCode: resuming a finished/failed run is already guaranteed to
+    # no-op (Supervisor.run()'s `while state.phase not in
+    # _TERMINAL_PHASES` loop guard exits immediately), but without this
+    # check the no-op is discovered only after a full server spawn and
+    # teardown, and reported identically to a resume that did real work
+    # ("final phase: done", exit 0). load_run() is lock-free, so this
+    # adds no acquisition of its own before the real one below. This
+    # does not relax ADR 0006's "no further resume is possible" -- a
+    # terminal run still cannot be reopened; this only makes the
+    # already-correct no-op cheap and legible instead of silent.
+    try:
+        existing = load_run(project_root, args.run_id)
+    except RuntimeError_ as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if existing.phase in TERMINAL_PHASES:
+        print(
+            f"error: run {args.run_id} is already {existing.phase} "
+            f"({existing.accepted_task_count} tasks accepted); "
+            "start a new run with 'loop-supervisor run'",
+            file=sys.stderr,
+        )
+        return 1
 
     try:
         with _bridge_sigterm_to_keyboard_interrupt():
