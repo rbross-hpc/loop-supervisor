@@ -138,11 +138,34 @@ after the fact get written down.
    `loop-supervisor` *ancestor* directory could redirect lock/state writes
    outside Git metadata entirely.
 
-5. **Dangling lock symlink can spin acquisition.**
-   `src/loop_supervisor/locking.py:343-365`.
-   `Path.exists()` follows symlinks and returns False for a dangling
-   symlink at the lock path, so `_inspect_existing_lock()` returns `None`
-   (meaning "retry") in a loop instead of surfacing a clear error.
+5. ~~Dangling lock symlink can spin acquisition.~~ **Resolved.**
+   `src/loop_supervisor/locking.py:364` (`_inspect_existing_lock`) and
+   `:446` (`release`). `Path.exists()` follows symlinks and returns
+   `False` for a dangling symlink, so `_inspect_existing_lock()`
+   previously returned `None` ("disappeared, retry") in `acquire()`'s
+   `while True` loop, which then re-attempted `os.link()` against the
+   same dangling symlink — always `FileExistsError`, since `link(2)`
+   does not follow symlinks — spinning at 100% CPU forever, *while
+   holding the guard flock* (`with _guarded(...)`, `locking.py:343`),
+   wedging every supervisor process on the repository.
+   `--recover-stale-lock` could not help: recovery lives past this
+   early return. Confirmed reproducible before the fix.
+
+   Fixed by switching both sites from `Path.exists()` to
+   `os.path.lexists()`, so a dangling symlink is seen rather than read
+   as absent. At the `acquire()` site this falls through to
+   `_read_lock`, whose `_open_no_follow` raises `OSError` ("too many
+   levels of symbolic links"), already wrapped as `MalformedLockError`.
+   `release()` had the identical hazard on its own `.exists()` check
+   (`:446`): a dangling symlink there would make it conclude "already
+   gone" and silently discard the ownership token while leaving the
+   symlink in place. Fixed the same way; now raises `LockError` instead.
+   See `tests/test_locking.py`
+   (`test_dangling_lock_symlink_is_rejected_not_spun_on`,
+   `test_dangling_lock_symlink_at_release_time_is_not_treated_as_absent`).
+   The first test runs `acquire()` in a subprocess with a bounded
+   `join()`, since calling it in-process against the pre-fix code would
+   have hung the test process itself with no way to time out.
 
 6. **Bound non-newline OpenCode stdout fragments.**
    `src/loop_supervisor/opencode.py:223-251`.
