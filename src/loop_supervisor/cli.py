@@ -22,6 +22,7 @@ from .input_providers import StdinInputProvider
 from .locking import LockError
 from .phases import PHASE_OPERATIONAL_FAILURE, TERMINAL_PHASES
 from .runtime import RuntimeError_, list_run_ids, load_run, run_new, run_resume
+from .skill import run_skill
 from .state import RunOptions, StateError
 from .supervisor import FailurePersistenceError, LoopError
 
@@ -537,6 +538,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Emit a machine-readable JSON report"
     )
     validate_parser.set_defaults(func=cmd_config_validate)
+
+    skill_parser = sub.add_parser(
+        "skill", help="Show or export the bundled adopt-loop-supervisor Agent Skill"
+    )
+    skill_sub = skill_parser.add_subparsers(dest="skill_action", required=True)
+    skill_sub.add_parser("show", help="Print the bundled SKILL.md to stdout")
+    skill_export_parser = skill_sub.add_parser("export", help="Copy the skill directory to PATH")
+    skill_export_parser.add_argument("path", metavar="PATH", help="Destination directory")
+    skill_export_parser.add_argument(
+        "--force", action="store_true", help="Overwrite the destination if non-empty"
+    )
+    skill_parser.set_defaults(func=lambda args: run_skill(args))
 
     return parser
 
