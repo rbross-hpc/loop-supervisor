@@ -330,6 +330,39 @@ def test_popen_oserror_with_throwing_str_normalized_to_startup_error(tmp_path, m
     assert "unprintable _UnprintableOSError" in str(excinfo.value)
 
 
+def test_anchor_identity_unprintable_getpgid_oserror_normalized(tmp_path, monkeypatch):
+    """os.getpgid() failing during anchor-identity verification with an
+    OSError subclass whose __str__ itself raises must still be
+    normalized to ServerStartupError with exact cause identity, falling
+    back to a deterministic "unprintable ..." rendering rather than
+    letting the broken __str__ escape in its place."""
+    config = OpenCodeServerConfig(executable="opencode")
+    server = OpenCodeServer(tmp_path, config)
+
+    class _UnprintableOSError(OSError):
+        def __str__(self) -> str:
+            raise RuntimeError("simulated str failure in OSError")
+
+    the_error = _UnprintableOSError("simulated unprintable OSError")
+
+    def _boom_getpgid(pid):
+        raise the_error
+
+    monkeypatch.setattr(os, "getpgid", _boom_getpgid)
+
+    class _FakeLauncher:
+        pid = 1234
+        returncode = None
+
+        def poll(self):
+            return None
+
+    with pytest.raises(ServerStartupError) as excinfo:
+        server._parse_anchor_identity(_FakeLauncher(), 0, 0, "anchor-ready:1234:1234")  # type: ignore[arg-type]
+    assert excinfo.value.__cause__ is the_error
+    assert "unprintable _UnprintableOSError" in str(excinfo.value)
+
+
 def test_startup_cleanup_keyboard_interrupt_does_not_replace_primary(tmp_path, monkeypatch):
     """If OpenCodeServer.start()'s own internal defense-in-depth stop()
     raises KeyboardInterrupt during startup-failure cleanup, the original
@@ -1880,6 +1913,15 @@ def _network_error_handler(request: httpx.Request) -> httpx.Response:
     raise httpx.ConnectError("simulated connection failure", request=request)
 
 
+class _UnprintableRequestError(httpx.ConnectError):
+    """An httpx.RequestError subclass whose __str__ itself raises, for
+    exercising the _safe_exception_text() fallback at every site that
+    interpolates a caught httpx.RequestError into a diagnostic message."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("simulated str failure in RequestError")
+
+
 def _patch_close(monkeypatch, replacement):
     """Patch httpx.Client.close globally to `replacement`. Used with the
     mock-transport server helper above, where every client constructed
@@ -2244,6 +2286,21 @@ def test_create_session_request_error_then_close_failure(tmp_path, monkeypatch):
     assert len(getattr(excinfo.value, "__notes__", [])) == 1
 
 
+def test_create_session_unprintable_request_error_normalized(tmp_path, monkeypatch):
+    """An httpx.RequestError subclass whose __str__ itself raises must
+    still be normalized to AgentInvocationError with a deterministic
+    "unprintable ..." rendering in the message, not let the broken
+    __str__ escape in its place."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        raise _UnprintableRequestError("simulated unprintable network error", request=request)
+
+    server = _mock_server(tmp_path, _handler, monkeypatch=monkeypatch)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.create_session(tmp_path, title="t", timeout=1.0)
+    assert "unprintable _UnprintableRequestError" in str(excinfo.value)
+
+
 def test_create_session_http_500_then_close_failure(tmp_path, monkeypatch):
     server = _mock_server(tmp_path, _json_handler(500, {"error": "boom"}), monkeypatch=monkeypatch)
     _patch_close(monkeypatch, _throwing_close)
@@ -2345,6 +2402,19 @@ def test_send_prompt_request_error_then_close_failure(tmp_path, monkeypatch):
     assert len(getattr(excinfo.value, "__notes__", [])) == 1
 
 
+def test_send_prompt_unprintable_request_error_normalized(tmp_path, monkeypatch):
+    """See test_create_session_unprintable_request_error_normalized: the
+    same _safe_exception_text() fallback must apply here."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        raise _UnprintableRequestError("simulated unprintable network error", request=request)
+
+    server = _mock_server(tmp_path, _handler, monkeypatch=monkeypatch)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert "unprintable _UnprintableRequestError" in str(excinfo.value)
+
+
 def test_send_prompt_http_500_then_close_failure(tmp_path, monkeypatch):
     server = _mock_server(tmp_path, _json_handler(500, {}), monkeypatch=monkeypatch)
     _patch_close(monkeypatch, _throwing_close)
@@ -2436,6 +2506,33 @@ def test_send_prompt_malformed_structured_output_then_close_failure(tmp_path, mo
     assert "malformed structured output" in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, TypeError)
     assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_send_prompt_unprintable_malformed_structured_output_normalized(tmp_path, monkeypatch):
+    """The json.dumps() failure re-serializing structured_output must
+    also be rendered through _safe_exception_text(): if that TypeError's
+    own __str__ raises, the fallback rendering must be used instead of
+    letting the broken __str__ escape."""
+    server = _mock_server(
+        tmp_path,
+        _json_handler(200, {"info": {"structured_output": {"a": 1}}, "parts": []}),
+        monkeypatch=monkeypatch,
+    )
+
+    class _UnprintableTypeError(TypeError):
+        def __str__(self) -> str:
+            raise RuntimeError("simulated str failure in TypeError")
+
+    the_error = _UnprintableTypeError("simulated unserializable structured_output")
+
+    def _boom_dumps(*args, **kwargs):
+        raise the_error
+
+    monkeypatch.setattr(json, "dumps", _boom_dumps)
+    with pytest.raises(AgentInvocationError) as excinfo:
+        server.send_prompt(**_prompt_kwargs(), timeout=1.0)
+    assert excinfo.value.__cause__ is the_error
+    assert "unprintable _UnprintableTypeError" in str(excinfo.value)
 
 
 def test_send_prompt_malformed_parts_then_close_failure(tmp_path, monkeypatch):
@@ -2551,6 +2648,19 @@ def test_abort_bounded_request_error_then_close_failure(tmp_path, monkeypatch):
         server._abort_session_bounded("s1")
     assert isinstance(excinfo.value.__cause__, httpx.ConnectError)
     assert len(getattr(excinfo.value, "__notes__", [])) == 1
+
+
+def test_abort_bounded_unprintable_request_error_normalized(tmp_path, monkeypatch):
+    """See test_create_session_unprintable_request_error_normalized: the
+    same _safe_exception_text() fallback must apply here."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        raise _UnprintableRequestError("simulated unprintable network error", request=request)
+
+    server = _mock_server(tmp_path, _handler, monkeypatch=monkeypatch)
+    with pytest.raises(OpenCodeError) as excinfo:
+        server._abort_session_bounded("s1")
+    assert "unprintable _UnprintableRequestError" in str(excinfo.value)
 
 
 def test_abort_bounded_http_500_then_close_failure(tmp_path, monkeypatch):

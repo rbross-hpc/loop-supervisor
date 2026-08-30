@@ -781,7 +781,9 @@ class OpenCodeServer:
         try:
             actual_pgid = os.getpgid(pid)
         except OSError as exc:
-            raise ServerStartupError(f"could not verify launcher identity: {exc}") from exc
+            raise ServerStartupError(
+                f"could not verify launcher identity: {_safe_exception_text(exc)}"
+            ) from exc
         if actual_pgid != pgid:
             raise ServerStartupError(f"launcher pgid mismatch: expected {pgid}, got {actual_pgid}")
         return _ProcessOwner(
@@ -1174,7 +1176,7 @@ class OpenCodeServer:
                 ) from exc
             except httpx.RequestError as exc:
                 raise AgentInvocationError(
-                    f"network error creating session for {title!r}: {exc}"
+                    f"network error creating session for {title!r}: {_safe_exception_text(exc)}"
                 ) from exc
 
             _raise_for_status(response, "create session")
@@ -1235,7 +1237,7 @@ class OpenCodeServer:
                 ) from exc
             except httpx.RequestError as exc:
                 raise AgentInvocationError(
-                    f"network error communicating with agent {agent!r}: {exc}"
+                    f"network error communicating with agent {agent!r}: {_safe_exception_text(exc)}"
                 ) from exc
 
             _raise_for_status(response, f"prompt for agent {agent!r}")
@@ -1294,7 +1296,7 @@ class OpenCodeServer:
                 ) from exc
             except httpx.RequestError as exc:
                 raise OpenCodeError(
-                    f"network error aborting session {session_id!r}: {exc}"
+                    f"network error aborting session {session_id!r}: {_safe_exception_text(exc)}"
                 ) from exc
 
             _raise_for_status(response, f"abort session {session_id!r}")
@@ -1460,7 +1462,7 @@ def _extract_text(data: dict[str, Any], *, agent: str) -> str:
             return _json.dumps(structured)
         except (TypeError, ValueError) as exc:
             raise AgentInvocationError(
-                f"agent {agent!r} returned malformed structured output: {exc}"
+                f"agent {agent!r} returned malformed structured output: {_safe_exception_text(exc)}"
             ) from exc
 
     parts = data.get("parts", [])
