@@ -547,6 +547,76 @@ def test_lock_path_symlink_is_rejected_and_target_untouched(tmp_path):
     assert target_file.read_text() == "do not touch\n"
 
 
+def _acquire_dangling_symlink_target(tmp_path_str: str, result_queue: Any) -> None:
+    try:
+        _make_lock(Path(tmp_path_str)).acquire()
+    except MalformedLockError:
+        result_queue.put("MalformedLockError")
+    except LockError as exc:
+        result_queue.put(f"other LockError: {exc}")
+    except BaseException as exc:  # pragma: no cover - diagnostic aid
+        result_queue.put(f"unexpected: {exc!r}")
+    else:
+        result_queue.put("returned")
+
+
+def test_dangling_lock_symlink_is_rejected_not_spun_on(tmp_path):
+    """A lock-path symlink whose target does not exist must be treated as
+    a malformed lock, not as "no lock present". Path.exists() follows
+    symlinks and reports False for a dangling target, which previously
+    made _inspect_existing_lock() return None ("disappeared, retry")
+    forever: acquire()'s retry loop would re-attempt os.link() against
+    the same dangling symlink, which always fails with FileExistsError
+    (link(2) does not follow symlinks), spinning at 100% CPU while
+    holding the guard flock for the whole repository.
+
+    Run in a subprocess with a bounded join: against the current bug,
+    calling acquire() directly in this process would hang the test
+    process itself with no way to time out, defeating the purpose of a
+    regression test. The subprocess can be killed unconditionally."""
+    target_dir = tmp_path.parent / "dangling-symlink-target-dir"
+    target_dir.mkdir()
+    lock_path = _lock_path(tmp_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.symlink_to(target_dir / "does-not-exist")
+
+    ctx = multiprocessing.get_context("fork")
+    result_queue: multiprocessing.Queue = ctx.Queue()
+    proc = ctx.Process(target=_acquire_dangling_symlink_target, args=(str(tmp_path), result_queue))
+    proc.start()
+    proc.join(timeout=5)
+    still_alive = proc.is_alive()
+    if still_alive:
+        proc.terminate()
+        proc.join(timeout=5)
+
+    assert not still_alive, "acquire() spun instead of raising on a dangling lock symlink"
+    assert result_queue.get_nowait() == "MalformedLockError"
+    assert lock_path.is_symlink()
+    assert not lock_path.exists()
+
+
+def test_dangling_lock_symlink_at_release_time_is_not_treated_as_absent(tmp_path):
+    """release() has the same exists()-follows-symlinks hazard as
+    acquire(): if the lock path becomes a dangling symlink between
+    acquire() and release() (e.g. something else replaced the lock file
+    with a broken symlink), release() must not silently conclude "the
+    lock is already gone" and discard its ownership token. It must
+    surface a clear error and leave the symlink in place for inspection.
+    """
+    lock = _make_lock(tmp_path)
+    lock.acquire()
+    lock_path = _lock_path(tmp_path)
+    lock_path.unlink()
+    lock_path.symlink_to(tmp_path / "does-not-exist")
+
+    with pytest.raises(LockError):
+        lock.release()
+
+    assert lock._token is not None
+    assert lock_path.is_symlink()
+
+
 # -- retryable release --------------------------------------------------------
 
 

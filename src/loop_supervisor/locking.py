@@ -360,8 +360,20 @@ class SupervisorLock:
         """Inspect the existing lock and decide what to do.
 
         Returns None if the lock disappeared (retry), or a LockError
-        if acquisition should fail."""
-        if not self._path.exists():
+        if acquisition should fail.
+
+        Uses os.path.lexists rather than Path.exists: the latter follows
+        symlinks and reports False for a dangling symlink at the lock
+        path, which would make this method say "disappeared, retry" for
+        something that is actually present. acquire()'s retry loop would
+        then spin forever re-attempting os.link() against the same
+        dangling symlink (link(2) does not follow symlinks, so it always
+        fails with FileExistsError) while holding the guard flock for the
+        whole repository. lexists reports True for a dangling symlink, so
+        it falls through to _read_lock below, whose _open_no_follow
+        raises OSError("too many levels of symbolic links"), which is
+        already wrapped as a MalformedLockError."""
+        if not os.path.lexists(self._path):
             return None
 
         try:
@@ -443,7 +455,11 @@ class SupervisorLock:
 
         try:
             with _guarded(self._path.parent.parent):
-                if not self._path.exists():
+                # lexists, not exists: see _inspect_existing_lock's
+                # docstring. A dangling symlink at the lock path is not
+                # "already gone" and must not make this instance silently
+                # discard its ownership token.
+                if not os.path.lexists(self._path):
                     self._token = None
                     return
 
