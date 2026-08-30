@@ -1464,6 +1464,15 @@ def _report_denied_permissions(session: RunSession) -> None:
     close() tears the denier down) rather than only in cmd_run/
     cmd_resume, so both headless entry points get it uniformly without
     duplicating the check.
+
+    Callers must invoke this from a ``finally``, not only on
+    ``run_to_completion()``'s successful-return path: an operational
+    failure makes ``Supervisor.run()`` raise ``LoopError`` (see backlog
+    item 44), which would otherwise skip this diagnostic in exactly the
+    case where it is most useful -- an agent that gave up and returned
+    no output after having every permission request denied looks
+    identical, in the persisted failure record, to any other cause of
+    "no text output" unless this line accompanies it.
     """
     count = session.denied_permission_count
     if count == 0:
@@ -1505,9 +1514,20 @@ def run_new(
     )
     with session:
         session.start_server()
-        result = session.run_to_completion(max_steps=max_steps)
-        _report_denied_permissions(session)
-        return result
+        try:
+            return session.run_to_completion(max_steps=max_steps)
+        finally:
+            # In a finally, not only on the successful-return path: an
+            # operational failure raises LoopError out of
+            # run_to_completion() (Supervisor.run() re-raises for
+            # OPERATIONAL_FAILURE), which previously skipped this
+            # diagnostic entirely -- silencing it in exactly the case
+            # where "N permission requests were denied" is most likely
+            # to explain *why* the failure happened (see backlog item
+            # 44: a headless run that fails because an agent gave up
+            # after being denied external_directory access repeatedly
+            # had no diagnostic connecting the two).
+            _report_denied_permissions(session)
 
 
 def run_resume(
@@ -1541,9 +1561,12 @@ def run_resume(
     )
     with session:
         session.start_server()
-        result = session.run_to_completion(max_steps=max_steps)
-        _report_denied_permissions(session)
-        return result
+        try:
+            return session.run_to_completion(max_steps=max_steps)
+        finally:
+            # See run_new()'s identical finally: LoopError from an
+            # operational failure must not skip this diagnostic.
+            _report_denied_permissions(session)
 
 
 def list_run_ids(project_root: Path) -> list[str]:
