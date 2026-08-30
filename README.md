@@ -5,11 +5,13 @@ loop — planner, optional architect, builder, auditor — over Git worktrees,
 so an LLM coding agent can incrementally implement a project one bounded
 task at a time, with an independent review step before anything merges.
 
-This repository is also a **project template**. Once you have a working
-loop, you can bootstrap a new project from it (see [Bootstrapping a new
-project](#bootstrapping-a-new-project) below) and keep only your project's
-own goals and design docs, while reusing the supervisor, agent roles, and
-tooling unchanged.
+`loop-supervisor init` bootstraps a new project that **depends on**
+`loop-supervisor` as an installed package — it does not vendor a copy
+of this repository's own source, tests, or history (see
+[ADR 0018](docs/decisions/0018-bootstrap-generates-a-dependent-skeleton-not-a-vendored-copy.md)).
+See [`docs/INSTALLING.md`](docs/INSTALLING.md) for the full install and
+first-run walkthrough, or [`docs/ADOPTING.md`](docs/ADOPTING.md) if
+you're bringing the loop into a project that already has code.
 
 ## How the loop works
 
@@ -183,6 +185,12 @@ migrated; start a new run instead.
 
 ## Setup
 
+This section covers working on `loop-supervisor` itself (this
+checkout). If you want to install `loop-supervisor` and bootstrap a
+new project with it, see [`docs/INSTALLING.md`](docs/INSTALLING.md)
+instead — it also covers prerequisites (Python, OpenCode, a model
+provider) this section assumes are already in place.
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
@@ -198,6 +206,12 @@ credentials with `{env:VAR}` interpolation, which OpenCode resolves from
 the environment. `loop-supervisor` loads `.env` itself (via
 `python-dotenv`) before starting `opencode serve`.
 
+`loop-supervisor config validate --project .` checks whether a project
+(this one, or any generated one) is plausibly set up for a run —
+executables on `PATH`, a clean git worktree, `opencode.json` parses,
+permissions cover the sibling task-worktree directory, agent
+definitions present, `.env` exists — before you try to start one.
+
 ## Running
 
 ```bash
@@ -206,7 +220,10 @@ loop-supervisor run --project /path/to/integration/checkout
 
 Useful flags: `--worktree-root`, `--max-tasks`, `--max-revisions`,
 `--max-replans`, `--max-architect-retries`, `--role-timeout`,
-`--require-decision-approval`, `--opencode-executable`.
+`--require-decision-approval`, `--opencode-executable`,
+`--recover-stale-lock`, and the mutually exclusive `--step`/
+`--max-steps` (bound how many phase transitions this invocation
+performs before stopping; `--step` is shorthand for `--max-steps 1`).
 
 The integration checkout must be a clean Git working tree on a real
 branch (not detached `HEAD`) before a run starts.
@@ -286,10 +303,24 @@ loop-supervisor init --destination ../my-new-project
 
 By default the generated `pyproject.toml`'s `loop-supervisor` dependency
 points at this project's own Git URL; pass `--loop-supervisor-git-url`
-to point at a fork, and `--project-name` to override the name derived
-from the destination directory. The destination must not already exist
-non-empty, and has no Git repository yet — `cd` in, review
-`.env.example`, and `git init` when ready.
+to point at a fork, `--project-name` to override the name derived from
+the destination directory, and `--architect-model provider/model-id`
+to pin the architect role to a specific model (omitted by default — it
+inherits the project's own default model). The destination must not
+already exist non-empty, and has no Git repository yet — `cd` in,
+review `.env.example`, and `git init` when ready. See
+[`docs/INSTALLING.md`](docs/INSTALLING.md) for the full walkthrough,
+including installing `loop-supervisor` itself first.
+
+The generated `opencode.json` ships with no model provider configured
+— see [ADR
+0023](docs/decisions/0023-generated-projects-ship-no-provider-configuration.md)
+and `docs/INSTALLING.md`'s [Configuring a model
+provider](docs/INSTALLING.md#3-configure-a-model-provider) section.
+
+If you're bringing the loop into a project that already has code
+rather than starting fresh, `init` isn't the right tool — see
+[`docs/ADOPTING.md`](docs/ADOPTING.md) instead.
 
 This is a plain filesystem write with no dependency on `.git` or on
 being run from a source checkout at all: it works the same way whether

@@ -1301,6 +1301,20 @@ after the fact get written down.
     denials — confirming the diagnostics fix above works as intended
     and that nothing else was masking a further defect.
 
+45. **No `LICENSE` file and no distribution metadata
+    (`readme`/`license`/`authors`/`[project.urls]`) in
+    `pyproject.toml`.** Blocks a clean `pip install git+...` from
+    showing correct package metadata and would block any future PyPI
+    release outright. Deferred out of the install/onboarding round
+    that produced ADRs 0022/0023, `config validate`, and the
+    `adopt-loop-supervisor` skill — none of those needed license
+    metadata to function, and the license terms themselves are a
+    decision for whoever owns the repository, not something to
+    default silently. See `wake`'s `pyproject.toml` for a same-family
+    project that already carries this metadata
+    (`license = "BSD-3-Clause"`, `authors`, `readme`), if a template is
+    wanted.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in

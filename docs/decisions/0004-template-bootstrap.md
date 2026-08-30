@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR
+0018](0018-bootstrap-generates-a-dependent-skeleton-not-a-vendored-copy.md).
+`--in-place` was removed outright; `init --destination` now generates a
+skeleton that depends on `loop-supervisor` as an installed package
+rather than vendoring a copy of it. Kept for historical context on why
+the original two-mode design existed.
 
 ## Context
 
