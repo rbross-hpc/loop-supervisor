@@ -953,19 +953,19 @@ after the fact get written down.
     attempts" and "on the final attempt" cases from this item's
     description are now covered.
 
-39. **Unsafe `str()` interpolation of arbitrary exceptions in three
+39. ~~Unsafe `str()` interpolation of arbitrary exceptions in three
     `opencode.py` HTTP-error-message sites, outside the one path Step
-    3's remediation already fixed.** (Tier 1 — correctness/security)
+    3's remediation already fixed.~~ **Resolved.**
     `src/loop_supervisor/opencode.py:784` (`_parse_anchor_identity`'s
-    `getpgid` failure message), `:1177` (`create_session`'s
-    `httpx.RequestError` message), `:1238` (`send_prompt`'s), `:1297`
+    `getpgid` failure message), `:1178` (`create_session`'s
+    `httpx.RequestError` message), `:1239` (`send_prompt`'s), `:1298`
     (`_abort_session_bounded`'s).
     Migrated from `second-lifecycle-fix-plan.md`'s Step 3 remediation
     trail, which fixed exactly one instance of this pattern (the
     `OSError`→`ServerStartupError` normalization in `start()`, this
     backlog's resolved item 27's neighbor) via `_safe_exception_text()`
     and explicitly named these four as "out of scope for this narrowly
-    targeted fix." All four remain plain f-string `{exc}` interpolation
+    targeted fix." All four were plain f-string `{exc}` interpolation
     of an exception whose `__str__` this code does not control (a
     third-party `httpx` exception, or a `getpgid` `OSError`); a
     throwing `__str__` on any of them would raise from inside message
@@ -973,10 +973,27 @@ after the fact get written down.
     `AgentInvocationError`/`ServerStartupError` and losing whatever
     that intended error was reporting — the same class of bug ADR-
     adjacent Step 2 (`opencode._safe_exception_text`) and Step 3's
-    fixed instance both exist specifically to prevent. Fix is
-    mechanical: route all four through the existing
+    fixed instance both exist specifically to prevent.
+
+    Fixed by routing all four through the existing
     `_safe_exception_text()` helper, matching the fixed instance's
-    pattern exactly.
+    pattern exactly. Also found and fixed a fifth site the original
+    finding did not name: `:1464` (`_extract_text`'s
+    `json.dumps(structured)` failure message), which had the identical
+    plain-`{exc}` defect against a `TypeError`/`ValueError` whose
+    `__str__` this code likewise does not control. `:1451`
+    (non-object-body message) was inspected and deliberately left
+    unchanged — it interpolates server-returned JSON via `str(data)`,
+    not a caught exception, so `_safe_exception_text()` does not apply.
+    See `tests/test_opencode.py`
+    (`test_anchor_identity_unprintable_getpgid_oserror_normalized`,
+    `test_create_session_unprintable_request_error_normalized`,
+    `test_send_prompt_unprintable_request_error_normalized`,
+    `test_send_prompt_unprintable_malformed_structured_output_normalized`,
+    `test_abort_bounded_unprintable_request_error_normalized`), each
+    modeled on the existing
+    `test_popen_oserror_with_throwing_str_normalized_to_startup_error`
+    template.
 
 40. **TUI module layout never matched the planned split; `tui/app.py`
     has grown to ~1,400 lines holding both `RunBrowserScreen` and
