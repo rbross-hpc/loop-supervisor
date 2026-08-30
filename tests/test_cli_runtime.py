@@ -95,6 +95,66 @@ def test_cmd_resume_normalizes_expected_errors(tmp_path, monkeypatch, capsys, ex
     assert "Traceback" not in captured.err
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"max_tasks": -5},
+        {"max_revisions": -1},
+        {"max_replans": -1},
+        {"max_architect_retries": -1},
+        {"role_timeout": 0.0},
+        {"role_timeout": -1.0},
+        {"startup_timeout": 0.0},
+        {"opencode_executable": ""},
+    ],
+)
+def test_cmd_run_rejects_invalid_options_before_starting(tmp_path, monkeypatch, capsys, overrides):
+    """Out-of-range CLI values (negative counts, non-positive timeouts, an
+    empty executable) must be rejected before run_new() is ever called --
+    the same values RunOptions.from_dict() would reject when loading a
+    persisted run. Without this, argparse's type coercion alone would
+    accept them, letting a run start, persist invalid options via
+    to_dict(), and then become permanently unresumable (from_dict()
+    rejects the very file the program itself wrote)."""
+
+    def fake_run_new(*args, **kwargs):
+        raise AssertionError("run_new must not be called for invalid options")
+
+    monkeypatch.setattr(cli_mod, "run_new", fake_run_new)
+    rc = cli_mod.cmd_run(_run_args(tmp_path, **overrides))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert "Traceback" not in captured.err
+
+
+def test_cmd_run_accepts_options_from_dict_would_accept(tmp_path, monkeypatch):
+    """Round-trip check: anything cmd_run() builds successfully must also
+    be accepted by RunOptions.from_dict(), so the two validation paths
+    (CLI construction, persisted-state loading) can never silently
+    diverge on what counts as valid."""
+    from loop_supervisor.state import RunOptions
+
+    captured_options = {}
+
+    class FakeState:
+        run_id = "run-123"
+        phase = "done"
+
+    def fake_run_new(project_root, options, **kwargs):
+        captured_options["options"] = options
+        return FakeState()
+
+    monkeypatch.setattr(cli_mod, "run_new", fake_run_new)
+    rc = cli_mod.cmd_run(_run_args(tmp_path))
+
+    assert rc == 0
+    options = captured_options["options"]
+    assert RunOptions.from_dict(options.to_dict()) == options
+
+
 def test_cmd_run_does_not_catch_keyboard_interrupt(tmp_path, monkeypatch):
     def fake_run_new(*args, **kwargs):
         raise KeyboardInterrupt()
