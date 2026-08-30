@@ -82,8 +82,21 @@ def iter_sse_json(
     - CRLF line endings.
     - Malformed JSON — emits a notice via ``on_notice`` and continues.
     - Object-only JSON — non-object values are silently skipped.
-    - Maximum event size — events exceeding ``max_event_bytes`` are dropped.
+    - Maximum event size — events exceeding ``max_event_bytes`` are dropped,
+      including an event built from an unbounded run of empty ``data:``
+      lines (each contributes at least one byte toward the cap, not
+      zero, so it cannot grow ``data_parts`` indefinitely for free).
     - Incomplete final record (no terminating blank line) — discarded.
+
+    Known limitation this cap does *not* cover: ``httpx``'s own
+    ``LineDecoder``, which produces the ``lines`` this function consumes
+    (via ``response.iter_lines()`` in ``SSEClient._connect_and_stream``),
+    buffers an unterminated line unboundedly in its own internal buffer
+    *before* a line ever reaches this function. ``max_event_bytes``
+    operates on already-decoded lines and cannot bound that upstream
+    buffering by construction. See backlog item 7 in
+    ``docs/plans/2026-08-22-post-lifecycle-fix-backlog.md`` for the
+    accepted scope of what this cap does and does not defend against.
     """
     data_parts: list[str] = []
     byte_count = 0
@@ -118,7 +131,14 @@ def iter_sse_json(
             if oversized:
                 continue
             payload = line[5:].lstrip(" ")
-            byte_count += len(payload.encode())
+            # +1 accounts for the "\n" that will join this part with the
+            # next one in "\n".join(data_parts) below, and also ensures
+            # every data: line -- even one with an empty payload --
+            # contributes at least one byte toward the cap. Without this,
+            # an unbounded run of empty "data:" lines within a single
+            # event would grow data_parts (and therefore memory) forever
+            # without ever tripping the size check.
+            byte_count += len(payload.encode()) + 1
             if byte_count > max_event_bytes:
                 if on_notice:
                     on_notice(f"SSE event exceeded {max_event_bytes} bytes; dropping")
@@ -150,6 +170,7 @@ class SSEClient:
         on_notice: Callable[[str], None] | None = None,
         connect_timeout: float = 10.0,
         read_timeout: float = 60.0,
+        max_event_bytes: int = 1 << 20,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._on_event = on_event
@@ -157,6 +178,7 @@ class SSEClient:
         self._on_notice = on_notice
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
+        self._max_event_bytes = max_event_bytes
         self._lifecycle_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -319,6 +341,7 @@ class SSEClient:
 
                     for obj in iter_sse_json(
                         response.iter_lines(),
+                        max_event_bytes=self._max_event_bytes,
                         on_notice=self._notice,
                     ):
                         if self._stop_event.is_set():

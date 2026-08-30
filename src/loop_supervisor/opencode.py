@@ -28,6 +28,22 @@ import httpx
 _READY_RE = re.compile(r"opencode server listening on (https?://\S+)")
 _STDOUT_DRAIN_MAXLEN = 500
 
+# Bound on the stdout pump's non-newline-terminated `partial` fragment.
+# A subprocess writing an arbitrarily long line with no newline -- or
+# one that never arrives -- would otherwise grow `partial` (and the
+# `_stdout_partial` snapshot derived from it, which flows into startup
+# diagnostics via _diagnostic_output()) without limit. Once `partial`
+# would exceed this bound, the accumulated bytes are dropped entirely
+# (not retained for later use) and the pump switches to "oversized"
+# mode: it discards further bytes for the same line, scanning only for
+# the eventual newline, so memory use for a single pathological line is
+# bounded at roughly this constant plus one read()'s worth of bytes,
+# never growing further regardless of how long the line actually is.
+# supervisor.py's own _truncate_message() separately bounds the final
+# persisted record; this bound exists further upstream, in memory,
+# before that point is ever reached.
+_MAX_STDOUT_FRAGMENT_BYTES = 64 * 1024
+
 # Bound for waiting on the process group after SIGTERM before escalating
 # to SIGKILL, and again after SIGKILL before giving up and reporting
 # unresolved ownership. The group-wide SIGKILL is unconditional after
@@ -814,6 +830,16 @@ class OpenCodeServer:
 
         def _pump() -> None:
             partial = b""
+            # True while the in-progress (not yet newline-terminated)
+            # line has exceeded _MAX_STDOUT_FRAGMENT_BYTES and its bytes
+            # have been dropped. The *next* newline seen still belongs to
+            # that same oversized line (it is what finally terminates
+            # it), so the first line produced by the next split must be
+            # discarded rather than recorded -- it is only the tail of
+            # an already-abandoned line, not a real one. Every line after
+            # that first discarded one is unaffected and recorded
+            # normally.
+            oversized = False
             while not self._stdout_stop.is_set():
                 try:
                     ready, _, _ = select.select([fileno], [], [], 0.1)
@@ -826,19 +852,29 @@ class OpenCodeServer:
                 except OSError:
                     break
                 if not chunk:
-                    if partial:
+                    if partial and not oversized:
                         self._record_line(partial.decode(errors="replace").rstrip("\r"))
                     self._stdout_eof_event.set()
                     break
                 partial += chunk
                 if b"\n" not in partial:
+                    if len(partial) > _MAX_STDOUT_FRAGMENT_BYTES:
+                        # Drop the accumulated bytes entirely rather than
+                        # retaining a truncated slice: the point is to
+                        # bound memory for a line that may never
+                        # terminate, not to preserve a sample of it.
+                        partial = b""
+                        oversized = True
                     with self._stdout_partial_lock:
-                        self._stdout_partial = partial.decode(errors="replace")
+                        self._stdout_partial = "" if oversized else partial.decode(errors="replace")
                     continue
                 lines = partial.split(b"\n")
                 partial = lines.pop()
                 with self._stdout_partial_lock:
                     self._stdout_partial = partial.decode(errors="replace")
+                if oversized:
+                    lines = lines[1:]
+                    oversized = False
                 for raw_line in lines:
                     self._record_line(raw_line.decode(errors="replace").rstrip("\r"))
 

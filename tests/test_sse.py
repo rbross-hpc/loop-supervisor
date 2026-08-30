@@ -90,6 +90,68 @@ def test_incomplete_final_record_discarded():
     assert result == []
 
 
+def test_many_empty_data_lines_trip_event_size_limit():
+    """An event built from a large number of empty `data:` lines must
+    still trip max_event_bytes, not grow data_parts for free forever:
+    each empty data: line must contribute at least one byte toward the
+    cap, exactly like a non-empty one does."""
+    notices: list[str] = []
+    lines = ["data:"] * 1000 + [""]
+    result = _parse(lines, max_event_bytes=100, on_notice=notices.append)
+    assert result == []
+    assert any("exceeded" in n for n in notices)
+
+
+def test_sse_client_threads_max_event_bytes_into_parser(monkeypatch):
+    """SSEClient must pass its own max_event_bytes through to
+    iter_sse_json rather than always using the parser's default --
+    otherwise the constructor parameter has no effect on the real
+    streaming path."""
+    import loop_supervisor.sse as sse_module
+
+    captured: dict[str, object] = {}
+    real_iter_sse_json = sse_module.iter_sse_json
+
+    def _spy(lines, **kwargs):
+        captured.update(kwargs)
+        return real_iter_sse_json(lines, **kwargs)
+
+    monkeypatch.setattr(sse_module, "iter_sse_json", _spy)
+
+    class _FakeResponse:
+        status_code = 200
+
+        def iter_lines(self):
+            return iter([])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def stream(self, *a, **kw):
+            return _FakeResponse()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sse_module.httpx, "Client", _FakeClient)
+
+    client = sse_module.SSEClient(
+        "http://example.invalid",
+        on_event=lambda obj: None,
+        max_event_bytes=12345,
+    )
+    client._connect_and_stream()
+
+    assert captured.get("max_event_bytes") == 12345
+
+
 def test_empty_data_after_blank():
     lines = ["data: ", ""]
     notices: list[str] = []

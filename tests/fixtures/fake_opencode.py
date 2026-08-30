@@ -16,6 +16,11 @@ test process can configure it before spawning:
     "split_ready_line" -- write the ready line in two separate writes
                         with a short delay between them, to exercise
                         reassembly of a line split across reads
+    "oversized_line_then_ready" -- write a single non-newline-terminated
+                        fragment larger than the pump's fragment bound,
+                        terminate it with a newline, then print the real
+                        ready line, to exercise recovery after an
+                        oversized line is dropped
 - FAKE_OPENCODE_RESPONSE: JSON text returned as `structured_output` for
     every /session/{id}/message call.
 - FAKE_OPENCODE_ERROR: if set, /session/{id}/message returns this string
@@ -374,6 +379,21 @@ def main() -> int:
         sys.stdout.flush()
         _time.sleep(0.2)
         sys.stdout.write(ready_line[split_at:])
+        sys.stdout.flush()
+        thread.join()
+        return 0
+
+    if mode == "oversized_line_then_ready":
+        # Write a single line far larger than the pump's fragment bound,
+        # with no newline for a while, to exercise the pump's oversized-
+        # line handling: it must drop the accumulated bytes instead of
+        # growing without limit, then correctly resume normal line
+        # handling (recognizing the real ready line) once this line is
+        # finally terminated.
+        sys.stdout.write("x" * (200 * 1024))
+        sys.stdout.flush()
+        sys.stdout.write("\n")
+        sys.stdout.write(f"opencode server listening on http://{hostname}:{actual_port}\n")
         sys.stdout.flush()
         thread.join()
         return 0
