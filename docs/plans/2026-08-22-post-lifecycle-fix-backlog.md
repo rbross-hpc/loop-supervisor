@@ -906,36 +906,52 @@ after the fact get written down.
     requested mid-failed-init-cleanup waits correctly and then
     proceeds.
 
-37. **`_confirm_server_stopped()`'s inter-attempt backoff uses
-    `time.sleep()`, which is not interrupt-safe.** (Tier 1 —
-    correctness)
-    `src/loop_supervisor/runtime.py:121` (module docstring's own
-    "Known limitation"), `:156` (`_CLEANUP_ATTEMPTS = 3`), `:228`
-    (`time.sleep(_CLEANUP_BACKOFF_SECONDS * (attempt + 1))`).
+37. ~~`_confirm_server_stopped()`'s inter-attempt backoff uses
+    `time.sleep()`, which is not interrupt-safe.~~ **Resolved.**
+    `src/loop_supervisor/runtime.py:196-224` (`_confirm_server_stopped`).
     Migrated from the same Step 3 audit trail as the now-resolved
     denial-routing and traceback-preservation findings (this backlog's
     items 26/27's neighbors in that plan), but explicitly called out
     there as remaining open across three separate remediation rounds
     ("Findings 3–4 ... remain unresolved") and never carried into this
-    backlog. A `KeyboardInterrupt`/`SystemExit` delivered while
-    `_confirm_server_stopped()` is inside this `time.sleep()` call is
-    not guaranteed the same primary-error precedence the rest of
-    `runtime.py`'s cleanup path establishes for every other window —
-    the module's own docstring already admits this rather than
-    claiming a guarantee it doesn't hold.
+    backlog until now.
 
-38. **Cleanup-time `KeyboardInterrupt`/`SystemExit` retry/exhaustion
+    A `KeyboardInterrupt`/`SystemExit` delivered while
+    `_confirm_server_stopped()` was inside its inter-attempt
+    `time.sleep()` previously escaped the function entirely, bypassing
+    the "returns structured success/failure information instead of
+    raising" contract its own docstring claims — an interrupt raised
+    by `stop()` itself already got that treatment (reported via
+    `last_error`, not re-raised), but the identical interrupt arriving
+    one line later, during backoff, did not.
+
+    Fixed by wrapping the backoff `time.sleep()` call in its own
+    `except (KeyboardInterrupt, SystemExit)`, returning the same
+    `_CleanupOutcome(confirmed=False, last_error=<interrupt>, ...)`
+    shape as the `stop()`-raises case, so both interrupt windows are
+    now indistinguishable to every caller. Removed the module
+    docstring's "Known limitation" paragraph, which is no longer true.
+    See `tests/test_runtime.py`
+    (`test_confirm_server_stopped_interrupt_during_backoff_reported_not_raised`,
+    `test_confirm_server_stopped_system_exit_during_backoff_reported_not_raised`).
+
+38. ~~Cleanup-time `KeyboardInterrupt`/`SystemExit` retry/exhaustion
     edge cases across `_confirm_server_stopped()`'s bounded retry loop
-    lack test coverage.** (Tier 5 — documentation/testing debt)
-    `src/loop_supervisor/runtime.py:200-232`.
+    lack test coverage.~~ **Resolved.**
+    `src/loop_supervisor/runtime.py:196-224`.
     Migrated from the same Step 3 finding as item 37 (the two were
     always paired as "findings 3–4" in the source plan and never
-    resolved). Distinct from item 37: this is a coverage gap for
-    behavior that may already be adequate, not a known defect: what
-    happens if an interrupt arrives between individual retry attempts
-    (not during the `time.sleep()` itself, which is item 37's
-    concern), or during the final attempt when the budget is about to
-    be exhausted, is untested either way.
+    resolved). Distinct from item 37: this was a coverage gap for
+    behavior that may already have been adequate, not a known defect.
+
+    Added `test_confirm_server_stopped_interrupt_on_final_attempt_reported_not_raised`,
+    covering an interrupt raised by `stop()` on the last attempt (the
+    budget is exhausted regardless, so no backoff would occur even
+    without the interrupt) — confirms `attempts` is reported correctly
+    and the interrupt is not swallowed by the loop's normal exhaustion
+    path. Combined with item 37's two new tests, both the "between
+    attempts" and "on the final attempt" cases from this item's
+    description are now covered.
 
 39. **Unsafe `str()` interpolation of arbitrary exceptions in three
     `opencode.py` HTTP-error-message sites, outside the one path Step

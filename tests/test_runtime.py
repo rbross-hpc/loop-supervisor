@@ -1172,6 +1172,92 @@ def test_confirm_server_stopped_never_discards_server_handle(monkeypatch):
     assert seen_instances[0] == id(server)
 
 
+def test_confirm_server_stopped_interrupt_during_backoff_reported_not_raised(monkeypatch):
+    """A KeyboardInterrupt/SystemExit delivered while waiting out the
+    inter-attempt backoff (not while stop() itself is running) must be
+    reported via last_error, exactly like an interrupt raised by stop()
+    itself -- not escape and bypass the structured-outcome contract this
+    function documents ("returning structured success/failure information
+    instead of raising")."""
+    import loop_supervisor.runtime as rt
+
+    the_interrupt = KeyboardInterrupt()
+
+    def _sleep_raises(seconds: float) -> None:
+        raise the_interrupt
+
+    monkeypatch.setattr(rt.time, "sleep", _sleep_raises)
+
+    class AlwaysFailsServer:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            raise RuntimeError(f"fail {self.stop_calls}")
+
+    server = AlwaysFailsServer()
+    outcome = rt._confirm_server_stopped(server)  # type: ignore[arg-type]
+
+    assert outcome.confirmed is False
+    assert outcome.last_error is the_interrupt
+    # The interrupt arrives during the backoff after the first failed
+    # attempt, so stop() must have been called exactly once -- the retry
+    # loop must not proceed to a second attempt.
+    assert server.stop_calls == 1
+    assert outcome.attempts == 1
+
+
+def test_confirm_server_stopped_system_exit_during_backoff_reported_not_raised(monkeypatch):
+    """SystemExit gets the identical treatment as KeyboardInterrupt when
+    delivered during backoff."""
+    import loop_supervisor.runtime as rt
+
+    the_exit = SystemExit(1)
+
+    def _sleep_raises(seconds: float) -> None:
+        raise the_exit
+
+    monkeypatch.setattr(rt.time, "sleep", _sleep_raises)
+
+    class AlwaysFailsServer:
+        def stop(self) -> None:
+            raise RuntimeError("fail")
+
+    outcome = rt._confirm_server_stopped(AlwaysFailsServer())  # type: ignore[arg-type]
+
+    assert outcome.confirmed is False
+    assert outcome.last_error is the_exit
+    assert outcome.attempts == 1
+
+
+def test_confirm_server_stopped_interrupt_on_final_attempt_reported_not_raised():
+    """An interrupt raised by stop() itself on the last attempt (budget
+    about to be exhausted, no further backoff would occur even without
+    an interrupt) must still be reported via last_error, not raised."""
+    import loop_supervisor.runtime as rt
+
+    the_interrupt = KeyboardInterrupt()
+
+    class InterruptsOnLastAttempt:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stop(self) -> None:
+            self.calls += 1
+            if self.calls == rt._CLEANUP_ATTEMPTS:
+                raise the_interrupt
+            raise RuntimeError(f"fail {self.calls}")
+
+    server = InterruptsOnLastAttempt()
+    outcome = rt._confirm_server_stopped(server)  # type: ignore[arg-type]
+
+    assert outcome.confirmed is False
+    assert outcome.last_error is the_interrupt
+    assert outcome.attempts == rt._CLEANUP_ATTEMPTS
+    assert server.calls == rt._CLEANUP_ATTEMPTS
+
+
 def test_run_new_startup_transient_stop_failure_then_success_releases_lock(tmp_path, monkeypatch):
     """A startup failure whose defense-in-depth stop() retry fails once
     and then succeeds must still confirm cleanup and release the lock."""
