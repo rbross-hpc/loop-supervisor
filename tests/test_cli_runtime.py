@@ -3,6 +3,7 @@ failures into a single sanitized stderr line and exit code 1, and never
 let a traceback escape for failures the runtime is documented to raise."""
 
 import argparse
+import json
 import os
 import signal
 
@@ -645,3 +646,63 @@ def test_cmd_tui_is_not_wrapped_by_the_sigterm_bridge(tmp_path, monkeypatch):
     assert rc == 1
     assert seen["disposition"] is before, "cmd_tui must not touch SIGTERM disposition at all"
     assert after is before
+
+
+def test_build_parser_wires_config_validate():
+    parser = cli_mod.build_parser()
+    args = parser.parse_args(["config", "validate", "--project", "/tmp/x"])
+    assert args.func is cli_mod.cmd_config_validate
+    assert args.project == "/tmp/x"
+    assert args.opencode_executable == "opencode"
+    assert args.json is False
+
+
+def test_build_parser_config_validate_requires_a_config_subcommand():
+    parser = cli_mod.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["config"])
+
+
+def test_cmd_config_validate_exit_code_matches_report_ok(tmp_path, monkeypatch, capsys):
+    args = argparse.Namespace(project=str(tmp_path), opencode_executable="opencode", json=False)
+
+    monkeypatch.setattr(
+        cli_mod,
+        "validate_report",
+        lambda project_root, *, opencode_executable: {
+            "ok": False,
+            "checks": {"dotenv_file": {"ok": False, "detail": "missing"}},
+            "env": {},
+        },
+    )
+    rc = cli_mod.cmd_config_validate(args)
+    assert rc == 1
+    out = capsys.readouterr()
+    assert "dotenv_file" in out.out
+    assert "one or more checks failed" in out.err
+
+
+def test_cmd_config_validate_prints_json_when_requested(tmp_path, monkeypatch, capsys):
+    args = argparse.Namespace(project=str(tmp_path), opencode_executable="opencode", json=True)
+    report = {"ok": True, "checks": {"dotenv_file": {"ok": True, "detail": "present"}}, "env": {}}
+    monkeypatch.setattr(
+        cli_mod, "validate_report", lambda project_root, *, opencode_executable: report
+    )
+    rc = cli_mod.cmd_config_validate(args)
+    assert rc == 0
+    out = capsys.readouterr()
+    parsed = json.loads(out.out)
+    assert parsed == report
+
+
+def test_cmd_config_validate_ok_true_exits_zero(tmp_path, monkeypatch, capsys):
+    args = argparse.Namespace(project=str(tmp_path), opencode_executable="opencode", json=False)
+    monkeypatch.setattr(
+        cli_mod,
+        "validate_report",
+        lambda project_root, *, opencode_executable: {"ok": True, "checks": {}, "env": {}},
+    )
+    rc = cli_mod.cmd_config_validate(args)
+    assert rc == 0
+    out = capsys.readouterr()
+    assert "all checks passed" in out.out

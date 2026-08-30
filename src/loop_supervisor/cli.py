@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import importlib.resources
 import importlib.resources.abc
+import json
 import re
 import shutil
 import signal
@@ -15,6 +16,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .doctor import validate_report
 from .git import GitError
 from .input_providers import StdinInputProvider
 from .locking import LockError
@@ -391,6 +393,30 @@ def cmd_init_copy(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config_validate(args: argparse.Namespace) -> int:
+    """Fast, offline preflight: is this project plausibly set up for a
+    loop-supervisor run. See `doctor.py` for what's checked and why
+    reachability of the configured model provider is deliberately out of
+    scope. Exits 1 (not an exception) when any check fails, mirroring
+    `cmd_run`/`cmd_resume`'s "error: ..." convention rather than raising.
+    """
+    project_root = _project_root(args.project)
+    report = validate_report(project_root, opencode_executable=args.opencode_executable)
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        for name, result in report["checks"].items():
+            status = "OK  " if result["ok"] else "FAIL"
+            print(f"[{status}] {name}: {result['detail']}")
+        if report["ok"]:
+            print("all checks passed")
+        else:
+            print("one or more checks failed; see above", file=sys.stderr)
+
+    return 0 if report["ok"] else 1
+
+
 def cmd_tui(args: argparse.Namespace) -> int:
     project_root = _project_root(args.project)
     load_dotenv(project_root / ".env")
@@ -481,6 +507,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Git URL the generated pyproject.toml pins loop-supervisor to",
     )
     init_parser.set_defaults(func=cmd_init_copy)
+
+    config_parser = sub.add_parser("config", help="Inspect or validate project configuration")
+    config_sub = config_parser.add_subparsers(dest="config_command", required=True)
+    validate_parser = config_sub.add_parser(
+        "validate", help="Check whether this project is set up for a loop-supervisor run"
+    )
+    validate_parser.add_argument("--project", default=None, help="Path to the integration repo")
+    validate_parser.add_argument("--opencode-executable", default="opencode")
+    validate_parser.add_argument(
+        "--json", action="store_true", help="Emit a machine-readable JSON report"
+    )
+    validate_parser.set_defaults(func=cmd_config_validate)
 
     return parser
 
