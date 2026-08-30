@@ -1284,6 +1284,23 @@ after the fact get written down.
     access (unlike `oclog`, most projects should not), but is not
     blocking and was not investigated further here.
 
+    **The stuck run itself was subsequently unstuck and confirmed
+    clear.** Added `external_directory` allow entries for
+    `~/.local/share/opencode/log/*` to `test-run-2`'s `opencode.json`
+    — this hand-authored fixture predated `cmd_init_copy` and never
+    had this ADR's `permission` block at all, so the deny was actually
+    OpenCode's own default `ask` being auto-rejected, not a
+    `loop-supervisor`-specific decision. The task worktree needed the
+    identical fix applied and committed separately (see ADR 0014's
+    Consequences for why: config is loaded per-invocation-directory,
+    not from the server's project root, so an in-flight worktree does
+    not inherit a fix made to the integration root after the worktree
+    was created). Once both were fixed, resuming the run produced a
+    real audit verdict (`disposition: "REVISE"`, concrete findings
+    about the tokenizer's whitespace handling) with zero permission
+    denials — confirming the diagnostics fix above works as intended
+    and that nothing else was masking a further defect.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in

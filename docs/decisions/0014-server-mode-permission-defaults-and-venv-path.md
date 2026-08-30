@@ -148,3 +148,26 @@ tool always shadows a same-named system tool.
   the `test-run` run never actually executed their verification
   commands, so their ACCEPT dispositions rest on static inspection
   alone.
+- **A permission-config edit to the integration project does not
+  retroactively reach a task worktree that already existed when the
+  edit was made.** Confirmed while diagnosing a real stuck run
+  (`test-run-2`, `5c7e2d584cfd`, backlog item 44): OpenCode loads
+  `opencode.json` starting from the invocation's own `directory`
+  (`RunSession`/`opencode.py`'s `run_agent` sets this to the task
+  worktree, not the server's `project_dir`), so each task worktree
+  needs its own copy of `opencode.json` for a permission change to
+  take effect there. A normal `cmd_init_copy`-generated project never
+  notices this: `git worktree add` checks out whatever the integration
+  branch's tip already contains, so a config fix committed *before* a
+  worktree is created is picked up automatically. The gap only appears
+  when a fix is applied *after* task worktrees already exist — as
+  happened here, where a hand-authored `opencode.json` (missing this
+  ADR's `permission` block entirely, since it predated `cmd_init_copy`
+  scaffolding) was corrected mid-run at the integration root, but the
+  in-flight task worktree still had the pre-fix file checked out at
+  its own `HEAD` and needed the identical edit applied and committed
+  there separately before the auditor could read the file it needed.
+  Not a code defect — this follows directly from how `git worktree`
+  and OpenCode's own config resolution interact — but worth knowing
+  before assuming a permission-config fix applies uniformly to a run
+  already in progress.
