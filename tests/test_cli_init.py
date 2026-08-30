@@ -1,4 +1,6 @@
 import difflib
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -132,21 +134,27 @@ def test_init_writes_expected_skeleton_files(tmp_path):
         "pyproject.toml",
         "pyrightconfig.json",
         "README.md",
+        "tests/test_placeholder.py",
     ):
         assert (destination / relative).exists(), relative
 
 
 def test_init_does_not_vendor_the_supervisor(tmp_path):
     """The new project depends on loop-supervisor as an installed
-    package; it must never receive the supervisor's own source, tests,
-    or this repository's own history/decisions (backlog item 25)."""
+    package; it must never receive the supervisor's own source or this
+    repository's own test suite/history/decisions (backlog item 25).
+    `tests/` itself does exist -- see
+    test_init_generated_project_pytest_collects_and_passes -- but must
+    contain only the generic placeholder, never anything from this
+    project's own ~900-test suite."""
     rc, destination = _run_init(tmp_path)
     assert rc == 0
 
     assert not (destination / "src").exists()
-    assert not (destination / "tests").exists()
     assert not (destination / ".git").exists()
     assert not (destination / "docs" / "plans").exists()
+    tests = list((destination / "tests").iterdir())
+    assert [p.name for p in tests] == ["test_placeholder.py"]
     # Only the ADR-format contract is carried over, not this project's
     # own numbered decision history.
     decisions = list((destination / "docs" / "decisions").iterdir())
@@ -297,3 +305,24 @@ def test_skeleton_agents_deny_the_skill_tool(tmp_path):
     for name in ("loop-planner.md", "loop-architect.md", "loop-builder.md", "loop-auditor.md"):
         text = (destination / ".opencode" / "agents" / name).read_text()
         assert "skill: deny" in text, f"{name}: missing 'skill: deny' in permission block"
+
+
+def test_init_generated_project_pytest_collects_and_passes(tmp_path):
+    """Regression guard: the skeleton's pyproject.toml declares
+    `testpaths = ["tests"]`, so a generated project with no tests/
+    directory at all fails `pytest` immediately with 'no tests ran'
+    before a user has written a single line of their own code. Confirm
+    the placeholder test both exists and is collected/passed by a real
+    pytest invocation against the generated project, not just that the
+    file is present."""
+    rc, destination = _run_init(tmp_path)
+    assert rc == 0
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q"],
+        cwd=str(destination),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout

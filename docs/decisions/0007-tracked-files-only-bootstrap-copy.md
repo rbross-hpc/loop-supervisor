@@ -2,7 +2,14 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR
+0018](0018-bootstrap-generates-a-dependent-skeleton-not-a-vendored-copy.md).
+The `git ls-files`-based copy this ADR describes only worked from a
+source checkout with `.git` present; ADR 0018 replaced it with a fixed
+package-data skeleton read via `importlib.resources`, which needs no
+`.git` and works from an installed wheel. Kept for historical context
+on the allowlist-vs-denylist reasoning, which was correct as far as it
+went.
 
 ## Context
 
