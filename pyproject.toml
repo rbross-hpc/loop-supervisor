@@ -36,6 +36,7 @@ loop_supervisor = [
   "_skeleton/.env.example",
   "_skeleton/.opencode/agents/*.md",
   "_skeleton/.opencode/agents/*.tmpl",
+  "_skills/**/*",
 ]
 
 [tool.pytest.ini_options]

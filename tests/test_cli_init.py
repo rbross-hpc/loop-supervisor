@@ -275,3 +275,25 @@ def test_init_does_not_leave_a_partial_destination_on_invalid_project_name(tmp_p
     rc = cmd_init_copy(args)
     assert rc == 1
     assert not destination.exists()
+
+
+def test_live_agents_deny_the_skill_tool():
+    """Every live agent role must deny the `skill` permission, so the
+    planner/architect/builder/auditor never read the bundled
+    adopt-loop-supervisor Agent Skill (or any other skill) as live
+    instruction -- the exact failure mode ADR 0018 exists to prevent,
+    since a skill's guidance is written for the human's interactive
+    session, not for an autonomous loop role."""
+    for name in ("loop-planner.md", "loop-architect.md", "loop-builder.md", "loop-auditor.md"):
+        text = (_LIVE_AGENTS_DIR / name).read_text()
+        assert "skill: deny" in text, f"{name}: missing 'skill: deny' in permission block"
+
+
+def test_skeleton_agents_deny_the_skill_tool(tmp_path):
+    """Same guarantee as test_live_agents_deny_the_skill_tool, but for
+    what init actually ships to a new project."""
+    rc, destination = _run_init(tmp_path)
+    assert rc == 0
+    for name in ("loop-planner.md", "loop-architect.md", "loop-builder.md", "loop-auditor.md"):
+        text = (destination / ".opencode" / "agents" / name).read_text()
+        assert "skill: deny" in text, f"{name}: missing 'skill: deny' in permission block"

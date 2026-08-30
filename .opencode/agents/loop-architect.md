@@ -6,6 +6,7 @@ temperature: 0.1
 steps: 30
 permission:
   edit: deny
+  skill: deny
   bash:
     "*": deny
     "git status*": allow

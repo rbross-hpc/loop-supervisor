@@ -5,6 +5,7 @@ temperature: 0.1
 steps: 80
 permission:
   edit: allow
+  skill: deny
   bash:
     "*": allow
     "git merge*": deny
