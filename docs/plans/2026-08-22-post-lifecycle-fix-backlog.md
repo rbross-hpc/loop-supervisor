@@ -1208,43 +1208,81 @@ after the fact get written down.
     without a subsequent `VACUUM`, since SQLite only frees the pages
     for reuse.
 
-44. **A real self-hosted run got permanently stuck on "agent
+44. ~~A real self-hosted run got permanently stuck on "agent
     'loop-auditor' returned no text output," an untested failure mode
-    of `_extract_text`'s empty-`text_parts` branch.** (Tier 2 — fix
-    next: validation/startup)
+    of `_extract_text`'s empty-`text_parts` branch.~~ **Root cause
+    identified by reproduction; the diagnostics gap it exposed is
+    resolved. See below for what remains genuinely open (not a
+    `loop-supervisor` defect).**
     `src/loop_supervisor/opencode.py:1481` (raises
-    `AgentInvocationError`), run `test-run-2` /
-    `5c7e2d584cfd` (`.git/loop-supervisor/runs/5c7e2d584cfd.json`),
-    `phase: operational_failure`, `failed_phase: auditing`,
-    `retryable: true`, `retry_phase: auditing`, still resumable as of
-    this writing.
+    `AgentInvocationError`), `src/loop_supervisor/runtime.py:1478-1524`
+    (`run_new`), `:1552-1584` (`run_resume`), `:1455-1476`
+    (`_report_denied_permissions`); run `test-run-2` / `5c7e2d584cfd`
+    (`.git/loop-supervisor/runs/5c7e2d584cfd.json`).
 
-    Discovered while investigating this repository's own self-hosted
-    run readiness, not from a synthetic test. The builder's task
-    completed successfully (`builder_result.status: "COMPLETE"`, 17
-    tests passing, all gates clean) and `loop-auditor` was invoked
-    against that result, but its response's `parts` list contained no
-    `{"type": "text"}` part with non-empty text — `_extract_text`
-    correctly classifies this as `AgentInvocationError` rather than
-    crashing uncaught, and `advance()`'s operational-failure handling
-    correctly persisted it as retryable — but nothing in this codebase
-    currently explains *why* an auditor invocation would return zero
-    text parts (a model returning only a tool call with no closing
-    text, a truncated/empty final message, or a provider-specific
-    response shape `_extract_text` does not yet recognize).
+    Originally discovered while investigating this repository's own
+    self-hosted run readiness, filed as an unexplained model-response-
+    shape gap. Reproduced by resuming the stuck run twice with
+    `--step`: the first retry cleared cleanly (`last_error` reset,
+    phase advanced to `auditing`), but the second — the actual auditor
+    invocation — failed identically, this time with visible context:
 
-    Distinct from item 6/7 (buffer bounds) and item 9 (persisted
-    nested role results): this is a live defect with a real
-    reproduction artifact, not a code-audit finding. No backlog item
-    tracked this before now, and it would recur identically on any
-    future self-hosted or production run that hits the same
-    underlying model-response shape. Before a genuine self-hosted run
-    of this supervisor against itself is attempted, this item (or at
-    least a resumed retry of the stuck run confirming it clears) should
-    be resolved — see this backlog's item 32 and
-    `docs/decisions/0014-server-mode-permission-defaults-and-venv-path.md`
-    for the other prerequisites (`--worktree-root`, per-worktree
-    `.venv` provisioning) a self-hosted run needs decided first.
+    ```
+    denied permission request '...' ('external_directory')
+    failed to deny permission request '...': HTTP 404;
+      the request may still be pending
+    (repeated twice more)
+    error: agent 'loop-auditor' returned no text output
+    ```
+
+    **Root cause: not a `loop-supervisor` defect, but a property of
+    this specific test project.** `test-run-2` is `oclog`, a tool whose
+    entire purpose is parsing `~/.local/share/opencode/log/-
+    opencode.log` — a path outside any task worktree by design
+    (confirmed via `src/oclog/parser.py`'s `DEFAULT_LOG_PATH` and the
+    builder's own `implementation_summary`, which says it "ran
+    `parse_log()` over the actual real log end-to-end"). Auditing that
+    claim requires the same out-of-worktree read, which triggers
+    `external_directory`, which headless mode denies unconditionally
+    (no human to prompt) — and the model, after repeated denials,
+    produced a response with no final text part at all. `_extract_text`
+    correctly raised `AgentInvocationError`; `advance()` correctly
+    persisted it as a retryable operational failure. Nothing here is
+    wrong on `loop-supervisor`'s side of that specific interaction.
+
+    **The real, general gap found while chasing this: the existing
+    "denied N permission request(s)" diagnostic (backlog item 27) never
+    fired on *any* operational failure, headless-wide** — not specific
+    to this project or this failure mode. `run_new`/`run_resume` called
+    `_report_denied_permissions(session)` only after
+    `run_to_completion()` returned successfully, but `Supervisor.run()`
+    re-raises `LoopError` for `AdvanceStatus.OPERATIONAL_FAILURE`
+    (`supervisor.py:729-732`) — exactly the case that had just occurred
+    here — so the line calling the diagnostic was unreachable dead code
+    for every operational failure, not only this one. This is why the
+    terminal output above shows the denier's own per-request lines
+    (which print unconditionally from `PermissionDenier._on_event`) but
+    never the summary line connecting them to the failure.
+
+    Fixed by moving both calls into a `finally` around
+    `run_to_completion()`, so the summary diagnostic fires whether the
+    call returns or raises. Now a denial-adjacent operational failure
+    is self-explanatory in the CLI's own output without needing to
+    separately correlate stderr lines by hand, as this investigation
+    had to. See `tests/test_runtime.py`
+    (`test_run_new_reports_denied_permissions_even_on_operational_-
+    failure`, `test_run_resume_reports_denied_permissions_even_on_-
+    operational_failure`).
+
+    **Genuinely still open, not fixed here, and not a
+    `loop-supervisor` defect:** three of the four deny replies 404'd
+    ("the request may still be pending"), suggesting either the model
+    moved on before the async SSE-driven deny reply landed, or several
+    `external_directory` requests fired faster than the denier could
+    process them serially. Worth a closer look if this pattern recurs
+    against a project that legitimately needs `external_directory`
+    access (unlike `oclog`, most projects should not), but is not
+    blocking and was not investigated further here.
 
 ## Out of scope for this backlog
 

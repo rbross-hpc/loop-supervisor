@@ -521,6 +521,150 @@ def test_run_new_exhausted_malformed_output_persists_and_reports_cleanly(tmp_pat
     assert state.last_error["retryable"] is True
 
 
+def test_run_new_reports_denied_permissions_even_on_operational_failure(tmp_path, capsys):
+    """_report_denied_permissions() must run even when run_to_completion()
+    raises LoopError (the operational-failure path), not only on its
+    successful-return path. Regression for backlog item 44: a headless
+    run that fails because an agent gave up after having permission
+    requests denied previously had no diagnostic connecting the two,
+    since Supervisor.run() re-raises LoopError for OPERATIONAL_FAILURE
+    before the summary line was ever reached."""
+    from loop_supervisor.supervisor import LoopError
+
+    repo = _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+
+    import loop_supervisor.runtime as rt
+
+    fake_server = _FakeServer(call_log)
+
+    class FakeGitRepo:
+        def __init__(self, *a, **kw):
+            self.root = repo.root
+
+        def common_dir(self):
+            return repo.common_dir()
+
+    class FakeOCServer:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __new__(cls, *a, **kw):
+            return fake_server
+
+    class FakeSupervisor:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start_new_run(self):
+            state = MagicMock()
+            state.run_id = "fake-run"
+            state.phase = "operational_failure"
+            state.options = _make_options()
+            return state
+
+        def run(self, state, *, max_steps=None):
+            raise LoopError("simulated operational failure")
+
+        @property
+        def runner(self):
+            return None
+
+        @runner.setter
+        def runner(self, value):
+            pass
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "GitRepo", FakeGitRepo)
+    mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+    mp.setattr(rt, "Supervisor", FakeSupervisor)
+    mp.setattr(
+        rt,
+        "PermissionDenier",
+        _fake_denier_class(call_log, denied_count=3, denied_summary=["external_directory"]),
+    )
+    try:
+        with pytest.raises(LoopError):
+            run_new(tmp_path / "repo", _make_options())
+    finally:
+        mp.undo()
+
+    captured = capsys.readouterr()
+    assert "denied 3 permission request(s)" in captured.err
+    assert "external_directory" in captured.err
+
+
+def test_run_resume_reports_denied_permissions_even_on_operational_failure(tmp_path, capsys):
+    """Same regression as the run_new() variant above, for run_resume():
+    _report_denied_permissions() must run even when run_to_completion()
+    raises LoopError."""
+    from loop_supervisor.supervisor import LoopError
+
+    repo = _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+
+    import loop_supervisor.runtime as rt
+
+    fake_server = _FakeServer(call_log)
+
+    class FakeGitRepo:
+        def __init__(self, *a, **kw):
+            self.root = repo.root
+
+        def common_dir(self):
+            return repo.common_dir()
+
+    class FakeOCServer:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __new__(cls, *a, **kw):
+            return fake_server
+
+    fake_state = MagicMock()
+    fake_state.run_id = "fake-run"
+    fake_state.phase = "operational_failure"
+    fake_state.options = _make_options()
+
+    class FakeSupervisor:
+        def __init__(self, *a, **kw):
+            pass
+
+        def resume(self, state):
+            return state
+
+        def run(self, state, *, max_steps=None):
+            raise LoopError("simulated operational failure")
+
+        @property
+        def runner(self):
+            return None
+
+        @runner.setter
+        def runner(self, value):
+            pass
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rt, "GitRepo", FakeGitRepo)
+    mp.setattr(rt, "OpenCodeServer", FakeOCServer)
+    mp.setattr(rt, "Supervisor", FakeSupervisor)
+    mp.setattr(rt, "load_state", lambda *a, **k: fake_state)
+    mp.setattr(
+        rt,
+        "PermissionDenier",
+        _fake_denier_class(call_log, denied_count=1, denied_summary=["bash"]),
+    )
+    try:
+        with pytest.raises(LoopError):
+            run_resume(tmp_path / "repo", "fake-run")
+    finally:
+        mp.undo()
+
+    captured = capsys.readouterr()
+    assert "denied 1 permission request(s)" in captured.err
+    assert "bash" in captured.err
+
+
 def test_run_resume_server_startup_failure_persists_operational_failure(tmp_path):
     from loop_supervisor.opencode import ServerStartupError
     from loop_supervisor.runtime import RuntimeError_
