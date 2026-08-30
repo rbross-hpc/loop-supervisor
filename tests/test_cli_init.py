@@ -15,23 +15,26 @@ _SKELETON_AGENTS_DIR = _REPO_ROOT / "src" / "loop_supervisor" / "_skeleton" / ".
 # which assumes this project's own language/tooling (pytest, ruff,
 # mypy) and would be actively wrong advice pasted into an arbitrary
 # new project. Divergence in loop-builder.md and loop-auditor.md is
-# therefore intentional, not drift; loop-planner.md and
-# loop-architect.md have no such repository-specific content and are
-# expected to match exactly. This allowlist exists so a *future*,
-# unintended divergence in the two allowed-to-differ files is still
-# caught if it stops being about "Testing discipline" specifically --
-# see test_skeleton_agent_divergence_is_limited_to_testing_discipline
+# therefore intentional, not drift; loop-planner.md has no such
+# repository-specific content and is expected to match exactly.
+# loop-architect.md is templated (ADR 0023: generated projects ship no
+# provider configuration, so the architect's `model:` pin is optional
+# and substituted at init time) and is compared separately, modulo
+# that one line. This allowlist exists so a *future*, unintended
+# divergence in the two allowed-to-differ files is still caught if it
+# stops being about "Testing discipline" specifically -- see
+# test_skeleton_agent_divergence_is_limited_to_testing_discipline
 # below.
-_EXPECTED_IDENTICAL = ("loop-planner.md", "loop-architect.md")
+_EXPECTED_IDENTICAL = ("loop-planner.md",)
 _EXPECTED_TO_DIVERGE = ("loop-builder.md", "loop-auditor.md")
 
 
-def test_skeleton_agents_planner_and_architect_match_live_exactly():
-    """loop-planner.md and loop-architect.md have no repository-
-    specific content, so the packaged skeleton copy `init` ships to
-    every new project must be byte-identical to this repository's own
-    -- any difference here is unintended drift (see backlog item 35),
-    not an intentional divergence."""
+def test_skeleton_agents_planner_matches_live_exactly():
+    """loop-planner.md has no repository-specific content, so the
+    packaged skeleton copy `init` ships to every new project must be
+    byte-identical to this repository's own -- any difference here is
+    unintended drift (see backlog item 35), not an intentional
+    divergence."""
     for name in _EXPECTED_IDENTICAL:
         live = (_LIVE_AGENTS_DIR / name).read_text()
         skeleton = (_SKELETON_AGENTS_DIR / name).read_text()
@@ -40,6 +43,33 @@ def test_skeleton_agents_planner_and_architect_match_live_exactly():
             "sync src/loop_supervisor/_skeleton/.opencode/agents/ from "
             ".opencode/agents/ (or update this test if the divergence is "
             "now intentional)"
+        )
+
+
+def test_skeleton_architect_matches_live_modulo_model_line():
+    """loop-architect.md.tmpl differs from the live loop-architect.md in
+    exactly one respect: the live file pins `model: argo/Claude Opus
+    4.8` (this project's own development choice, per ADR 0023), while
+    the skeleton substitutes `__LOOP_SUPERVISOR_ARCHITECT_MODEL_LINE__`
+    -- empty by default, or an `--architect-model`-supplied line at
+    init time. Any other difference is unintended drift."""
+    live_lines = (_LIVE_AGENTS_DIR / "loop-architect.md").read_text().splitlines()
+    skeleton_lines = (_SKELETON_AGENTS_DIR / "loop-architect.md.tmpl").read_text().splitlines()
+
+    matcher = difflib.SequenceMatcher(a=skeleton_lines, b=live_lines, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        skeleton_only = skeleton_lines[i1:i2]
+        live_only = live_lines[j1:j2]
+        assert (
+            tag == "replace"
+            and skeleton_only == ["__LOOP_SUPERVISOR_ARCHITECT_MODEL_LINE__temperature: 0.1"]
+            and live_only == ["model: argo/Claude Opus 4.8", "temperature: 0.1"]
+        ), (
+            "loop-architect.md.tmpl differs from the live agent prompt in a way "
+            "not accounted for by the model-line placeholder "
+            f"(op={tag!r}, skeleton={skeleton_only!r}, live={live_only!r})"
         )
 
 
@@ -182,16 +212,39 @@ def test_init_parameterizes_external_directory_to_the_destination_s_parent(tmp_p
     }
 
 
-def test_init_falda_tenant_uses_env_interpolation_not_a_literal(tmp_path):
-    """Regression guard for the hardcoded `X-Falda-Tenant` literal this
-    repo's own opencode.json carries; a generated project must never
-    inherit another tenant's identifier."""
+def test_init_generates_no_provider_or_mcp_configuration(tmp_path):
+    """ADR 0023: a generated project ships no provider block and no MCP
+    servers -- those are this repository's own development environment
+    (Argo, Falda), not something generic to every loop-supervisor
+    project. Models resolve from the new project's own global OpenCode
+    config, same as any other OpenCode project. Supersedes the old
+    Falda-tenant-interpolation regression guard, which is moot now that
+    no Falda config is generated at all."""
     rc, destination = _run_init(tmp_path)
     assert rc == 0
     import json
 
     config = json.loads((destination / "opencode.json").read_text())
-    assert config["mcp"]["falda"]["headers"]["X-Falda-Tenant"] == "{env:FALDA_TENANT}"
+    assert "provider" not in config
+    assert "mcp" not in config
+
+
+def test_init_architect_has_no_model_pin_by_default(tmp_path):
+    rc, destination = _run_init(tmp_path)
+    assert rc == 0
+    text = (destination / ".opencode" / "agents" / "loop-architect.md").read_text()
+    assert "model:" not in text
+    assert "temperature: 0.1" in text
+
+
+def test_init_architect_model_flag_pins_the_given_model(tmp_path):
+    rc, destination = _run_init(tmp_path, **{"architect_model": "anthropic/claude-opus-4"})
+    assert rc == 0
+    text = (destination / ".opencode" / "agents" / "loop-architect.md").read_text()
+    assert "model: anthropic/claude-opus-4\n" in text
+    lines = text.splitlines()
+    model_index = lines.index("model: anthropic/claude-opus-4")
+    assert lines[model_index + 1] == "temperature: 0.1"
 
 
 def test_init_pins_loop_supervisor_dependency_to_default_git_url(tmp_path):

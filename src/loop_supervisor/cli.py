@@ -329,6 +329,7 @@ _SKELETON_PLACEHOLDER_FILES = {
     "README.md.tmpl": "README.md",
     "opencode.json.tmpl": "opencode.json",
     "pyproject.toml.tmpl": "pyproject.toml",
+    ".opencode/agents/loop-architect.md.tmpl": ".opencode/agents/loop-architect.md",
 }
 
 
@@ -354,10 +355,18 @@ def cmd_init_copy(args: argparse.Namespace) -> int:
     # not the destination itself.
     allowed_external_directory = str(destination.parent)
 
+    # loop-architect.md.tmpl's frontmatter is `<placeholder>temperature:
+    # ...`, so this substitutes either a `model: ...\n` line (with its own
+    # trailing newline) or an empty string, never leaving a blank line or
+    # broken YAML behind either way.
+    architect_model = getattr(args, "architect_model", None)
+    architect_model_line = f"model: {architect_model}\n" if architect_model else ""
+
     substitutions = {
         "__LOOP_SUPERVISOR_PROJECT_NAME__": project_name,
         "__LOOP_SUPERVISOR_PROJECT_ROOT__": allowed_external_directory,
         "__LOOP_SUPERVISOR_GIT_URL__": args.loop_supervisor_git_url,
+        "__LOOP_SUPERVISOR_ARCHITECT_MODEL_LINE__": architect_model_line,
     }
 
     created_destination = not destination.exists()
@@ -505,6 +514,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--loop-supervisor-git-url",
         default=_DEFAULT_LOOP_SUPERVISOR_GIT_URL,
         help="Git URL the generated pyproject.toml pins loop-supervisor to",
+    )
+    init_parser.add_argument(
+        "--architect-model",
+        default=None,
+        help=(
+            "provider/model-id to pin the architect agent to (e.g. "
+            "'anthropic/claude-opus-4'); default: no pin, inherit the "
+            "project's own default model"
+        ),
     )
     init_parser.set_defaults(func=cmd_init_copy)
 

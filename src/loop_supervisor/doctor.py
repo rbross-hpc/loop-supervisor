@@ -7,7 +7,7 @@ environment plausibly set up" (executables on PATH, a parseable
 `opencode.json`, a clean non-detached git worktree, required env vars
 present), not "will the configured provider/model actually respond".
 The latter needs credentials and a live endpoint, which turns a
-sub-second preflight into a slow, flaky one; see ADR 0023.
+sub-second preflight into a slow, flaky one; see ADR 0022.
 
 Each check is independently reported by name so a caller (a human, or
 an agent following the `adopt-loop-supervisor` skill) can act on the
