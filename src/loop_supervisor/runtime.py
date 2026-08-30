@@ -116,10 +116,6 @@ while ``advance()``/``run_to_completion()`` is in flight. ``close()``
 will block until that call finishes. Concurrent ``advance()`` calls are
 *not* supported — the state guard rejects the second one, as it does
 single-threaded.
-
-Known limitation: ``_confirm_server_stopped``'s backoff uses
-``time.sleep()``, which is not interrupt-safe. This module therefore does
-not claim complete primary-error precedence in every interrupt scenario.
 """
 
 from __future__ import annotations
@@ -210,11 +206,15 @@ def _confirm_server_stopped(server: OpenCodeServer) -> _CleanupOutcome:
     exact same instance, since OpenCodeServer.stop() is documented as
     safe to retry after a partial failure.
 
-    A KeyboardInterrupt/SystemExit raised by stop() itself stops the
-    retry loop immediately (retrying cleanup after an operator interrupt
-    would ignore their request); it is reported via last_error like any
-    other failure rather than being re-raised here, so it can never
-    replace whatever primary exception the caller is already handling.
+    A KeyboardInterrupt/SystemExit raised by stop() itself, or delivered
+    while waiting out the inter-attempt backoff, stops the retry loop
+    immediately (retrying cleanup after an operator interrupt would
+    ignore their request); it is reported via last_error like any other
+    failure rather than being re-raised here, so it can never replace
+    whatever primary exception the caller is already handling. Both
+    windows get identical treatment: an interrupt does not distinguish
+    between "we were calling stop()" and "we were waiting to call stop()
+    again" the way the caller must observe it.
     """
     last_error: BaseException | None = None
     for attempt in range(_CLEANUP_ATTEMPTS):
@@ -225,7 +225,12 @@ def _confirm_server_stopped(server: OpenCodeServer) -> _CleanupOutcome:
         except BaseException as exc:  # noqa: BLE001 - reported, not raised; caller may retry
             last_error = exc
             if attempt < _CLEANUP_ATTEMPTS - 1:
-                time.sleep(_CLEANUP_BACKOFF_SECONDS * (attempt + 1))
+                try:
+                    time.sleep(_CLEANUP_BACKOFF_SECONDS * (attempt + 1))
+                except (KeyboardInterrupt, SystemExit) as interrupt:
+                    return _CleanupOutcome(
+                        confirmed=False, last_error=interrupt, attempts=attempt + 1
+                    )
             continue
         else:
             return _CleanupOutcome(confirmed=True, last_error=None, attempts=attempt + 1)
