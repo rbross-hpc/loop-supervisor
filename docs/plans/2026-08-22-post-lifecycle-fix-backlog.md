@@ -181,42 +181,79 @@ after the fact get written down.
    `join()`, since calling it in-process against the pre-fix code would
    have hung the test process itself with no way to time out.
 
-6. **Bound non-newline OpenCode stdout fragments.**
-   `src/loop_supervisor/opencode.py:813-841` (`_start_stdout_pump`;
+6. ~~Bound non-newline OpenCode stdout fragments.~~ **Resolved.**
+   `src/loop_supervisor/opencode.py:813-843` (`_start_stdout_pump`;
    corrected from a stale `:223-251` citation, which now points at an
    unrelated class).
    The stdout pump's `partial` buffer (data received but not yet
-   newline-terminated) is unbounded; a subprocess that writes an
-   arbitrarily long line without a newline could grow this without limit.
+   newline-terminated) was unbounded; a subprocess that writes an
+   arbitrarily long line without a newline could grow it without limit
+   — and the `_stdout_partial` snapshot derived from it flows into
+   startup diagnostics via `_diagnostic_output()`, so this would also
+   inflate a persisted `ServerStartupError` message, ahead of
+   `supervisor.py`'s own `_truncate_message()` bound on the final
+   record.
 
-7. **Bound SSE parser memory against unbounded upstream buffering, not
-   just the already-enforced per-event cap.** (description corrected;
-   see below)
-   `src/loop_supervisor/sse.py:121-127` (existing cap), `:320`
+   Fixed with a new `_MAX_STDOUT_FRAGMENT_BYTES` bound (64 KiB): once
+   the in-progress fragment would exceed it, its bytes are dropped
+   entirely (not retained as a truncated sample — the goal is bounding
+   memory for a line that may never terminate, not preserving part of
+   it) and the pump enters an "oversized" mode that discards further
+   bytes for that same line while still scanning for its eventual
+   newline, so a single pathological line costs at most this constant
+   plus one `read()`'s worth of memory regardless of how long it
+   actually is. Once that newline arrives, the pump correctly resumes
+   normal per-line handling (including ready-line recognition) for
+   whatever follows. See `tests/test_opencode.py`
+   (`test_server_startup_recovers_after_oversized_unterminated_line`)
+   and the new `"oversized_line_then_ready"`
+   `FAKE_OPENCODE_MODE` in `tests/fixtures/fake_opencode.py`.
+
+7. ~~Bound SSE parser memory against unbounded upstream buffering, not
+   just the already-enforced per-event cap.~~ **Two of three gaps
+   resolved; the third is a known, accepted limitation — see below.**
+   `src/loop_supervisor/sse.py:70-141` (`iter_sse_json`, its docstring's
+   "Known limitation" section, and the `SSEClient` constructor), `:320`
    (`_connect_and_stream`).
    This item previously asked to "confirm" an event-size cap exists;
-   it already does, and is already tested
-   (`tests/test_sse.py:78`), so that framing was stale. Three real
-   gaps remain, none of which the existing cap addresses:
+   it already did, and was already tested (`tests/test_sse.py:78`), so
+   that framing was stale. Three real gaps were identified, none of
+   which the existing cap addressed:
 
-   1. `_connect_and_stream` (`:320`) calls `iter_sse_json` without
-      passing `max_event_bytes`, so the real streaming path always
-      gets the 1 MiB default with no way to configure it — there is
-      no `SSEClient`-level parameter or `RunOptions` field that
-      reaches this cap at all; only a caller that constructs
-      `iter_sse_json` directly (today, only tests) can vary it.
-   2. An empty `data:` line contributes to `data_parts` (the growing
-      per-event buffer) without incrementing the size counter that
-      trips the cap, so a stream of many empty `data:` lines within
-      one event is not bounded by the existing check.
-   3. The actual hazard: `httpx`'s `LineDecoder`, which the SSE client
-      reads through, buffers an unterminated line unboundedly
-      *upstream* of `iter_sse_json` — by the time a line reaches this
-      module's own per-event accounting, `httpx` may already have
-      buffered an arbitrarily long line in memory. `max_event_bytes`
-      cannot defend against this by construction: it operates on
-      already-decoded lines, not on the byte stream `LineDecoder`
-      itself is buffering.
+   1. **Resolved.** `_connect_and_stream` (`:320`) called
+      `iter_sse_json` without passing `max_event_bytes`, so the real
+      streaming path always got the 1 MiB default with no way to
+      configure it. Fixed by adding a `max_event_bytes` constructor
+      parameter to `SSEClient` (default unchanged at 1 MiB, so neither
+      existing call site — `permissions.py:109`, `tui/app.py:613` —
+      changes behavior) and threading it through to `iter_sse_json`.
+      See `tests/test_sse.py`
+      (`test_sse_client_threads_max_event_bytes_into_parser`).
+   2. **Resolved.** An empty `data:` line contributed to `data_parts`
+      (the growing per-event buffer) without incrementing the size
+      counter that trips the cap, so a stream of many empty `data:`
+      lines within one event was not bounded by the existing check.
+      Fixed by counting every `data:` line's payload plus one byte
+      (for the `"\n"` that will join it with the next part), so an
+      empty payload still contributes toward the cap instead of being
+      free. See `tests/test_sse.py`
+      (`test_many_empty_data_lines_trip_event_size_limit`).
+   3. **Deliberately left open — accepted as a known limitation, not
+      fixed here.** `httpx`'s own `LineDecoder`, which produces the
+      lines `iter_sse_json` consumes (via `response.iter_lines()`),
+      buffers an unterminated line unboundedly in its own internal
+      buffer *before* a line ever reaches this module's per-event
+      accounting. `max_event_bytes` cannot defend against this by
+      construction: it operates on already-decoded lines, not on the
+      byte stream `LineDecoder` itself is buffering. Now documented
+      explicitly in `iter_sse_json`'s docstring rather than silently
+      left unaddressed. If revisited, the likely shape is bypassing
+      `LineDecoder` entirely — reading `response.iter_bytes()` and
+      doing our own capped line-splitting — which is a materially
+      larger change (replacing tested third-party stream handling with
+      our own) than this item's other two gaps, and arguably belongs
+      in the same design decision as item 6's analogous stdout-pump
+      case rather than as an isolated SSE fix.
 
 ## Tier 2 — fix next: validation/startup
 

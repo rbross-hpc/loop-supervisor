@@ -239,6 +239,24 @@ def test_server_startup_handles_ready_line_split_across_writes(tmp_path):
         assert health["healthy"] is True
 
 
+def test_server_startup_recovers_after_oversized_unterminated_line(tmp_path):
+    """A single non-newline-terminated line far larger than the pump's
+    fragment bound must not grow the pump's in-memory buffer without
+    limit, and once that oversized line is finally terminated, the pump
+    must correctly resume normal line handling and recognize the real
+    ready line that follows it -- proving the bound drops the oversized
+    line's bytes without wedging the pump for subsequent lines."""
+    config = _argv_config(FAKE_OPENCODE_MODE="oversized_line_then_ready")
+    with _FakeServer(tmp_path, config) as server:
+        assert server.base_url is not None
+        health = server.health()
+        assert health["healthy"] is True
+        with server._stdout_partial_lock:
+            assert len(server._stdout_partial) < oc_module._MAX_STDOUT_FRAGMENT_BYTES
+        for line in server._stdout_lines:
+            assert len(line) < oc_module._MAX_STDOUT_FRAGMENT_BYTES
+
+
 def test_server_startup_cleans_up_process_on_unexpected_exception(tmp_path, monkeypatch):
     """Any exception raised while parsing readiness output (not just the
     two dedicated ServerStartupError paths) must still terminate the
