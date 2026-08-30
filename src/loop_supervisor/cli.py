@@ -20,7 +20,7 @@ from .input_providers import StdinInputProvider
 from .locking import LockError
 from .phases import PHASE_OPERATIONAL_FAILURE, TERMINAL_PHASES
 from .runtime import RuntimeError_, list_run_ids, run_new, run_resume
-from .state import RunOptions
+from .state import RunOptions, StateError
 from .supervisor import FailurePersistenceError, LoopError
 
 # Expected application-level failures that a normal `run`/`resume`
@@ -170,18 +170,35 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    options = RunOptions(
-        max_accepted_tasks=args.max_tasks,
-        max_revisions_per_task=args.max_revisions,
-        max_replans_per_task=args.max_replans,
-        max_architect_retries=args.max_architect_retries,
-        malformed_output_retries=1,
-        role_timeout=args.role_timeout,
-        worktree_root=str(Path(args.worktree_root).resolve()) if args.worktree_root else None,
-        require_decision_approval=args.require_decision_approval,
-        opencode_executable=args.opencode_executable,
-        opencode_startup_timeout=args.startup_timeout,
-    )
+    # Route through RunOptions.from_dict() rather than constructing
+    # RunOptions directly: from_dict() is the same validation resume()
+    # relies on to load a persisted run, so this is the one place that
+    # defines what a valid RunOptions is. Without this, argparse's
+    # type=int/type=float coercion accepts values (e.g. a negative
+    # --max-tasks, a zero or negative --role-timeout) that from_dict()
+    # would reject -- so a run could start, persist that invalid state,
+    # and then be permanently unresumable, since the very file its own
+    # program wrote fails the check its own resume path performs.
+    try:
+        options = RunOptions.from_dict(
+            {
+                "max_accepted_tasks": args.max_tasks,
+                "max_revisions_per_task": args.max_revisions,
+                "max_replans_per_task": args.max_replans,
+                "max_architect_retries": args.max_architect_retries,
+                "malformed_output_retries": 1,
+                "role_timeout": args.role_timeout,
+                "worktree_root": str(Path(args.worktree_root).resolve())
+                if args.worktree_root
+                else None,
+                "require_decision_approval": args.require_decision_approval,
+                "opencode_executable": args.opencode_executable,
+                "opencode_startup_timeout": args.startup_timeout,
+            }
+        )
+    except StateError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     try:
         with _bridge_sigterm_to_keyboard_interrupt():

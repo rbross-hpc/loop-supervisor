@@ -257,11 +257,42 @@ after the fact get written down.
 
 ## Tier 2 — fix next: validation/startup
 
-8. **CLI-created `RunOptions` bypass `RunOptions.from_dict()`
-   validation.**
-   `src/loop_supervisor/state.py:72-145`, `src/loop_supervisor/cli.py:55-66`.
+8. ~~CLI-created `RunOptions` bypass `RunOptions.from_dict()`
+   validation.~~ **Resolved.**
+   `src/loop_supervisor/state.py:94-141` (`RunOptions.from_dict`),
+   `src/loop_supervisor/cli.py:163-192` (`cmd_run`); corrected from a
+   stale `state.py:72-145`/`cli.py:55-66` citation.
    Directly constructed `RunOptions` (as opposed to those deserialized
-   from persisted state) skip the validation `from_dict()` performs.
+   from persisted state) skipped the validation `from_dict()` performs.
+   Confirmed exploitable: `RunOptions(max_accepted_tasks=-5,
+   role_timeout=0.0, opencode_startup_timeout=-3.0, ...)` constructed
+   without error, while `RunOptions.from_dict()` given the identical
+   values raised `StateError`. `argparse`'s `type=int`/`type=float`
+   coercion (`cli.py:378-389`) enforces type but not range, so e.g.
+   `run --max-tasks -5 --role-timeout 0` started a run, persisted the
+   invalid options via `to_dict()`, and produced a run that could never
+   be resumed — `from_dict()` rejects the exact file the program itself
+   wrote, trapping a live lock (and possibly a live worktree) behind an
+   unresumable run.
+
+   Fixed by routing `cmd_run`'s option construction through
+   `RunOptions.from_dict()` instead of the `RunOptions(...)` constructor
+   directly, so CLI-built and persisted-and-reloaded options are
+   validated by the exact same code path and can never silently
+   diverge on what counts as valid. Invalid values are now rejected
+   with a sanitized `error: ...` line and exit 1, before any lock is
+   acquired or server started — matching every other expected-failure
+   path in `cmd_run`. `cmd_resume` was already unaffected (it loads
+   `RunOptions` from persisted state via `from_dict()`, never
+   constructs one directly); `tui/app.py`'s `_DEFAULT_OPTIONS`
+   (`:159`) is a hardcoded module-level constant with fixed valid
+   literals, not user input, so it was never exposed to this hole. See
+   `tests/test_cli_runtime.py`
+   (`test_cmd_run_rejects_invalid_options_before_starting`,
+   parametrized over negative counts, non-positive timeouts, and an
+   empty executable; `test_cmd_run_accepts_options_from_dict_would_-
+   accept`, a round-trip check that anything `cmd_run` builds
+   successfully is also accepted by `from_dict()`).
 
 9. **Persisted nested role results, pending questions, and
    phase/result relationships are not fully validated.**
@@ -270,13 +301,18 @@ after the fact get written down.
    shape, timestamp ordering, phase-vs-result consistency) is incomplete
    compared to the flat field/type checks already in place.
 
-10. **Non-`FileNotFoundError` spawn failures need normalization.**
-    `src/loop_supervisor/opencode.py:155-183`.
-    Only `FileNotFoundError` is caught and normalized to
-    `ServerStartupError`; other `OSError` subclasses from
-    `subprocess.Popen` (e.g. `PermissionError`, `OSError` for exec format
-    errors) propagate unclassified and are not persisted as a durable
-    startup failure.
+10. ~~Non-`FileNotFoundError` spawn failures need normalization.~~
+    **Already resolved; this backlog had not caught up.**
+    `src/loop_supervisor/opencode.py:661-680`. Re-verified against
+    current source: the launcher-spawn `except BaseException as exc:`
+    clause already checks `isinstance(exc, OSError)` — every `OSError`
+    subclass, not only `FileNotFoundError` — and normalizes to
+    `ServerStartupError` with the original exception preserved as
+    `__cause__` via `_safe_exception_text()`. Already covered by
+    `tests/test_opencode.py:265`
+    (`test_popen_permission_error_normalized_to_startup_error`) and
+    `:285` (`test_popen_generic_oserror_normalized_to_startup_error`).
+    No code change made; this item is marked resolved by inspection.
 
 ## Tier 3 — reliability
 
@@ -469,8 +505,9 @@ after the fact get written down.
 
 24. **Retry after an operational failure discovered mid-phase can lose
     operator-supplied guidance.**
-    `src/loop_supervisor/supervisor.py:867-869`,
-    `src/loop_supervisor/supervisor.py:1022-1024`.
+    `src/loop_supervisor/supervisor.py:877` (`_do_architecting`),
+    `:1032` (`_do_building`); corrected from a stale `:867-869`/
+    `:1022-1024` citation.
     `_do_architecting()` and `_do_building()` clear
     `state.pending_question` (consuming any operator guidance/answer)
     before invoking the role and running its contract checks. If the
