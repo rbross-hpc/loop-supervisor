@@ -83,11 +83,24 @@ after the fact get written down.
 
 2. **Ordinary post-transition `_save()` failures are outside
    classification/failure-persistence boundaries.**
-   `src/loop_supervisor/supervisor.py:534-549`,
-   `src/loop_supervisor/supervisor.py:716-718`.
+   `src/loop_supervisor/supervisor.py:543` (the `PHASE_AWAITING_INPUT`
+   save after the `try`), `:551` (the success-path save); both sit
+   outside the `try:` at `:478-540`, unlike the `_save()` call at
+   `:481` (inside the try, so a failure there at least has a chance of
+   being classified). Corrected from a stale `:534-549`/`:716-718`
+   citation.
    A `_save()` failure after an otherwise successful phase transition is
    not classified or recorded consistently with other operational
-   failures.
+   failures raised from inside the `try` block (`_handle_operational_-
+   failure`, `:592-596`; `_handle_terminal_failure`, `:631`, neither of
+   which this code path can reach once outside the `try`).
+   The realistic trigger is not a bare disk-write failure: `_save()`
+   calls `self._checkpoint(state)` (`:737-738`), which calls
+   `repo.head_commit()`/`repo.status_snapshot()` (`:448-456`) — Git
+   operations that can raise `GitError`. `GitError` is already one of
+   the exception types the in-`try` operational-failure tuple catches
+   (`:526-532`); it is simply unreachable from a `_save()` call made
+   after that `try` block has already exited.
 
 3. ~~Persisted "sanitized" messages may include HTTP response bodies or
    server output.~~ **Resolved (partially).**
@@ -132,8 +145,9 @@ after the fact get written down.
 
 4. **Symlinked lock/state ancestor directories, and state-file symlinks,
    are not rejected.**
-   `src/loop_supervisor/locking.py:76-103`,
-   `src/loop_supervisor/state.py:665-695`.
+   `src/loop_supervisor/locking.py:76-115` (`_lock_path`, `_guard_path`,
+   `_guarded`), `src/loop_supervisor/state.py:684-730` (`save_state`,
+   `load_state`); corrected from a stale `:76-103`/`:665-695` citation.
    `_open_no_follow` guards the leaf lock/guard files, but a symlinked
    `loop-supervisor` *ancestor* directory could redirect lock/state writes
    outside Git metadata entirely.
@@ -168,15 +182,41 @@ after the fact get written down.
    have hung the test process itself with no way to time out.
 
 6. **Bound non-newline OpenCode stdout fragments.**
-   `src/loop_supervisor/opencode.py:223-251`.
+   `src/loop_supervisor/opencode.py:813-841` (`_start_stdout_pump`;
+   corrected from a stale `:223-251` citation, which now points at an
+   unrelated class).
    The stdout pump's `partial` buffer (data received but not yet
    newline-terminated) is unbounded; a subprocess that writes an
    arbitrarily long line without a newline could grow this without limit.
 
-7. **Correct SSE event-size accounting and raw-line memory bounds.**
-   `src/loop_supervisor/sse.py:70-129`.
-   Confirm the SSE client's line/event buffering has an explicit size
-   cap symmetrical to the OpenCode stdout pump fix above.
+7. **Bound SSE parser memory against unbounded upstream buffering, not
+   just the already-enforced per-event cap.** (description corrected;
+   see below)
+   `src/loop_supervisor/sse.py:121-127` (existing cap), `:320`
+   (`_connect_and_stream`).
+   This item previously asked to "confirm" an event-size cap exists;
+   it already does, and is already tested
+   (`tests/test_sse.py:78`), so that framing was stale. Three real
+   gaps remain, none of which the existing cap addresses:
+
+   1. `_connect_and_stream` (`:320`) calls `iter_sse_json` without
+      passing `max_event_bytes`, so the real streaming path always
+      gets the 1 MiB default with no way to configure it — there is
+      no `SSEClient`-level parameter or `RunOptions` field that
+      reaches this cap at all; only a caller that constructs
+      `iter_sse_json` directly (today, only tests) can vary it.
+   2. An empty `data:` line contributes to `data_parts` (the growing
+      per-event buffer) without incrementing the size counter that
+      trips the cap, so a stream of many empty `data:` lines within
+      one event is not bounded by the existing check.
+   3. The actual hazard: `httpx`'s `LineDecoder`, which the SSE client
+      reads through, buffers an unterminated line unboundedly
+      *upstream* of `iter_sse_json` — by the time a line reaches this
+      module's own per-event accounting, `httpx` may already have
+      buffered an arbitrarily long line in memory. `max_event_bytes`
+      cannot defend against this by construction: it operates on
+      already-decoded lines, not on the byte stream `LineDecoder`
+      itself is buffering.
 
 ## Tier 2 — fix next: validation/startup
 
@@ -872,25 +912,50 @@ after the fact get written down.
     `loop-supervisor` version and a project's own copied agent
     definitions.
 
-36. **TUI startup-failure deadlock: the single reusable
-    `_shutdown_complete_event` can be awaited by a caller with no
-    attempt in flight to ever set it.** (Tier 1 — correctness)
-    `src/loop_supervisor/tui/app.py:407`, `:906` (`_maybe_start_-
-    shutdown_attempt`), `:931` (`await_shutdown_complete`).
+36. **TUI startup-failure deadlock (currently unreachable): the single
+    reusable `_shutdown_complete_event` could be awaited by a caller
+    with no attempt in flight to ever set it, if a future caller
+    bypassed the existing guard.** (Tier 3 — reliability; demoted from
+    Tier 1)
+    `src/loop_supervisor/tui/app.py:407`, `:924` (`_maybe_start_-
+    shutdown_attempt`), `:949` (`await_shutdown_complete`), `:1309`
+    (the guard that currently prevents this).
     Migrated from `docs/plans/2026-08-22-second-lifecycle-fix-
     plan.md`'s Step 5 (blocker 1), which is the only place this defect
     was tracked; it does not appear anywhere in this backlog before
-    now. Confirmed still present: `app.py:407` still constructs one
-    `threading.Event()` per `RunScreen`, not one per shutdown attempt.
-    Successful cleanup after a failed `_do_initialize_locked()` can set
-    `shutdown_clean = True` without ever setting this event (no
-    `_shutdown_worker` attempt ran to signal it); a later app exit or
-    "q" press that awaits the event then waits forever. Step 4's TUI
-    ownership registry fix (resolved, this backlog's item 12) narrowly
-    worked around one instance of this ("already clean with nothing to
-    signal" is checked before awaiting) without redesigning the
-    underlying single-event design, and its own commit says so
-    explicitly.
+    now.
+
+    **Corrected note (this backlog previously overstated this as a
+    live, reachable defect):** re-verified against current
+    `app.py`. `_shutdown_complete_event` is still a single reusable
+    `threading.Event()` per `RunScreen` (`:407`), not one per shutdown
+    attempt, and `_maybe_start_shutdown_attempt()` still does not set
+    it when cleanup was "already clean" (`:931`, i.e. no
+    `_shutdown_worker` ran to signal it) — so the underlying
+    single-event design is exactly as fragile as originally described.
+    However, every current caller that awaits the event
+    (`ensure_cleanup_coordinator`'s drain loop, `app.py:1290-1315`) is
+    already gated by `if not screen.shutdown_clean:` (`:1309`) before
+    calling `action_request_shutdown()` and awaiting — so on the
+    already-clean path this backlog worried about, no attempt is
+    started and no await happens. The two other callers
+    (`on_return`'s "Return to runs" button, `:840`; `_on_exit_app`'s
+    retry drain, `:1186`) both call the non-awaiting
+    `action_request_shutdown()` directly and never await the event
+    themselves. Confirmed no caller in the current codebase reaches
+    `await_shutdown_complete()` without first passing the `:1309`
+    guard. The comment at `:1305-1307` already says as much explicitly
+    ("this check is the narrow, non-redesigning guard for that case;
+    the full per-attempt signaling redesign is Step 5's responsibility,
+    not this one's") — this backlog's item just never caught up to
+    that comment.
+
+    The residual risk is real but not urgent: the guard is easy to get
+    wrong in a *future* caller (nothing enforces "always check
+    `shutdown_clean` before awaiting" except convention and this one
+    comment), and the fix design below removes that foot-gun entirely
+    rather than trusting every future call site to remember it. Demoted
+    out of Tier 1 because there is currently no path that hangs.
 
     Fix design carried over from the source plan: replace the single
     reusable event with a per-attempt handle (generation counter + its
@@ -899,12 +964,13 @@ after the fact get written down.
     attempt, a newly started one, or "already clean" (nothing to wait
     for), synchronized under a dedicated attempt lock; every caller
     (`_on_exit_app()`, `"q"`, "Return to runs") awaits only a real
-    attempt handle it holds, never a bare shared event. Needed tests:
-    app exit after clean startup-failure cleanup completes without
-    deadlock; `"q"`/"Return to runs" work after clean startup-failure
-    cleanup; distinct attempt generations don't cross-signal; app exit
-    requested mid-failed-init-cleanup waits correctly and then
-    proceeds.
+    attempt handle it holds, never a bare shared event — removing the
+    need for any caller to separately check `shutdown_clean` first.
+    Needed tests: app exit after clean startup-failure cleanup
+    completes without deadlock; `"q"`/"Return to runs" work after clean
+    startup-failure cleanup; distinct attempt generations don't
+    cross-signal; app exit requested mid-failed-init-cleanup waits
+    correctly and then proceeds.
 
 37. ~~`_confirm_server_stopped()`'s inter-attempt backoff uses
     `time.sleep()`, which is not interrupt-safe.~~ **Resolved.**
@@ -1062,6 +1128,44 @@ after the fact get written down.
     yet; and a bare `DELETE` will not shrink `opencode.db` on disk
     without a subsequent `VACUUM`, since SQLite only frees the pages
     for reuse.
+
+44. **A real self-hosted run got permanently stuck on "agent
+    'loop-auditor' returned no text output," an untested failure mode
+    of `_extract_text`'s empty-`text_parts` branch.** (Tier 2 — fix
+    next: validation/startup)
+    `src/loop_supervisor/opencode.py:1481` (raises
+    `AgentInvocationError`), run `test-run-2` /
+    `5c7e2d584cfd` (`.git/loop-supervisor/runs/5c7e2d584cfd.json`),
+    `phase: operational_failure`, `failed_phase: auditing`,
+    `retryable: true`, `retry_phase: auditing`, still resumable as of
+    this writing.
+
+    Discovered while investigating this repository's own self-hosted
+    run readiness, not from a synthetic test. The builder's task
+    completed successfully (`builder_result.status: "COMPLETE"`, 17
+    tests passing, all gates clean) and `loop-auditor` was invoked
+    against that result, but its response's `parts` list contained no
+    `{"type": "text"}` part with non-empty text — `_extract_text`
+    correctly classifies this as `AgentInvocationError` rather than
+    crashing uncaught, and `advance()`'s operational-failure handling
+    correctly persisted it as retryable — but nothing in this codebase
+    currently explains *why* an auditor invocation would return zero
+    text parts (a model returning only a tool call with no closing
+    text, a truncated/empty final message, or a provider-specific
+    response shape `_extract_text` does not yet recognize).
+
+    Distinct from item 6/7 (buffer bounds) and item 9 (persisted
+    nested role results): this is a live defect with a real
+    reproduction artifact, not a code-audit finding. No backlog item
+    tracked this before now, and it would recur identically on any
+    future self-hosted or production run that hits the same
+    underlying model-response shape. Before a genuine self-hosted run
+    of this supervisor against itself is attempted, this item (or at
+    least a resumed retry of the stuck run confirming it clears) should
+    be resolved — see this backlog's item 32 and
+    `docs/decisions/0014-server-mode-permission-defaults-and-venv-path.md`
+    for the other prerequisites (`--worktree-root`, per-worktree
+    `.venv` provisioning) a self-hosted run needs decided first.
 
 ## Out of scope for this backlog
 
