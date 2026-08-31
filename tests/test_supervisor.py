@@ -307,6 +307,87 @@ def test_builder_complete_with_falsy_commit_raises_loop_error(tmp_path, monkeypa
         supervisor._do_building(state)
 
 
+def test_creating_worktree_runs_provisioning_commands(tmp_path):
+    marker = tmp_path / "project" / "provisioned.txt"
+    runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
+    options = _make_options(provision_commands=(f"touch {marker.name}",))
+    supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+
+    assert state.phase == "building"
+    worktree_path = Path(state.task_worktree_path)
+    assert (worktree_path / marker.name).exists()
+
+
+def test_creating_worktree_skips_provisioning_when_not_configured(tmp_path):
+    runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+    supervisor.advance(state)
+
+    assert state.phase == "building"
+
+
+def test_creating_worktree_provisioning_failure_is_an_operational_failure(tmp_path):
+    runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
+    options = _make_options(provision_commands=("sh -c 'exit 7'",))
+    supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    outcome = supervisor.advance(state)  # creating_worktree -> operational_failure
+
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+    assert outcome.status.value == "operational_failure"
+    assert state.last_error is not None
+    assert state.last_error["kind"] == "provisioning"
+    assert state.last_error["retry_phase"] == "creating_worktree"
+    assert state.last_error["retryable"] is True
+    # task identity must not be committed on a failed provisioning attempt
+    assert state.task_worktree_path is None
+    assert state.pending_worktree_path is not None
+
+
+def test_creating_worktree_provisioning_stops_at_first_failing_command(tmp_path):
+    marker = tmp_path / "project" / "second-command-ran.txt"
+    runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
+    options = _make_options(
+        provision_commands=("sh -c 'exit 1'", f"touch {marker.name}"),
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+    supervisor.advance(state)
+
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+    assert not marker.exists()
+
+
+def test_creating_worktree_provisioning_retry_reconciles_existing_worktree(tmp_path):
+    # A provisioning failure leaves the worktree/branch created (only task
+    # identity is withheld) so resume re-enters via
+    # create_or_reconcile_task_worktree's reconciliation path rather than
+    # re-creating from scratch.
+    runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
+    options = _make_options(provision_commands=("sh -c 'exit 1'",))
+    supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+    supervisor.advance(state)
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+
+    # Fix the configured command (simulating an operator editing
+    # loop-supervisor.toml) and retry the failed phase.
+    supervisor.options = _make_options(provision_commands=("true",))
+    state.phase = state.last_error["retry_phase"]
+    supervisor.advance(state)
+
+    assert state.phase == "building"
+    assert state.task_worktree_path is not None
+
+
 def test_run_max_steps_none_matches_unbounded_default(tmp_path):
     runner = ScriptedRunner(
         {

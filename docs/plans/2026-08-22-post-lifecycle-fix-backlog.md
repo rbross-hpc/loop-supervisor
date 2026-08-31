@@ -881,11 +881,29 @@ after the fact get written down.
     connection's event dispatch, not just reusing `PermissionDenier`
     as-is.
 
-32. **Consider having the supervisor provision each task worktree's
-    `.venv` itself, instead of relying on the builder agent to do it.**
+32. ~~**Consider having the supervisor provision each task worktree's
+    `.venv` itself, instead of relying on the builder agent to do
+    it.**~~ **Resolved.** An opt-in `[provision].commands` list in
+    `loop-supervisor.toml` (ADR 0025) is run sequentially in
+    `_do_creating_worktree`, before task identity is committed to
+    state, so a failure retries the whole phase and reconciles the
+    already-created worktree/branch (`GitRepo.
+    create_or_reconcile_task_worktree`) rather than re-creating from
+    scratch -- configured commands are expected to be idempotent, the
+    same expectation the existing `.venv/` convention already
+    depends on. A failure is a hard operational failure
+    (`ProvisioningError`, `commands.py`): a half-provisioned
+    environment produces confusing downstream tool errors rather than
+    a clear one, so failing closed was chosen over letting the
+    builder cope with a partial setup. `cleanup_worktree` needed no
+    change, confirming the item's own prediction. The
+    "learn what to provision from the agent's own prior work" idea
+    was not pursued -- static configuration was judged sufficient, and
+    the cross-task-boundary signal-persistence problem it would have
+    required remains unaddressed on its own merits.
     `src/loop_supervisor/supervisor.py` (`_do_creating_worktree`),
-    `src/loop_supervisor/opencode.py` (`build_agent_env`),
-    `docs/decisions/0014-server-mode-permission-defaults-and-venv-path.md`.
+    `src/loop_supervisor/commands.py`,
+    `docs/decisions/0025-loop-supervisor-toml-is-the-project-config-channel.md`.
 
     ADR 0014 already establishes that each task worktree must have its
     own `.venv` — never symlinked or shared with the integration

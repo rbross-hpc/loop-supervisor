@@ -43,3 +43,26 @@ block) may also reference `pytest`/`ruff`/`mypy` by name in prose — the
 skeleton's own README template flags this exact spot. Search both
 `.md` files for those three tool names and update any prose mentions
 alongside the permission entries so the two stay consistent.
+
+## Optional: let `loop-supervisor` provision the task worktree itself
+
+Each task worktree needs its own environment (e.g. a Python `.venv`,
+`node_modules`, or whatever the target project's toolchain requires),
+never shared or symlinked with the integration checkout's own — a
+tool that records absolute paths back to where it was installed (an
+editable Python install, for example) would otherwise silently verify
+the wrong source tree. By default this is left to the builder agent's
+own initiative on first need. To have `loop-supervisor` set it up
+deterministically before building starts instead, add a
+`loop-supervisor.toml` at the project root:
+
+```toml
+[provision]
+commands = ["python3 -m venv .venv", ".venv/bin/pip install -e '.[dev]'"]
+timeout = 600
+```
+
+Replace the example commands with whatever the target project's own
+setup requires (e.g. `npm ci` for a Node project). This is entirely
+optional and off by default — see `loop-supervisor run --help` for the
+equivalent `--provision-command`/`--no-provision` flags.

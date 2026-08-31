@@ -18,6 +18,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+class ProvisioningError(RuntimeError):
+    """Raised when a configured `[provision].commands` sequence fails
+    (nonzero exit or timeout). Carries the full `CommandResult` sequence
+    so a caller can report exactly which command failed and why."""
+
+    def __init__(self, results: list[CommandResult]) -> None:
+        self.results = results
+        failed = results[-1]
+        if failed.timed_out:
+            reason = f"timed out after {failed.duration:.1f}s"
+        else:
+            reason = f"exited {failed.returncode}"
+        super().__init__(f"provisioning command {failed.command!r} {reason}")
+
+
 @dataclass(frozen=True)
 class CommandResult:
     """The outcome of running one configured command line to completion
