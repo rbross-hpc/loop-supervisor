@@ -27,6 +27,7 @@ except ImportError:
         pass
 
 
+from .config import DEFAULT_PROVISION_TIMEOUT, DEFAULT_VERIFY_TIMEOUT
 from .contracts import (
     ArchitectResult,
     ArchitectStatus,
@@ -117,6 +118,10 @@ def _default_run_options() -> RunOptions:
         require_decision_approval=False,
         opencode_executable="opencode",
         opencode_startup_timeout=30.0,
+        provision_commands=(),
+        provision_timeout=DEFAULT_PROVISION_TIMEOUT,
+        verify_commands=(),
+        verify_timeout=DEFAULT_VERIFY_TIMEOUT,
     )
 
 

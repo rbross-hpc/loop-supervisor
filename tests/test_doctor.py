@@ -17,6 +17,7 @@ from loop_supervisor.doctor import (
     _check_git_repo,
     _check_opencode_executable,
     _check_opencode_json,
+    _check_project_config,
     _check_python_version,
     env_status,
     run_checks,
@@ -224,6 +225,43 @@ def test_check_dotenv_present_passes_when_present(tmp_path):
     assert result.ok is True
 
 
+def test_check_project_config_passes_when_file_absent(tmp_path):
+    result = _check_project_config(tmp_path)
+    assert result.ok is True
+
+
+def test_check_project_config_fails_on_invalid_toml(tmp_path):
+    (tmp_path / "loop-supervisor.toml").write_text("not valid [ toml")
+    result = _check_project_config(tmp_path)
+    assert result.ok is False
+
+
+def test_check_project_config_fails_on_unknown_executable(tmp_path):
+    (tmp_path / "loop-supervisor.toml").write_text(
+        '[verify]\ncommands = ["definitely-not-a-real-command-xyz --flag"]\n'
+    )
+    result = _check_project_config(tmp_path)
+    assert result.ok is False
+    assert "definitely-not-a-real-command-xyz" in result.detail
+
+
+def test_check_project_config_passes_when_executable_on_path(tmp_path):
+    (tmp_path / "loop-supervisor.toml").write_text('[verify]\ncommands = ["git status"]\n')
+    result = _check_project_config(tmp_path)
+    assert result.ok is True
+
+
+def test_check_project_config_resolves_via_project_venv_bin(tmp_path):
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    fake_tool = venv_bin / "fake-verify-tool"
+    fake_tool.write_text("#!/bin/sh\nexit 0\n")
+    fake_tool.chmod(0o755)
+    (tmp_path / "loop-supervisor.toml").write_text('[verify]\ncommands = ["fake-verify-tool -q"]\n')
+    result = _check_project_config(tmp_path)
+    assert result.ok is True, result.detail
+
+
 def test_env_status_never_includes_values(monkeypatch):
     monkeypatch.setenv("ARGO_API_KEY", "super-secret-value")
     status = env_status()
@@ -246,6 +284,7 @@ def test_run_checks_returns_all_named_checks(tmp_path):
         "external_directory_permission",
         "agent_definitions",
         "dotenv_file",
+        "project_config",
     }
 
 

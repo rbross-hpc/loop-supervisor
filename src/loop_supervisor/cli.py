@@ -16,6 +16,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .config import ConfigError, ProjectConfig, load_project_config
 from .doctor import validate_report
 from .git import GitError
 from .input_providers import StdinInputProvider
@@ -148,6 +149,40 @@ def _resolve_max_steps(args: argparse.Namespace) -> int | None:
 _NON_PAUSE_PHASES = TERMINAL_PHASES | {PHASE_OPERATIONAL_FAILURE}
 
 
+def _resolve_project_config(args: argparse.Namespace, project_root: Path) -> ProjectConfig:
+    """Load `loop-supervisor.toml` (or the `--config` override) and apply
+    CLI overrides on top of it.
+
+    A `--provision-command`/`--verify-command` flag replaces the config
+    file's corresponding command list entirely (it does not append to
+    it); `--no-provision`/`--no-verify` force the corresponding list to
+    empty regardless of what the config file says. Precedence is
+    flag > config file > off, matching every other run-behavior setting
+    in this project.
+    """
+    config_path = Path(args.config) if args.config else project_root / "loop-supervisor.toml"
+    config = load_project_config(config_path)
+
+    provision_commands = config.provision_commands
+    if getattr(args, "no_provision", False):
+        provision_commands = ()
+    elif getattr(args, "provision_command", None):
+        provision_commands = tuple(args.provision_command)
+
+    verify_commands = config.verify_commands
+    if getattr(args, "no_verify", False):
+        verify_commands = ()
+    elif getattr(args, "verify_command", None):
+        verify_commands = tuple(args.verify_command)
+
+    return ProjectConfig(
+        provision_commands=provision_commands,
+        provision_timeout=getattr(args, "provision_timeout", None) or config.provision_timeout,
+        verify_commands=verify_commands,
+        verify_timeout=getattr(args, "verify_timeout", None) or config.verify_timeout,
+    )
+
+
 def _paused_phase_message(phase: str) -> str | None:
     """Return the "paused at phase X" line for a non-terminal, non-failure
     stop, or None if the run finished, failed, or hit an unretryable
@@ -170,6 +205,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         max_steps = _resolve_max_steps(args)
     except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        project_config = _resolve_project_config(args, project_root)
+    except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -197,6 +238,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "require_decision_approval": args.require_decision_approval,
                 "opencode_executable": args.opencode_executable,
                 "opencode_startup_timeout": args.startup_timeout,
+                "provision_commands": list(project_config.provision_commands),
+                "provision_timeout": project_config.provision_timeout,
+                "verify_commands": list(project_config.verify_commands),
+                "verify_timeout": project_config.verify_timeout,
             }
         )
     except StateError as exc:
@@ -470,6 +515,43 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Remove a stale lock from a dead local process and retry",
     )
+    run_parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to loop-supervisor.toml (default: <project>/loop-supervisor.toml)",
+    )
+    provision_group = run_parser.add_mutually_exclusive_group()
+    provision_group.add_argument(
+        "--provision-command",
+        action="append",
+        default=None,
+        metavar="CMD",
+        help="Command to run in a new task worktree before building "
+        "(repeatable; replaces [provision].commands from the config file "
+        "entirely, does not append to it)",
+    )
+    provision_group.add_argument(
+        "--no-provision",
+        action="store_true",
+        help="Disable worktree provisioning even if the config file configures it",
+    )
+    run_parser.add_argument("--provision-timeout", type=float, default=None)
+    verify_group = run_parser.add_mutually_exclusive_group()
+    verify_group.add_argument(
+        "--verify-command",
+        action="append",
+        default=None,
+        metavar="CMD",
+        help="Command to run after building and before auditing, with results "
+        "shown to the auditor (repeatable; replaces [verify].commands from "
+        "the config file entirely, does not append to it)",
+    )
+    verify_group.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Disable supervisor-run verification even if the config file configures it",
+    )
+    run_parser.add_argument("--verify-timeout", type=float, default=None)
     _add_step_control_arguments(run_parser)
     run_parser.set_defaults(func=cmd_run)
 

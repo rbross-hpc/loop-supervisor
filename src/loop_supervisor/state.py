@@ -97,6 +97,10 @@ class RunOptions:
     require_decision_approval: bool
     opencode_executable: str
     opencode_startup_timeout: float
+    provision_commands: tuple[str, ...]
+    provision_timeout: float
+    verify_commands: tuple[str, ...]
+    verify_timeout: float
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -152,6 +156,25 @@ class RunOptions:
         worktree_root = data["worktree_root"]
         if worktree_root is not None and (not isinstance(worktree_root, str) or not worktree_root):
             raise StateError("run option 'worktree_root' must be null or a non-empty string")
+
+        for name in ("provision_commands", "verify_commands"):
+            value = data[name]
+            if not isinstance(value, (list, tuple)) or not all(
+                isinstance(item, str) and item for item in value
+            ):
+                raise StateError(
+                    f"run option {name!r} must be a list of non-empty strings, got {value!r}"
+                )
+            data[name] = tuple(value)
+
+        for name in ("provision_timeout", "verify_timeout"):
+            value = data[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise StateError(f"run option {name!r} must be a number, got {value!r}")
+            if not math.isfinite(value) or value <= 0:
+                raise StateError(
+                    f"run option {name!r} must be a finite positive number, got {value!r}"
+                )
 
         return cls(**data)
 

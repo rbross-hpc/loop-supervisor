@@ -228,6 +228,15 @@ Useful flags: `--worktree-root`, `--max-tasks`, `--max-revisions`,
 `--max-steps` (bound how many phase transitions this invocation
 performs before stopping; `--step` is shorthand for `--max-steps 1`).
 
+Two optional, off-by-default features are configured via
+`loop-supervisor.toml` at the project root (or `--config PATH`), with
+CLI flags taking precedence over the file: `[provision].commands`
+(run once, in the new task worktree, before building) and
+`[verify].commands` (run after building, before auditing, with
+results shown to the auditor). See ADR 0025 for the config format and
+`--provision-command`/`--no-provision`/`--verify-command`/
+`--no-verify` for the equivalent flags.
+
 The integration checkout must be a clean Git working tree on a real
 branch (not detached `HEAD`) before a run starts.
 
