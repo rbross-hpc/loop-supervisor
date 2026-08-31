@@ -93,3 +93,25 @@ Set these up for your own project's language and tooling; the
 auditor's permission block in `.opencode/agents/loop-auditor.md`
 allows `pytest`, `ruff`, and `mypy` by default — adjust it if your
 project uses different tools.
+
+Each task worktree needs its own `.venv` (or equivalent), never
+shared or symlinked with this checkout's own `.venv` — an editable
+install (or any tool that records absolute paths back to where it was
+installed) would otherwise silently verify the wrong source tree. By
+default, an agent creates it during the build step on first need; to
+have `loop-supervisor` create it deterministically before building
+starts instead, add a `loop-supervisor.toml` at the project root:
+
+```toml
+[provision]
+commands = ["python3 -m venv .venv", ".venv/bin/pip install -e '.[dev]'"]
+timeout = 600
+```
+
+Consider [`uv`](https://docs.astral.sh/uv/) instead of `venv`/`pip`
+for faster repeated installs (`uv venv && uv pip install -e '.[dev]'`)
+— it hardlinks from a global cache rather than reinstalling from
+scratch on every worktree. `loop-supervisor` has no opinion on which
+installer you use; it only runs whatever commands you configure. See
+`loop-supervisor run --help` for the equivalent `--provision-command`/
+`--no-provision` flags, which take precedence over this file.

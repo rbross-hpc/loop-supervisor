@@ -27,6 +27,7 @@ except ImportError:
         pass
 
 
+from .commands import ProvisioningError, run_commands
 from .config import DEFAULT_PROVISION_TIMEOUT, DEFAULT_VERIFY_TIMEOUT
 from .contracts import (
     ArchitectResult,
@@ -50,7 +51,13 @@ from .decisions import (
     write_adr_idempotent,
 )
 from .git import GitError, GitRepo, MergeConflictError, TaskWorktree
-from .opencode import AgentInvocationError, AgentRunner, OpenCodeError, PhaseTimeoutError
+from .opencode import (
+    AgentInvocationError,
+    AgentRunner,
+    OpenCodeError,
+    PhaseTimeoutError,
+    build_agent_env,
+)
 from .phases import (
     PHASE_ARCHITECTING,
     PHASE_AUDITING,
@@ -534,6 +541,7 @@ class Supervisor:
             GitError,
             DecisionError,
             ContractError,
+            ProvisioningError,
         ) as exc:
             return self._handle_operational_failure(
                 state,
@@ -818,7 +826,9 @@ class Supervisor:
     # -- creating worktree ------------------------------------------------
 
     def _do_creating_worktree(self, state: RunState) -> None:
-        """Create (or reconcile) the task worktree based on persisted intent.
+        """Create (or reconcile) the task worktree based on persisted intent,
+        then run any configured `[provision].commands` (ADR 0025, backlog
+        item 32) in it before committing the task identity.
 
         The persisted path, branch, and base commit are immutable intent:
         this never substitutes current mutable Git state (e.g. the current
@@ -827,6 +837,19 @@ class Supervisor:
         exact reconciliation rules applied when a crash leaves both the
         worktree and branch already created but the resulting task identity
         unsaved.
+
+        Provisioning runs *before* `state.task_worktree_path` and the
+        pending-intent fields are cleared, deliberately: if a configured
+        command fails, this phase is retried in its entirety on resume,
+        re-entering `create_or_reconcile_task_worktree`'s reconciliation
+        path (which finds the already-created worktree/branch, still at
+        `base_commit` with a clean tree, and accepts it) rather than
+        hitting the "no pending worktree intent" guard above. Configured
+        provisioning commands are therefore expected to be idempotent and
+        to write only git-ignored content (exactly the existing `.venv/`
+        convention already relies on) -- a command that leaves tracked or
+        untracked non-ignored changes behind would break that
+        reconciliation on retry.
         """
         if (
             state.pending_worktree_path is None
@@ -847,6 +870,16 @@ class Supervisor:
             base_commit=state.pending_worktree_base,
             worktree_root=self.worktree_root,
         )
+
+        if self.options.provision_commands:
+            results = run_commands(
+                self.options.provision_commands,
+                cwd=worktree.path,
+                timeout=self.options.provision_timeout,
+                env=build_agent_env(worktree.path),
+            )
+            if not results[-1].ok:
+                raise ProvisioningError(results)
 
         state.original_task_id = worktree.original_task_id
         state.task_worktree_path = str(worktree.path)
@@ -1413,6 +1446,16 @@ def _classify_operational_failure(
             "to retry the phase; if it recurs, the agent prompt or the contract "
             "schema may have drifted.",
         )
+    if isinstance(exc, ProvisioningError):
+        return (
+            failed_phase,
+            True,
+            False,
+            "A configured [provision].commands entry failed or timed out. Resume "
+            "to retry; the worktree/branch are reused as-is (provisioning "
+            "commands must be idempotent), or fix the command in "
+            "loop-supervisor.toml first if it will fail the same way again.",
+        )
     return (failed_phase, True, False, None)
 
 
@@ -1431,6 +1474,8 @@ def _error_kind(exc: Exception) -> str:
         return "opencode_startup"
     if isinstance(exc, ContractError):
         return "contract"
+    if isinstance(exc, ProvisioningError):
+        return "provisioning"
     return "unknown"
 
 
