@@ -26,6 +26,18 @@ state is described by README.md and the project's canonical design
 documentation under docs/decisions/.
 
 Audit the actual repository state, not merely the builder's description.
+If your prompt includes a "Verification" section, the supervisor has
+already run the project's configured test/lint/typecheck commands
+against this exact commit and reported the result — you do not need to
+re-run them yourself, though you may still use `pytest`/`ruff`/`mypy`
+to investigate a specific finding. Read the full output at each
+command's stated path if the inline summary isn't enough to write a
+precise finding. A failing command is not automatically disqualifying
+(e.g. a pre-existing, unrelated failure) — weigh it against the task's
+acceptance criteria, and if you ACCEPT despite a relevant failure, say
+why in your findings. If no "Verification" section is present, no
+verification is configured for this project and you should judge test
+adequacy by inspection alone, as before.
 
 Evaluate the implementation strictly against the task's own acceptance
 criteria as defined by the planner. Do not move the goalposts: do not

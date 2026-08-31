@@ -6,7 +6,7 @@ test_supervisor.py's integration-style suite.
 """
 
 from loop_supervisor.contracts import PlannerResult
-from loop_supervisor.supervisor import _build_builder_prompt
+from loop_supervisor.supervisor import _build_auditor_prompt, _build_builder_prompt
 
 
 def _planner(**overrides):
@@ -122,3 +122,119 @@ def test_no_findings_or_changes_omits_both_headers():
     )
     assert "The auditor requested these changes" not in prompt
     assert "Supporting detail from the audit" not in prompt
+
+
+def _base_auditor_kwargs(**overrides):
+    kwargs = dict(
+        integration_branch="main",
+        integration_commit="abc123",
+        task_branch="loop/task-1",
+        task_commit="def456",
+        base_commit="abc123",
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_auditor_prompt_without_verification_omits_verification_section():
+    prompt = _build_auditor_prompt(_planner(), **_base_auditor_kwargs())
+    assert "Verification:" not in prompt
+    assert "Builder-reported" not in prompt
+
+
+def test_auditor_prompt_verification_ok_states_no_rerun_needed():
+    verification_result = {
+        "ok": True,
+        "commands": [
+            {
+                "command": "pytest -q",
+                "ok": True,
+                "returncode": 0,
+                "timed_out": False,
+                "duration": 1.23,
+                "output_path": ".loop-supervisor/verification/01.log",
+                "summary": "5 passed",
+            }
+        ],
+    }
+    prompt = _build_auditor_prompt(
+        _planner(), **_base_auditor_kwargs(verification_result=verification_result)
+    )
+    assert "every command succeeded" in prompt
+    assert "You do not need to re-run them" in prompt
+    assert "`pytest -q` [ok]" in prompt
+    assert ".loop-supervisor/verification/01.log" in prompt
+    assert "5 passed" in prompt
+
+
+def test_auditor_prompt_verification_failure_states_not_disqualifying():
+    verification_result = {
+        "ok": False,
+        "commands": [
+            {
+                "command": "pytest -q",
+                "ok": False,
+                "returncode": 1,
+                "timed_out": False,
+                "duration": 1.0,
+                "output_path": ".loop-supervisor/verification/01.log",
+                "summary": "FAILED test_x.py::test_y",
+            }
+        ],
+    }
+    prompt = _build_auditor_prompt(
+        _planner(), **_base_auditor_kwargs(verification_result=verification_result)
+    )
+    assert "at least one command failed" in prompt
+    assert "not automatically disqualifying" in prompt
+    assert "exit 1" in prompt
+    assert "FAILED test_x.py::test_y" in prompt
+
+
+def test_auditor_prompt_verification_timeout_is_labeled():
+    verification_result = {
+        "ok": False,
+        "commands": [
+            {
+                "command": "pytest -q",
+                "ok": False,
+                "returncode": None,
+                "timed_out": True,
+                "duration": 900.0,
+                "output_path": ".loop-supervisor/verification/01.log",
+                "summary": "",
+            }
+        ],
+    }
+    prompt = _build_auditor_prompt(
+        _planner(), **_base_auditor_kwargs(verification_result=verification_result)
+    )
+    assert "TIMED OUT" in prompt
+
+
+def test_auditor_prompt_includes_builder_self_reported_tests():
+    prompt = _build_auditor_prompt(
+        _planner(),
+        **_base_auditor_kwargs(
+            builder_tests_run=["pytest -q"],
+            builder_test_results=["945 passed"],
+        ),
+    )
+    assert "The builder self-reported" in prompt
+    assert "not independently verified" in prompt
+    assert "- pytest -q" in prompt
+    assert "- 945 passed" in prompt
+
+
+def test_auditor_prompt_omits_builder_self_report_header_when_absent():
+    prompt = _build_auditor_prompt(_planner(), **_base_auditor_kwargs())
+    assert "The builder self-reported" not in prompt
+
+
+def test_auditor_prompt_suggested_git_commands_still_present_with_verification():
+    verification_result = {"ok": True, "commands": []}
+    prompt = _build_auditor_prompt(
+        _planner(), **_base_auditor_kwargs(verification_result=verification_result)
+    )
+    assert "git diff abc123...def456" in prompt
+    assert "git log --oneline abc123..def456" in prompt

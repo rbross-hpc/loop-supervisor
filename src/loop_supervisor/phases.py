@@ -11,6 +11,7 @@ from __future__ import annotations
 PHASE_PLANNING = "planning"
 PHASE_ARCHITECTING = "architecting"
 PHASE_BUILDING = "building"
+PHASE_VERIFYING = "verifying"
 PHASE_AUDITING = "auditing"
 PHASE_AWAITING_INPUT = "awaiting_input"
 PHASE_DONE = "done"
@@ -40,6 +41,7 @@ ALL_PHASES = frozenset(
         PHASE_PLANNING,
         PHASE_ARCHITECTING,
         PHASE_BUILDING,
+        PHASE_VERIFYING,
         PHASE_AUDITING,
         PHASE_AWAITING_INPUT,
         PHASE_DONE,

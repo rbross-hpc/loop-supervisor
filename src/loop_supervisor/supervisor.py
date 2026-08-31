@@ -16,7 +16,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 try:
     from enum import StrEnum
@@ -27,7 +27,7 @@ except ImportError:
         pass
 
 
-from .commands import ProvisioningError, run_commands
+from .commands import CommandResult, ProvisioningError, run_commands
 from .config import DEFAULT_PROVISION_TIMEOUT, DEFAULT_VERIFY_TIMEOUT
 from .contracts import (
     ArchitectResult,
@@ -72,6 +72,7 @@ from .phases import (
     PHASE_OPERATIONAL_FAILURE,
     PHASE_PLANNING,
     PHASE_RECORDING_DECISION,
+    PHASE_VERIFYING,
     TERMINAL_PHASES,
 )
 from .state import DecisionRequest, OperationalErrorRecord, RunOptions, RunState, save_state
@@ -511,6 +512,8 @@ class Supervisor:
                 self._do_architecting(state)
             elif phase_before == PHASE_BUILDING:
                 self._do_building(state)
+            elif phase_before == PHASE_VERIFYING:
+                self._do_verifying(state)
             elif phase_before == PHASE_AUDITING:
                 self._do_auditing(state)
             elif phase_before == PHASE_CREATING_WORKTREE:
@@ -1130,7 +1133,7 @@ class Supervisor:
                 )
             verified_head = self.repo.verify_builder_commit(worktree, result.commit)
             state.last_task_head = verified_head
-            state.phase = PHASE_AUDITING
+            state.phase = PHASE_VERIFYING if self.options.verify_commands else PHASE_AUDITING
             return
 
         state.pending_question = {
@@ -1143,6 +1146,32 @@ class Supervisor:
             "context": {"status": result.status.value},
         }
         state.phase = PHASE_AWAITING_INPUT
+
+    # -- verifying ------------------------------------------------------------
+
+    def _do_verifying(self, state: RunState) -> None:
+        """Run the project's configured `[verify].commands` (ADR 0025,
+        backlog item 46) against the builder's committed work, independent
+        of anything the builder or auditor claims, and persist a compact
+        result the auditor's prompt is built from (`_build_auditor_prompt`).
+
+        This phase never raises on a verification command's own failure
+        (a failing test suite is a *finding for the auditor to weigh*, not
+        an infrastructure fault) -- only an unexpected exception while
+        running commands escalates to an operational failure. It is not a
+        durable side-effect phase: rerunning it is always safe and produces
+        an equivalent result, so unlike `creating_worktree` it carries no
+        crash-reconciliation concerns.
+        """
+        worktree = self._require_worktree(state)
+        results = run_commands(
+            self.options.verify_commands,
+            cwd=worktree.path,
+            timeout=self.options.verify_timeout,
+            env=build_agent_env(worktree.path),
+        )
+        state.verification_result = _summarize_verification(results, worktree.path)
+        state.phase = PHASE_AUDITING
 
     def _require_worktree(self, state: RunState) -> TaskWorktree:
         if self._active_worktree is not None:
@@ -1165,6 +1194,13 @@ class Supervisor:
         worktree = self._require_worktree(state)
         integration_commit = self.repo.head_commit()
 
+        builder_tests_run = None
+        builder_test_results = None
+        if state.builder_result is not None:
+            builder = BuilderResult.model_validate(state.builder_result)
+            builder_tests_run = builder.tests_run
+            builder_test_results = builder.test_results
+
         prompt = _build_auditor_prompt(
             planner,
             integration_branch=state.integration_branch,
@@ -1172,6 +1208,9 @@ class Supervisor:
             task_branch=worktree.branch,
             task_commit=state.last_task_head or "",
             base_commit=worktree.base_commit,
+            verification_result=state.verification_result,
+            builder_tests_run=builder_tests_run,
+            builder_test_results=builder_test_results,
         )
         raw = self.runner.run_agent(
             agent="loop-auditor",
@@ -1214,6 +1253,9 @@ class Supervisor:
                     f"task {self._require_worktree(state).original_task_id!r} exceeded "
                     f"{self.limits.max_revisions_per_task} revisions"
                 )
+            # A new builder attempt invalidates the previous verification
+            # run: it was computed against a commit this REVISE discards.
+            state.verification_result = None
             state.phase = PHASE_BUILDING
             return
 
@@ -1225,6 +1267,7 @@ class Supervisor:
                 f"{self.limits.max_replans_per_task} replans"
             )
         state.builder_result = None
+        state.verification_result = None
         if result.decision_required:
             state.decision_request = DecisionRequest(
                 origin="auditor",
@@ -1332,6 +1375,7 @@ class Supervisor:
         state.planner_result = None
         state.architect_result = None
         state.builder_result = None
+        state.verification_result = None
         state.auditor_result = None
         state.decision_request = None
         state.merge_pre_head = None
@@ -1359,6 +1403,7 @@ class Supervisor:
             if answer.strip().lower() == "replan":
                 state.pending_question = None
                 state.builder_result = None
+                state.verification_result = None
                 state.phase = PHASE_PLANNING
             else:
                 state.pending_question = pending
@@ -1521,6 +1566,46 @@ _SECRET_PATTERN_RE = re.compile(
 _MAX_MESSAGE_LENGTH = 2000
 _MESSAGE_HEAD_LENGTH = 500
 
+# Relative to the task worktree root. Gitignored (see
+# _skeleton/.gitignore's `.loop-supervisor/` reservation), so writing
+# here never perturbs `task_status_snapshot` or trips the resume
+# cleanliness guard.
+_VERIFICATION_LOG_SUBDIR = Path(".loop-supervisor") / "verification"
+
+
+def _summarize_verification(results: list[CommandResult], worktree_path: Path) -> dict[str, Any]:
+    """Persist each command's full stdout/stderr under the (gitignored)
+    task worktree, and return a compact summary suitable for both
+    `RunState.verification_result` and `_build_auditor_prompt`.
+
+    Truncation only affects the *summary* shown to the auditor inline;
+    the full output always remains on disk at `output_path` for the
+    auditor (or a human) to read directly if the summary isn't enough
+    to write a precise finding.
+    """
+    log_dir = worktree_path / _VERIFICATION_LOG_SUBDIR
+    log_dir.mkdir(parents=True, exist_ok=True)
+    commands: list[dict[str, Any]] = []
+    for index, result in enumerate(results, start=1):
+        log_path = log_dir / f"{index:02d}.log"
+        log_path.write_text(
+            f"$ {result.command}\n\n--- stdout ---\n{result.stdout}\n"
+            f"--- stderr ---\n{result.stderr}\n"
+        )
+        combined = (result.stdout + "\n" + result.stderr).strip()
+        commands.append(
+            {
+                "command": result.command,
+                "ok": result.ok,
+                "returncode": result.returncode,
+                "timed_out": result.timed_out,
+                "duration": round(result.duration, 2),
+                "output_path": str(log_path.relative_to(worktree_path)),
+                "summary": _truncate_message(_redact_secrets(combined)) if combined else "",
+            }
+        )
+    return {"ok": all(c["ok"] for c in commands), "commands": commands}
+
 
 def _redact_secrets(msg: str) -> str:
     """Best-effort removal of known-secret environment values and common
@@ -1674,22 +1759,66 @@ def _build_auditor_prompt(
     task_branch: str,
     task_commit: str,
     base_commit: str,
+    verification_result: dict[str, Any] | None = None,
+    builder_tests_run: list[str] | None = None,
+    builder_test_results: list[str] | None = None,
 ) -> str:
-    return "\n".join(
-        [
-            f"task_id: {planner.task_id}",
-            f"objective: {planner.objective}",
-            "acceptance_criteria:",
-            *[f"- {c}" for c in planner.acceptance_criteria],
-            "",
-            f"Integration branch: {integration_branch}",
-            f"Integration commit: {integration_commit}",
-            f"Task branch: {task_branch}",
-            f"Task commit: {task_commit}",
-            f"Task base commit: {base_commit}",
-            "",
-            "Suggested inspection commands:",
-            f"git diff {base_commit}...{task_commit}",
-            f"git log --oneline {base_commit}..{task_commit}",
-        ]
-    )
+    lines = [
+        f"task_id: {planner.task_id}",
+        f"objective: {planner.objective}",
+        "acceptance_criteria:",
+        *[f"- {c}" for c in planner.acceptance_criteria],
+        "",
+        f"Integration branch: {integration_branch}",
+        f"Integration commit: {integration_commit}",
+        f"Task branch: {task_branch}",
+        f"Task commit: {task_commit}",
+        f"Task base commit: {base_commit}",
+        "",
+        "Suggested inspection commands:",
+        f"git diff {base_commit}...{task_commit}",
+        f"git log --oneline {base_commit}..{task_commit}",
+    ]
+    if builder_tests_run or builder_test_results:
+        lines.append("")
+        lines.append(
+            "The builder self-reported the following (its own claim, not "
+            "independently verified -- weigh it against the section below "
+            "if both are present):"
+        )
+        if builder_tests_run:
+            lines.append("Builder-reported tests_run:")
+            lines.extend(f"- {t}" for t in builder_tests_run)
+        if builder_test_results:
+            lines.append("Builder-reported test_results:")
+            lines.extend(f"- {t}" for t in builder_test_results)
+    if verification_result is not None:
+        lines.append("")
+        if verification_result["ok"]:
+            lines.append(
+                "Verification: the supervisor ran the configured [verify].commands "
+                "against this exact commit and every command succeeded. You do not "
+                "need to re-run them, but may inspect the full output at each "
+                "command's output_path below if useful."
+            )
+        else:
+            lines.append(
+                "Verification: the supervisor ran the configured [verify].commands "
+                "against this exact commit and at least one command failed. You do "
+                "not need to re-run them, but should weigh this against the task's "
+                "acceptance criteria -- a failure here is not automatically "
+                "disqualifying (e.g. a pre-existing, unrelated failure), but an "
+                "ACCEPT despite a relevant failure should say why in your findings."
+            )
+        for command in verification_result["commands"]:
+            status = (
+                "ok"
+                if command["ok"]
+                else ("TIMED OUT" if command["timed_out"] else f"exit {command['returncode']}")
+            )
+            lines.append(
+                f"- `{command['command']}` [{status}], full output at {command['output_path']}"
+            )
+            if command["summary"]:
+                lines.append(f"  {command['summary']}")
+    return "\n".join(lines)

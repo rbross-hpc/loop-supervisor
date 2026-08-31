@@ -16,12 +16,17 @@ you're bringing the loop into a project that already has code.
 ## How the loop works
 
 ```
-planner --> [architect] --> builder --> auditor --> supervisor merge
-   ^                                        |
-   +---------------- REPLAN ----------------+
-                        |
-                     REVISE --> builder (same task)
+planner --> [architect] --> builder --> [verify] --> auditor --> supervisor merge
+   ^                                                     |
+   +------------------- REPLAN -------------------------+
+                           |
+                        REVISE --> builder (same task)
 ```
+
+`[verify]` runs only if `[verify].commands` is configured
+(`loop-supervisor.toml`, see ADR 0025); otherwise the builder's commit
+goes straight to the auditor, unchanged from before this feature
+existed.
 
 Four OpenCode agents, each with a narrow permission boundary, plus a
 Python supervisor that owns everything they are not allowed to do
@@ -44,7 +49,9 @@ themselves:
   the builder's summary) and returns `ACCEPT`, `REVISE`, or `REPLAN`.
   The auditor evaluates strictly against the task's own stated acceptance
   criteria — it does not expand scope or apply preferences the task never
-  claimed to satisfy.
+  claimed to satisfy. If `[verify].commands` is configured, its prompt
+  also includes the supervisor's own independently-run verification
+  result (not the auditor's or builder's claim) — see ADR 0025.
 
 The **Python supervisor** (`src/loop_supervisor/`) owns everything none of
 the agents are trusted to do themselves: starting `opencode serve`,
@@ -455,8 +462,9 @@ instead:
 ## Current limitations
 
 - One task in flight at a time (no parallel task worktrees).
-- No post-merge test run after a successful `ACCEPT` merge (builder and
-  auditor test runs are relied upon instead).
+- No post-merge test run after a successful `ACCEPT` merge (the last
+  pre-merge verification, if configured, plus the auditor's own
+  inspection, are relied upon instead).
 - Cancellation during an active OpenCode invocation is cooperative
   (abort request sent); no guarantee of immediate termination.
 - Diff browsing and full log inspection are not yet in the TUI.
