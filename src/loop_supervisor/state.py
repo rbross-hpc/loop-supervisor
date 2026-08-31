@@ -330,6 +330,7 @@ class RunState:
     planner_result: dict[str, Any] | None = None
     architect_result: dict[str, Any] | None = None
     builder_result: dict[str, Any] | None = None
+    verification_result: dict[str, Any] | None = None
     auditor_result: dict[str, Any] | None = None
     decision_request: dict[str, Any] | None = None
     accepted_task_count: int = 0

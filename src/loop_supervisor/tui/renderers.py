@@ -17,6 +17,7 @@ def render_phase_badge(phase: str) -> Text:
         "planning": "cyan",
         "architecting": "blue",
         "building": "yellow",
+        "verifying": "yellow",
         "auditing": "magenta",
         "awaiting_input": "orange3",
         "creating_worktree": "cyan",

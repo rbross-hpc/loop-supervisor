@@ -1337,6 +1337,43 @@ after the fact get written down.
     (`license = "BSD-3-Clause"`, `authors`, `readme`), if a template is
     wanted.
 
+46. ~~**Audits routinely accept based on static inspection alone,
+    because the auditor cannot reliably run its own verification
+    commands.**~~ **Resolved.** ADR 0014's Consequences section
+    promised a backlog item on exactly this ("both audits completed
+    so far in the `test-run` run never actually executed their
+    verification commands, so their ACCEPT dispositions rest on
+    static inspection alone") but it was never filed until now.
+    `src/loop_supervisor/supervisor.py` (`_do_verifying`,
+    `_build_auditor_prompt`), `src/loop_supervisor/phases.py`
+    (`PHASE_VERIFYING`), `docs/decisions/0026-supervisor-run-
+    verification-is-a-finding-not-a-fault.md`.
+
+    An opt-in `[verify].commands` list in `loop-supervisor.toml` is
+    run by the supervisor itself, sequentially, in a new `verifying`
+    phase between `building` and `auditing` (only entered when
+    `verify_commands` is non-empty; otherwise `building` routes
+    straight to `auditing`, unchanged). Full output is written under
+    the worktree's gitignored `.loop-supervisor/verification/`, and a
+    compact summary (per-command ok/timeout/exit-code/output-path,
+    truncated stdout+stderr) is persisted to
+    `RunState.verification_result` and rendered into the auditor's
+    prompt alongside the builder's own self-reported `tests_run`/
+    `test_results` claims for comparison. A failing verification
+    command never raises or diverts to `operational_failure` -- it is
+    a finding for the auditor to weigh (e.g. against a task's actual
+    acceptance criteria; a pre-existing unrelated failure should not
+    automatically block ACCEPT), never an infrastructure fault. Both
+    agent prompt files (live and skeleton) were updated to say
+    results are supplied and re-running them is unnecessary, while
+    keeping the `pytest`/`ruff`/`mypy` permission grants so the
+    auditor can still investigate a specific finding.
+    `verification_result` is cleared on REVISE (the next builder
+    attempt invalidates it) and REPLAN/task-boundary (matching
+    `builder_result`'s existing lifecycle). No `AuditorResult` schema
+    change was needed, avoiding the `extra="forbid"` lockstep problem
+    a schema change would have required.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in

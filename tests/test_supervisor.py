@@ -388,6 +388,137 @@ def test_creating_worktree_provisioning_retry_reconciles_existing_worktree(tmp_p
     assert state.task_worktree_path is not None
 
 
+def test_building_routes_to_auditing_directly_when_verify_not_configured(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="COMPLETE")],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+    supervisor.advance(state)  # building -> auditing (unchanged, verify off)
+
+    assert state.phase == "auditing"
+    assert state.verification_result is None
+
+
+def test_building_routes_to_verifying_when_configured(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="COMPLETE")],
+        }
+    )
+    options = _make_options(verify_commands=("echo checking",))
+    supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+    supervisor.advance(state)
+    supervisor.advance(state)
+
+    assert state.phase == "verifying"
+
+
+def test_verifying_runs_commands_and_persists_result_then_reaches_auditing(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="COMPLETE")],
+        }
+    )
+    options = _make_options(verify_commands=("echo hello-verification",))
+    supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+    supervisor.advance(state)
+    supervisor.advance(state)  # building -> verifying
+    supervisor.advance(state)  # verifying -> auditing
+
+    assert state.phase == "auditing"
+    assert state.verification_result is not None
+    assert state.verification_result["ok"] is True
+    commands = state.verification_result["commands"]
+    assert len(commands) == 1
+    assert commands[0]["command"] == "echo hello-verification"
+    assert commands[0]["ok"] is True
+    assert "hello-verification" in commands[0]["summary"]
+
+    worktree_path = Path(state.task_worktree_path)
+    log_path = worktree_path / commands[0]["output_path"]
+    assert log_path.exists()
+    assert "hello-verification" in log_path.read_text()
+
+
+def test_verifying_records_failure_but_still_reaches_auditing(tmp_path):
+    # A failing verification command is a finding for the auditor to
+    # weigh, not an infrastructure fault -- it must never raise or divert
+    # to operational_failure.
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="COMPLETE")],
+        }
+    )
+    options = _make_options(verify_commands=("sh -c 'exit 1'",))
+    supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+    supervisor.advance(state)
+    supervisor.advance(state)
+    supervisor.advance(state)
+
+    assert state.phase == "auditing"
+    assert state.verification_result["ok"] is False
+    assert state.verification_result["commands"][0]["ok"] is False
+
+
+def test_auditor_prompt_includes_verification_summary(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="COMPLETE")],
+            "loop-auditor": [_auditor(disposition="ACCEPT")],
+        }
+    )
+    options = _make_options(verify_commands=("echo hello-verification",))
+    supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+    supervisor.advance(state)
+    supervisor.advance(state)
+    supervisor.advance(state)  # verifying -> auditing
+    supervisor.advance(state)  # auditing -> merging
+
+    auditor_prompt = next(p for agent, p in runner.prompts if agent == "loop-auditor")
+    assert "Verification:" in auditor_prompt
+    assert "hello-verification" in auditor_prompt
+
+
+def test_revise_clears_stale_verification_result(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="COMPLETE"), _builder(status="COMPLETE")],
+            "loop-auditor": [_auditor(disposition="REVISE", required_changes=["fix it"])],
+        }
+    )
+    options = _make_options(verify_commands=("echo hello-verification",))
+    supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+    supervisor.advance(state)  # building -> verifying
+    supervisor.advance(state)  # verifying -> auditing
+    assert state.verification_result is not None
+    supervisor.advance(state)  # auditing -> building (REVISE)
+
+    assert state.phase == "building"
+    assert state.verification_result is None
+
+
 def test_run_max_steps_none_matches_unbounded_default(tmp_path):
     runner = ScriptedRunner(
         {
