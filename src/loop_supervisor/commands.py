@@ -115,18 +115,27 @@ def run_commands(
     cwd: Path,
     timeout: float,
     env: dict[str, str],
+    stop_on_failure: bool = True,
 ) -> list[CommandResult]:
-    """Run each command in order, stopping at the first failure.
+    """Run each command in order.
 
-    A timeout or a nonzero exit both count as failure and stop the
+    By default (`stop_on_failure=True`, provisioning's use case), a
+    timeout or a nonzero exit both count as failure and stop the
     sequence; a caller inspects the returned list's last entry's `ok`
     to know whether every command succeeded or the sequence was cut
     short.
+
+    With `stop_on_failure=False` (verification's use case), every
+    command always runs regardless of earlier failures: a lint failure
+    should not hide a downstream test failure the auditor also needs
+    to see. The returned list then always has one entry per input
+    command, and a caller inspects each entry's `ok` individually
+    rather than only the last one.
     """
     results: list[CommandResult] = []
     for command in commands:
         result = run_command(command, cwd=cwd, timeout=timeout, env=env)
         results.append(result)
-        if not result.ok:
+        if not result.ok and stop_on_failure:
             break
     return results

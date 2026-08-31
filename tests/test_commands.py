@@ -87,3 +87,43 @@ def test_run_commands_runs_all_on_success(tmp_path):
 def test_run_commands_empty_list_returns_empty(tmp_path):
     results = run_commands((), cwd=tmp_path, timeout=5, env=_env())
     assert results == []
+
+
+def test_run_commands_stop_on_failure_true_is_the_default(tmp_path):
+    marker = tmp_path / "second-ran"
+    results = run_commands(
+        ("sh -c 'exit 1'", f"touch {marker}"),
+        cwd=tmp_path,
+        timeout=5,
+        env=_env(),
+    )
+    assert len(results) == 1
+    assert not marker.exists()
+
+
+def test_run_commands_stop_on_failure_false_runs_every_command(tmp_path):
+    marker = tmp_path / "second-ran"
+    results = run_commands(
+        ("sh -c 'exit 1'", f"touch {marker}"),
+        cwd=tmp_path,
+        timeout=5,
+        env=_env(),
+        stop_on_failure=False,
+    )
+    assert len(results) == 2
+    assert results[0].ok is False
+    assert results[1].ok is True
+    assert marker.exists()
+
+
+def test_run_commands_stop_on_failure_false_records_every_result_regardless_of_position(tmp_path):
+    results = run_commands(
+        ("echo one", "sh -c 'exit 1'", "echo three"),
+        cwd=tmp_path,
+        timeout=5,
+        env=_env(),
+        stop_on_failure=False,
+    )
+    assert [r.ok for r in results] == [True, False, True]
+    assert "one" in results[0].stdout
+    assert "three" in results[2].stdout
