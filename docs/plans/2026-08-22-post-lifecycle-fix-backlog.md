@@ -1350,13 +1350,17 @@ after the fact get written down.
     verification-is-a-finding-not-a-fault.md`.
 
     An opt-in `[verify].commands` list in `loop-supervisor.toml` is
-    run by the supervisor itself, sequentially, in a new `verifying`
-    phase between `building` and `auditing` (only entered when
-    `verify_commands` is non-empty; otherwise `building` routes
+    run by the supervisor itself, sequentially with every command
+    always run regardless of an earlier one's failure, in a new
+    `verifying` phase between `building` and `auditing` (only entered
+    when `verify_commands` is non-empty; otherwise `building` routes
     straight to `auditing`, unchanged). Full output is written under
-    the worktree's gitignored `.loop-supervisor/verification/`, and a
-    compact summary (per-command ok/timeout/exit-code/output-path,
-    truncated stdout+stderr) is persisted to
+    git-common-dir (`docs/decisions/0027-verification-logs-live-
+    under-git-common-dir-not-the-worktree.md`; an initial version
+    wrote under the worktree instead and was corrected by that ADR
+    after a post-merge audit), and a compact summary (per-command
+    ok/timeout/exit-code/output-path, truncated stdout+stderr) is
+    persisted to
     `RunState.verification_result` and rendered into the auditor's
     prompt alongside the builder's own self-reported `tests_run`/
     `test_results` claims for comparison. A failing verification
@@ -1373,6 +1377,17 @@ after the fact get written down.
     `builder_result`'s existing lifecycle). No `AuditorResult` schema
     change was needed, avoiding the `extra="forbid"` lockstep problem
     a schema change would have required.
+
+47. **Verification logs accumulate under git-common-dir with no
+    pruning.** Since ADR 0027, `<git_common_dir>/loop-supervisor/
+    verification/<run_id>/` is written once per `verifying` phase
+    execution and never deleted -- not by `cleanup_worktree`, not at
+    task-boundary cleanup, not anywhere. For a project that runs
+    verification often, this grows unbounded. Parallel to item 43's
+    opt-in `opencode.db` pruning discussion (deferred there for the
+    same reason: no evidence yet of it mattering in practice, and a
+    pruning policy is easier to design once there's a real retention
+    pattern to observe rather than guessed upfront).
 
 ## Out of scope for this backlog
 

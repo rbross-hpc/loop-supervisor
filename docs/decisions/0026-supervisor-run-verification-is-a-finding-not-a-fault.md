@@ -2,7 +2,14 @@
 
 ## Status
 
-Accepted
+Accepted. Its "where full command output lives" and
+"no stop-on-first-failure" paragraphs below are superseded by [ADR
+0027](0027-verification-logs-live-under-git-common-dir-not-the-worktree.md):
+verification logs write under git-common-dir rather than the task
+worktree, and `_do_verifying` now actually passes
+`stop_on_failure=False` as this ADR always said it did. Everything
+else here (the `verifying` phase, the fault/finding policy, the
+prompt changes) is unaffected. Kept for historical context.
 
 ## Context
 
