@@ -53,23 +53,6 @@ ALL_PHASES = frozenset(
     }
 )
 
-# The phase vocabulary that existed in schema v2. Every phase introduced
-# in v3 (the durable side-effect and operational_failure phases) must be
-# rejected in a document that claims to be schema v2, so a v3 document can
-# never smuggle new crash-reconciliation semantics past the migration by
-# relabeling itself as v2.
-V2_PHASES = frozenset(
-    {
-        PHASE_PLANNING,
-        PHASE_ARCHITECTING,
-        PHASE_BUILDING,
-        PHASE_AUDITING,
-        PHASE_AWAITING_INPUT,
-        PHASE_DONE,
-        PHASE_FAILED,
-    }
-)
-
 # Phases an OperationalErrorRecord.retry_phase may legitimately name.
 # Excludes operational_failure itself (a retryable record can never point
 # back to the wrapper state — that would erase the real interrupted phase

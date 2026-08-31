@@ -21,10 +21,21 @@ from .phases import (
     ALL_PHASES,
     PHASE_OPERATIONAL_FAILURE,
     RETRY_TARGET_PHASES,
-    V2_PHASES,
 )
 
-STATE_SCHEMA_VERSION = 3
+# Reset to 1 (backlog item 30): this project has no users and no
+# production installs, so every RunState document ever persisted was
+# created by this same development codebase. The prior v1->v2->v3
+# migration history was pure carrying cost -- real code, real tests, and
+# a real audit surface purchased for compatibility nobody needed -- and
+# has been deleted rather than carried forward again. There is
+# deliberately no migration path into this version: any document that
+# does not already carry schema_version == 1 in this exact shape is
+# rejected, and starting a new run is the only supported recovery. If
+# this project ever acquires a real installed user base whose in-flight
+# run state must survive an upgrade, that is the point to start taking
+# migrations seriously again -- see backlog item 30's resolution note.
+STATE_SCHEMA_VERSION = 1
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _MAX_RUN_ID_LENGTH = 128
@@ -274,54 +285,6 @@ _TASK_IDENTITY_FIELDS = (
     "task_base_commit",
 )
 
-_V2_FIELDS = {
-    "schema_version",
-    "run_id",
-    "git_common_dir",
-    "integration_path",
-    "integration_branch",
-    "integration_commit_at_start",
-    "options",
-    "integration_expected_head",
-    "integration_status_snapshot",
-    "original_task_id",
-    "task_worktree_path",
-    "task_branch",
-    "task_base_commit",
-    "task_expected_head",
-    "task_status_snapshot",
-    "phase",
-    "planner_result",
-    "architect_result",
-    "builder_result",
-    "auditor_result",
-    "decision_request",
-    "accepted_task_count",
-    "revision_count",
-    "replan_count",
-    "architect_retry_count",
-    "pending_question",
-    "last_task_head",
-    "created_at",
-    "updated_at",
-}
-
-# Fields added in schema v3. A document claiming to be v2 must not contain
-# any of these; migration always creates them as None.
-_V3_ONLY_FIELDS = frozenset(
-    {
-        "last_error",
-        "pending_worktree_path",
-        "pending_worktree_branch",
-        "pending_worktree_base",
-        "pending_adr_path",
-        "pending_adr_hash",
-        "merge_pre_head",
-        "merge_task_head",
-        "merge_commit",
-    }
-)
-
 
 @dataclass
 class RunState:
@@ -374,28 +337,19 @@ class RunState:
     def from_dict(cls, data: dict[str, Any]) -> RunState:
         version = data.get("schema_version")
         # Type-strict version comparison: bool is an int subclass and
-        # float(2.0) == 2, so plain equality would accept True as v1 and
-        # 2.0 as v2. The migrated/loaded state must always carry a real
-        # integer schema version.
+        # float(1.0) == 1, so plain equality would accept True or 1.0 as a
+        # valid version. The loaded state must always carry a real integer
+        # schema version.
         if type(version) is not int:
             raise StateError(f"state schema_version must be an integer, got {version!r}")
-        if version == 1:
-            raise StateError(
-                "state schema_version 1 cannot be resumed safely: it lacks "
-                "immutable run options and Git checkpoints introduced in "
-                "schema_version 2. Start a new run instead."
-            )
-        if version not in (2, STATE_SCHEMA_VERSION):
+        if version != STATE_SCHEMA_VERSION:
             raise StateError(
                 f"state schema_version {version!r} is not supported "
-                f"(expected {STATE_SCHEMA_VERSION})"
+                f"(expected {STATE_SCHEMA_VERSION}); there is no migration path "
+                "into the current schema -- start a new run instead"
             )
 
         data = dict(data)
-        source_version = version
-
-        if source_version == 2:
-            data = _migrate_v2_to_v3(data)
 
         # Strict, exact field set. Dataclass defaults are appropriate for
         # constructing *new* in-memory states, but must never implicitly
@@ -420,7 +374,7 @@ class RunState:
 
         _validate_scalar_types(data)
         _validate_task_identity(data, worktree_absent=_worktree_is_absent_phase(data))
-        _validate_phase_invariants(data, source_version=source_version)
+        _validate_phase_invariants(data)
 
         try:
             return cls(**data)
@@ -429,42 +383,6 @@ class RunState:
             # normalize any residual constructor error to StateError so the
             # runtime's fail-closed "cannot load run" path always applies.
             raise StateError(f"state could not be constructed: {exc}") from exc
-
-
-def _migrate_v2_to_v3(data: dict[str, Any]) -> dict[str, Any]:
-    """Strictly, additively migrate schema v2 to v3.
-
-    The v2 boundary is enforced, not trusted: the document must have
-    *exactly* the historical v2 field set (no v3-only fields), and its
-    phase must belong to the v2 phase vocabulary. Migration then builds a
-    fresh dict from the validated v2 fields and assigns every v3-only
-    field to None unconditionally — never preserving a supplied value —
-    so a v2 document can never smuggle in v3 crash-reconciliation intent.
-    Existing v2 run options, Git checkpoints, and phase are left untouched.
-    """
-    keys = set(data)
-    v3_present = keys & _V3_ONLY_FIELDS
-    if v3_present:
-        raise StateError(
-            "state claims schema_version 2 but contains schema v3-only "
-            f"fields: {sorted(v3_present)}"
-        )
-    unknown = keys - _V2_FIELDS
-    if unknown:
-        raise StateError(f"schema v2 state contains unknown fields: {sorted(unknown)}")
-    missing = _V2_FIELDS - keys
-    if missing:
-        raise StateError(f"schema v2 state is missing required fields: {sorted(missing)}")
-
-    phase = data.get("phase")
-    if phase not in V2_PHASES:
-        raise StateError(f"schema v2 state has phase {phase!r}, which did not exist in schema v2")
-
-    result = {key: data[key] for key in _V2_FIELDS}
-    result["schema_version"] = STATE_SCHEMA_VERSION
-    for key in _V3_ONLY_FIELDS:
-        result[key] = None
-    return result
 
 
 def _validate_scalar_types(data: dict[str, Any]) -> None:
@@ -580,7 +498,7 @@ def _validate_task_identity(data: dict[str, Any], *, worktree_absent: bool) -> N
         )
 
 
-def _validate_phase_invariants(data: dict[str, Any], *, source_version: int) -> None:
+def _validate_phase_invariants(data: dict[str, Any]) -> None:
     phase = data.get("phase", "")
     if phase not in ALL_PHASES:
         raise StateError(f"state has unknown phase: {phase!r}")
@@ -644,11 +562,7 @@ def _validate_phase_invariants(data: dict[str, Any], *, source_version: int) -> 
     if phase == "operational_failure" and raw_error is None:
         raise StateError("phase 'operational_failure' requires last_error")
 
-    # A native v3 terminal failure always persists a nonretryable error
-    # record. A genuine migrated v2 'failed' state necessarily has no
-    # last_error (the field did not exist in v2), and migration adds it as
-    # None; that legacy shape is permitted for read/display compatibility.
-    if phase == "failed" and raw_error is None and source_version != 2:
+    if phase == "failed" and raw_error is None:
         raise StateError("phase 'failed' requires a nonretryable last_error")
 
     if phase == "recording_decision":

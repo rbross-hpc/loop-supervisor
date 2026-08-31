@@ -810,8 +810,12 @@ after the fact get written down.
     task count both asserted present in the message;
     `test_cmd_resume_terminal_run_rejection_reports_load_run_failure`).
 
-30. **Squash `RunState` schema migrations (currently v2→v3) into a
-    single current version.** `src/loop_supervisor/state.py`
+30. ~~**Squash `RunState` schema migrations (currently v2→v3) into a
+    single current version.**~~ **Resolved** by
+    `docs/decisions/0024-state-schema-migration-was-squashed-not-versioned.md`:
+    `STATE_SCHEMA_VERSION` reset to `1`, all v1/v2/v3 migration
+    machinery deleted, no migration path into the current schema.
+    `src/loop_supervisor/state.py`
     (`STATE_SCHEMA_VERSION`, `_migrate_v2_to_v3`, `_V2_FIELDS`,
     `_V3_ONLY_FIELDS`, `V2_PHASES`).
 
