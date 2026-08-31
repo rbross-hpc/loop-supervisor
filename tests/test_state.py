@@ -162,21 +162,6 @@ def test_load_rejects_unknown_option_field(tmp_path):
         load_state(tmp_path, state.run_id)
 
 
-def test_load_rejects_schema_v1_without_migration(tmp_path):
-    state = _make_state(new_run_id())
-    save_state(tmp_path, state)
-    path = state_path(tmp_path, state.run_id)
-    data = json.loads(path.read_text())
-    data["schema_version"] = 1
-    del data["options"]
-    del data["integration_expected_head"]
-    del data["integration_status_snapshot"]
-    path.write_text(json.dumps(data))
-
-    with pytest.raises(StateError, match="schema_version 1"):
-        load_state(tmp_path, state.run_id)
-
-
 def test_load_rejects_partial_task_identity(tmp_path):
     state = _make_state(new_run_id(), task_worktree_path="/repo-task-1")
     save_state(tmp_path, state)
@@ -204,7 +189,7 @@ def test_decision_request_rejects_invalid_origin():
 def _make_cleanup_state(run_id: str, phase: str, **overrides) -> RunState:
     """Make a state with full task identity in a cleanup phase."""
     base: dict[str, Any] = dict(
-        schema_version=3,
+        schema_version=STATE_SCHEMA_VERSION,
         run_id=run_id,
         git_common_dir="/repo/.git",
         integration_path="/repo",
@@ -335,35 +320,6 @@ def test_operational_failure_rejects_unknown_error_fields(tmp_path):
     (path / f"{state.run_id}.json").write_text(json.dumps(data))
     with pytest.raises(StateError, match="unknown fields"):
         load_state(tmp_path, state.run_id)
-
-
-def test_v2_to_v3_migration_preserves_existing_fields(tmp_path):
-    import json
-
-    state = _make_state(new_run_id())
-    data = state.to_dict()
-    data["schema_version"] = 2
-    for v3_key in (
-        "last_error",
-        "pending_worktree_path",
-        "pending_worktree_branch",
-        "pending_worktree_base",
-        "pending_adr_path",
-        "pending_adr_hash",
-        "merge_pre_head",
-        "merge_task_head",
-        "merge_commit",
-    ):
-        data.pop(v3_key, None)
-    path = tmp_path / "loop-supervisor" / "runs"
-    path.mkdir(parents=True)
-    (path / f"{state.run_id}.json").write_text(json.dumps(data))
-    loaded = load_state(tmp_path, state.run_id)
-    assert loaded.schema_version == 3
-    assert loaded.phase == "planning"
-    assert loaded.options.max_accepted_tasks == 20
-    assert loaded.last_error is None
-    assert loaded.merge_commit is None
 
 
 # -- run_id validation / traversal safety -----------------------------------
@@ -598,120 +554,7 @@ def test_operational_failure_requires_retryable_error(tmp_path):
         load_state(tmp_path, state.run_id)
 
 
-# -- strict schema-v2 migration ---------------------------------------------
-
-
-def _write_v2(tmp_path, run_id: str, **overrides) -> dict:
-    """Build a canonical, exact schema-v2 document (no v3-only fields)."""
-    state = _make_state(run_id)
-    data = state.to_dict()
-    for v3_key in (
-        "last_error",
-        "pending_worktree_path",
-        "pending_worktree_branch",
-        "pending_worktree_base",
-        "pending_adr_path",
-        "pending_adr_hash",
-        "merge_pre_head",
-        "merge_task_head",
-        "merge_commit",
-    ):
-        data.pop(v3_key, None)
-    data["schema_version"] = 2
-    data.update(overrides)
-    path = tmp_path / "loop-supervisor" / "runs"
-    path.mkdir(parents=True, exist_ok=True)
-    (path / f"{run_id}.json").write_text(json.dumps(data))
-    return data
-
-
-@pytest.mark.parametrize(
-    "v3_field",
-    [
-        "last_error",
-        "pending_worktree_path",
-        "pending_worktree_branch",
-        "pending_worktree_base",
-        "pending_adr_path",
-        "pending_adr_hash",
-        "merge_pre_head",
-        "merge_task_head",
-        "merge_commit",
-    ],
-)
-def test_v2_migration_rejects_v3_only_fields(tmp_path, v3_field):
-    run_id = new_run_id()
-    _write_v2(tmp_path, run_id, **{v3_field: "smuggled"})
-    with pytest.raises(StateError):
-        load_state(tmp_path, run_id)
-
-
-@pytest.mark.parametrize(
-    "v3_phase",
-    [
-        "creating_worktree",
-        "recording_decision",
-        "merging",
-        "cleanup_worktree",
-        "cleanup_branch",
-        "operational_failure",
-    ],
-)
-def test_v2_migration_rejects_v3_only_phases(tmp_path, v3_phase):
-    run_id = new_run_id()
-    _write_v2(tmp_path, run_id, phase=v3_phase)
-    with pytest.raises(StateError):
-        load_state(tmp_path, run_id)
-
-
-def test_v2_migration_rejects_missing_historical_field(tmp_path):
-    run_id = new_run_id()
-    data = _write_v2(tmp_path, run_id)
-    del data["accepted_task_count"]
-    path = tmp_path / "loop-supervisor" / "runs" / f"{run_id}.json"
-    path.write_text(json.dumps(data))
-    with pytest.raises(StateError):
-        load_state(tmp_path, run_id)
-
-
-def test_v2_migration_adds_every_v3_field_as_none(tmp_path):
-    run_id = new_run_id()
-    _write_v2(tmp_path, run_id)
-    loaded = load_state(tmp_path, run_id)
-    assert loaded.schema_version == 3
-    for v3_key in (
-        "last_error",
-        "pending_worktree_path",
-        "pending_worktree_branch",
-        "pending_worktree_base",
-        "pending_adr_path",
-        "pending_adr_hash",
-        "merge_pre_head",
-        "merge_task_head",
-        "merge_commit",
-    ):
-        assert getattr(loaded, v3_key) is None
-
-
-def test_v2_migration_preserves_historical_values(tmp_path):
-    run_id = new_run_id()
-    _write_v2(tmp_path, run_id, accepted_task_count=3, revision_count=2, phase="building")
-    # building requires task identity checkpoints on load; add them.
-    data = json.loads((tmp_path / "loop-supervisor" / "runs" / f"{run_id}.json").read_text())
-    data["original_task_id"] = "task-1"
-    data["task_worktree_path"] = "/tmp/wt/task-1"
-    data["task_branch"] = "feature/task-1"
-    data["task_base_commit"] = "abc123"
-    data["task_expected_head"] = "def456"
-    data["task_status_snapshot"] = ""
-    (tmp_path / "loop-supervisor" / "runs" / f"{run_id}.json").write_text(json.dumps(data))
-    loaded = load_state(tmp_path, run_id)
-    assert loaded.accepted_task_count == 3
-    assert loaded.revision_count == 2
-    assert loaded.phase == "building"
-
-
-@pytest.mark.parametrize("version", [2.0, 3.0, True, "3"])
+@pytest.mark.parametrize("version", [1.0, 2, 0, True, "1"])
 def test_load_rejects_non_integer_schema_version(tmp_path, version):
     state = _make_state(new_run_id())
     save_state(tmp_path, state)
@@ -857,15 +700,7 @@ def test_load_wraps_malformed_json_as_state_error(tmp_path):
         load_state(tmp_path, run_id)
 
 
-def test_migrated_v2_failed_without_error_is_permitted(tmp_path):
-    run_id = new_run_id()
-    _write_v2(tmp_path, run_id, phase="failed")
-    loaded = load_state(tmp_path, run_id)
-    assert loaded.phase == "failed"
-    assert loaded.last_error is None
-
-
-def test_native_v3_failed_requires_error(tmp_path):
+def test_failed_phase_requires_error_on_load(tmp_path):
     state = _make_state(new_run_id(), phase="failed")
     data = state.to_dict()
     assert data["last_error"] is None

@@ -179,9 +179,12 @@ and fails closed on any mismatch rather than guessing:
   worktree dirty — that recorded dirty state is what's compared against,
   not a requirement that it become clean).
 
-State schema v1 (pre-dating these checkpoints and persisted run options)
-cannot be resumed safely and is rejected outright rather than silently
-migrated; start a new run instead.
+A saved run whose `schema_version` does not match the currently
+installed version is rejected outright rather than silently migrated
+or repaired; start a new run instead. There is deliberately no
+migration path between schema versions (see backlog item 30's
+resolution note in `docs/plans/2026-08-22-post-lifecycle-fix-backlog.md`
+and `state.py`'s comment above `STATE_SCHEMA_VERSION`).
 
 ## Setup
 
