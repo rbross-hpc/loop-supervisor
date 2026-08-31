@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .config import ConfigError, load_project_config
 from .git import GitError, GitRepo
 
 # Env vars this project's own skeleton and `.env.example` reference.
@@ -237,6 +238,53 @@ def _check_dotenv_present(project_root: Path) -> CheckResult:
     return CheckResult("dotenv_file", True, f"{env_path} exists")
 
 
+def _check_project_config(project_root: Path) -> CheckResult:
+    """Parse `loop-supervisor.toml` and confirm each configured command's
+    executable token resolves on `PATH` -- but never execute a command.
+    A missing file is `ok`: both worktree provisioning and supervisor-run
+    verification are opt-in, off-by-default features (see ADR 0025), so
+    a project that never created this file needs no diagnostic at all.
+    Executing a command here would violate the offline/fast preflight
+    contract this module otherwise holds (ADR 0022).
+    """
+    config_path = project_root / "loop-supervisor.toml"
+    if not config_path.is_file():
+        return CheckResult(
+            "project_config", True, f"{config_path} does not exist (provisioning/verify disabled)"
+        )
+    try:
+        config = load_project_config(config_path)
+    except ConfigError as exc:
+        return CheckResult("project_config", False, f"{config_path} is invalid: {exc}")
+
+    # Mirror build_agent_env's PATH construction (opencode.py) so a
+    # command that only resolves via the project's own .venv/bin isn't
+    # reported as missing: verification commands are expected to run
+    # inside a task worktree with exactly that PATH prepended, not the
+    # ambient PATH this preflight itself runs under.
+    venv_bin = str(project_root / ".venv" / "bin")
+    search_path = os.pathsep.join([venv_bin, os.environ.get("PATH", "")])
+
+    unresolved = []
+    for command in (*config.provision_commands, *config.verify_commands):
+        executable = command.split(maxsplit=1)[0]
+        if shutil.which(executable, path=search_path) is None:
+            unresolved.append(executable)
+    if unresolved:
+        return CheckResult(
+            "project_config",
+            False,
+            f"{config_path} parses, but not found on PATH: {', '.join(sorted(set(unresolved)))}",
+        )
+    return CheckResult(
+        "project_config",
+        True,
+        f"{config_path} parses; "
+        f"{len(config.provision_commands)} provision command(s), "
+        f"{len(config.verify_commands)} verify command(s) configured",
+    )
+
+
 def env_status() -> dict[str, dict[str, Any]]:
     """Set/unset status of each known provider env var. Values are never
     included, only whether each is set -- safe to print or log."""
@@ -256,6 +304,7 @@ def run_checks(project_root: Path, *, opencode_executable: str = "opencode") -> 
         _check_external_directory_permission(project_root),
         _check_agent_files(project_root),
         _check_dotenv_present(project_root),
+        _check_project_config(project_root),
     ]
 
 

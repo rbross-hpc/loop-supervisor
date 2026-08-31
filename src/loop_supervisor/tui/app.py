@@ -125,6 +125,7 @@ from textual.widgets import (
     TextArea,
 )
 
+from ..config import DEFAULT_PROVISION_TIMEOUT, DEFAULT_VERIFY_TIMEOUT
 from ..git import GitRepo
 from ..opencode import InvocationRef
 from ..opencode_events import OpenCodeEventError, normalize_global_event
@@ -167,6 +168,10 @@ _DEFAULT_OPTIONS = RunOptions(
     require_decision_approval=False,
     opencode_executable="opencode",
     opencode_startup_timeout=30.0,
+    provision_commands=(),
+    provision_timeout=DEFAULT_PROVISION_TIMEOUT,
+    verify_commands=(),
+    verify_timeout=DEFAULT_VERIFY_TIMEOUT,
 )
 
 # How long to wait, per notification interval, for the in-flight advance()

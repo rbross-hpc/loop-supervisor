@@ -30,6 +30,10 @@ def _make_options(**overrides) -> RunOptions:
         require_decision_approval=False,
         opencode_executable="opencode",
         opencode_startup_timeout=30.0,
+        provision_commands=(),
+        provision_timeout=600.0,
+        verify_commands=(),
+        verify_timeout=900.0,
     )
     defaults.update(overrides)
     return RunOptions(**defaults)
@@ -130,12 +134,18 @@ def test_run_options_roundtrip(tmp_path):
         require_decision_approval=True,
         opencode_executable="/usr/local/bin/opencode",
         opencode_startup_timeout=99.0,
+        provision_commands=("python3 -m venv .venv",),
+        provision_timeout=123.0,
+        verify_commands=("pytest -q", "ruff check ."),
+        verify_timeout=456.0,
     )
     state = _make_state(new_run_id(), options=options)
     save_state(tmp_path, state)
 
     loaded = load_state(tmp_path, state.run_id)
     assert loaded.options == options
+    assert loaded.options.provision_commands == ("python3 -m venv .venv",)
+    assert loaded.options.verify_commands == ("pytest -q", "ruff check .")
 
 
 def test_load_rejects_missing_options(tmp_path):
@@ -617,6 +627,15 @@ def test_load_rejects_bad_scalar_types(tmp_path, field, value):
         ("require_decision_approval", "yes"),
         ("opencode_executable", ""),
         ("worktree_root", ""),
+        ("provision_commands", "pytest -q"),
+        ("provision_commands", [""]),
+        ("provision_commands", [1]),
+        ("provision_timeout", 0),
+        ("provision_timeout", "x"),
+        ("verify_commands", "pytest -q"),
+        ("verify_commands", [""]),
+        ("verify_timeout", 0),
+        ("verify_timeout", float("inf")),
     ],
 )
 def test_load_rejects_bad_run_option_values(tmp_path, field, value):

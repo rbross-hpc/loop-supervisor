@@ -27,6 +27,10 @@ def _make_options(**overrides) -> RunOptions:
         require_decision_approval=False,
         opencode_executable="opencode",
         opencode_startup_timeout=30.0,
+        provision_commands=(),
+        provision_timeout=600.0,
+        verify_commands=(),
+        verify_timeout=900.0,
     )
     defaults.update(overrides)
     return RunOptions(**defaults)

@@ -29,6 +29,13 @@ def _run_args(tmp_path, **overrides):
         max_architect_retries=3,
         role_timeout=1800.0,
         recover_stale_lock=False,
+        config=None,
+        provision_command=None,
+        provision_timeout=None,
+        no_provision=False,
+        verify_command=None,
+        verify_timeout=None,
+        no_verify=False,
         step=False,
         max_steps=None,
     )
@@ -167,6 +174,109 @@ def test_cmd_run_accepts_options_from_dict_would_accept(tmp_path, monkeypatch):
     assert rc == 0
     options = captured_options["options"]
     assert RunOptions.from_dict(options.to_dict()) == options
+
+
+def _capture_options(monkeypatch):
+    captured_options = {}
+
+    class FakeState:
+        run_id = "run-123"
+        phase = "done"
+
+    def fake_run_new(project_root, options, **kwargs):
+        captured_options["options"] = options
+        return FakeState()
+
+    monkeypatch.setattr(cli_mod, "run_new", fake_run_new)
+    return captured_options
+
+
+def test_cmd_run_defaults_provision_and_verify_to_off(tmp_path, monkeypatch):
+    captured = _capture_options(monkeypatch)
+    rc = cli_mod.cmd_run(_run_args(tmp_path))
+    assert rc == 0
+    options = captured["options"]
+    assert options.provision_commands == ()
+    assert options.verify_commands == ()
+
+
+def test_cmd_run_reads_provision_and_verify_from_config_file(tmp_path, monkeypatch):
+    (tmp_path / "loop-supervisor.toml").write_text(
+        '[provision]\ncommands = ["python3 -m venv .venv"]\n[verify]\ncommands = ["pytest -q"]\n'
+    )
+    captured = _capture_options(monkeypatch)
+    rc = cli_mod.cmd_run(_run_args(tmp_path))
+    assert rc == 0
+    options = captured["options"]
+    assert options.provision_commands == ("python3 -m venv .venv",)
+    assert options.verify_commands == ("pytest -q",)
+
+
+def test_cmd_run_provision_command_flag_replaces_config_file_list(tmp_path, monkeypatch):
+    (tmp_path / "loop-supervisor.toml").write_text('[provision]\ncommands = ["from-config-file"]\n')
+    captured = _capture_options(monkeypatch)
+    rc = cli_mod.cmd_run(_run_args(tmp_path, provision_command=["from-cli"]))
+    assert rc == 0
+    assert captured["options"].provision_commands == ("from-cli",)
+
+
+def test_cmd_run_verify_command_flag_replaces_config_file_list(tmp_path, monkeypatch):
+    (tmp_path / "loop-supervisor.toml").write_text('[verify]\ncommands = ["from-config-file"]\n')
+    captured = _capture_options(monkeypatch)
+    rc = cli_mod.cmd_run(_run_args(tmp_path, verify_command=["from-cli"]))
+    assert rc == 0
+    assert captured["options"].verify_commands == ("from-cli",)
+
+
+def test_cmd_run_no_provision_forces_off_even_with_config_file(tmp_path, monkeypatch):
+    (tmp_path / "loop-supervisor.toml").write_text('[provision]\ncommands = ["from-config-file"]\n')
+    captured = _capture_options(monkeypatch)
+    rc = cli_mod.cmd_run(_run_args(tmp_path, no_provision=True))
+    assert rc == 0
+    assert captured["options"].provision_commands == ()
+
+
+def test_cmd_run_no_verify_forces_off_even_with_config_file(tmp_path, monkeypatch):
+    (tmp_path / "loop-supervisor.toml").write_text('[verify]\ncommands = ["from-config-file"]\n')
+    captured = _capture_options(monkeypatch)
+    rc = cli_mod.cmd_run(_run_args(tmp_path, no_verify=True))
+    assert rc == 0
+    assert captured["options"].verify_commands == ()
+
+
+def test_cmd_run_config_flag_overrides_default_config_path(tmp_path, monkeypatch):
+    alt_dir = tmp_path / "alt"
+    alt_dir.mkdir()
+    alt_config = alt_dir / "custom.toml"
+    alt_config.write_text('[verify]\ncommands = ["from-alt-config"]\n')
+    (tmp_path / "loop-supervisor.toml").write_text('[verify]\ncommands = ["from-default-config"]\n')
+    captured = _capture_options(monkeypatch)
+    rc = cli_mod.cmd_run(_run_args(tmp_path, config=str(alt_config)))
+    assert rc == 0
+    assert captured["options"].verify_commands == ("from-alt-config",)
+
+
+def test_cmd_run_provision_timeout_flag_overrides_config_file(tmp_path, monkeypatch):
+    (tmp_path / "loop-supervisor.toml").write_text('[provision]\ncommands = ["x"]\ntimeout = 111\n')
+    captured = _capture_options(monkeypatch)
+    rc = cli_mod.cmd_run(_run_args(tmp_path, provision_timeout=222.0))
+    assert rc == 0
+    assert captured["options"].provision_timeout == 222.0
+
+
+def test_cmd_run_reports_invalid_config_file_before_starting(tmp_path, monkeypatch, capsys):
+    (tmp_path / "loop-supervisor.toml").write_text("not valid [ toml")
+
+    def fake_run_new(*args, **kwargs):
+        raise AssertionError("run_new must not be called for an invalid config file")
+
+    monkeypatch.setattr(cli_mod, "run_new", fake_run_new)
+    rc = cli_mod.cmd_run(_run_args(tmp_path))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("error: ")
+    assert "Traceback" not in captured.err
 
 
 def test_cmd_run_does_not_catch_keyboard_interrupt(tmp_path, monkeypatch):

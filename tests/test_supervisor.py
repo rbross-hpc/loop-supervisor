@@ -190,6 +190,10 @@ def _make_options(**overrides):
         opencode_startup_timeout=overrides.get(
             "opencode_startup_timeout", base.opencode_startup_timeout
         ),
+        provision_commands=overrides.get("provision_commands", base.provision_commands),
+        provision_timeout=overrides.get("provision_timeout", base.provision_timeout),
+        verify_commands=overrides.get("verify_commands", base.verify_commands),
+        verify_timeout=overrides.get("verify_timeout", base.verify_timeout),
     )
 
 
