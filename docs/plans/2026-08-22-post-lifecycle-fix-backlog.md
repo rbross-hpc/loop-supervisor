@@ -1779,6 +1779,35 @@ after the fact get written down.
     process group and releases the lock -- printing a clean message
     and re-raising (rather than swallowing) is the likely shape.
 
+52. **`[provision]`/`[verify]` config from `loop-supervisor.toml` only
+    applies to `loop-supervisor run`; `resume` and `tui` bypass it
+    entirely.** (Tier 2 — validation/startup)
+    `_resolve_project_config` (`cli.py:152-182`) is called only from
+    `cmd_run` (`cli.py:212`); `cmd_resume` never calls it and instead
+    reloads `provision_commands`/`verify_commands` from the run's own
+    persisted `RunOptions` (correct and intended -- a resumed run must
+    honor the config it was actually started with, not silently pick
+    up a file edited since). `tui/app.py`'s `_DEFAULT_OPTIONS`
+    (`:159-181`) hardcodes `provision_commands=()`/`verify_commands=()`
+    as module-level constants and never reads `loop-supervisor.toml`
+    at all -- this is the more serious half: a TUI-driven run has no
+    path to picking up either feature, not even accidentally.
+
+    This means item 48's mitigation (isolating every task worktree's
+    venv from the integration checkout's own) protects only
+    `loop-supervisor run` invocations. A run started via the TUI is
+    fully exposed to the same venv-hijack mechanism item 48 describes,
+    with no config surface to close it. Overlaps item 17 (DEFERRED:
+    `tui` should accept the same run-behavior flags `run` does) in
+    root cause, but is filed separately because item 17 frames the gap
+    as a UX/validation shortfall, while this item's TUI consequence is
+    a live Tier-1 mitigation gap, not merely a missing convenience.
+    Not fixed here -- the TUI is deferred per the note at the top of
+    this file, and wiring `loop-supervisor.toml` through it is real
+    work for a UI surface not currently prioritized. README's
+    provisioning-isolation claim (see item 48's "Setup" section
+    addition) was scoped to `run` explicitly once this was found.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in

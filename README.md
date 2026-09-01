@@ -224,11 +224,19 @@ definitions present, `.env` exists — before you try to start one.
 
 This checkout's own `loop-supervisor.toml` (see "Running" below)
 provisions every task worktree with its own independent `.venv`
-before a builder touches it — a self-hosted run never shares this
-checkout's own venv with a task's, so nothing a builder does inside
-its worktree (including an editable `pip install`) can affect this
-checkout's own environment. See backlog item 48 for the incident that
-motivated this.
+before a builder touches it — under `loop-supervisor run`, a
+self-hosted run never shares this checkout's own venv with a task's,
+so nothing a builder does inside its worktree (including an editable
+`pip install`) can affect this checkout's own environment. See
+backlog item 48 for the incident that motivated this.
+
+**This protection is `run`-only.** `resume` reloads `provision_commands`
+from the run's own persisted state rather than re-reading
+`loop-supervisor.toml`, so a run started before provisioning was
+configured stays unprotected across every future resume. `tui` never
+reads `loop-supervisor.toml` at all — its `_DEFAULT_OPTIONS` hardcode
+provisioning off — so a TUI-driven run remains fully exposed to the
+item-48 hijack regardless of this file. See backlog item 52.
 
 ## Running
 
