@@ -448,12 +448,26 @@ instead:
 
 - **A test claiming to pin a historical defect must be verified failing
   against that defect's actual prior commit, not a hand-written
-  injection.** Check out (or `git show`) the source file as it existed
-  at the commit before the fix, run the new test against it in an
-  isolated trial environment, and confirm it fails there and passes
-  against the fixed code. A hand-written injection only proves the test
-  detects *your* injection, which is frequently a different (and often
-  more broken) bug than the one that actually shipped.
+  injection.** Do this in your own task worktree — it persists
+  unchanged through verification, auditing, and merge, so it is
+  already an isolated trial environment; do not create a second
+  worktree for this. Back up the file(s) the fix touched (e.g. `cp
+  src/foo.py /tmp/foo.py.bak`), overwrite them with the pre-fix
+  version (`git show <commit-before-the-fix>:path/to/file.py >
+  path/to/file.py`), run the new test and confirm it fails, then
+  restore from your backup (`cp /tmp/foo.py.bak src/foo.py`) — never
+  `git checkout --` on uncommitted work, which discards it instead of
+  restoring it. Confirm `git status` is clean again before reporting
+  COMPLETE: the supervisor rejects a dirty worktree at that point. A
+  hand-written injection only proves the test detects *your*
+  injection, which is frequently a different (and often more broken)
+  bug than the one that actually shipped.
+
+  If a probe genuinely needs a different commit checked out entirely
+  (not just one or two files swapped), a temporary worktree is the
+  right tool — but remove it (`git worktree remove`) before reporting,
+  rather than leaving it registered for the supervisor or a future
+  session to find.
   - **Mandatory probe self-check:** before trusting the trial run's
     result, assert something that is only true of the *old* code being
     tested (e.g. `hasattr(module, "_SomeSymbolAddedByTheFix") is False`).

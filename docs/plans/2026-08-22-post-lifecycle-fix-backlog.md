@@ -1742,22 +1742,55 @@ after the fact get written down.
     path into `revision_count` with a possibly-different threshold)
     before implementation.
 
-50. **Agent-created worktrees outside the supervisor's own bookkeeping
-    survive task cleanup.** (Tier 3 — reliability)
-    Observed after the same overnight run: six `git worktree`
-    entries beyond the supervisor's own task worktree were still
-    registered afterward -- four under `/tmp/opencode/`, two as
-    siblings of the integration checkout -- created by prior audit/
-    investigation agent sessions rather than by the supervisor itself,
-    two of them left dirty. `cleanup_worktree`
-    (`src/loop_supervisor/git.py`) only ever removes the one task
-    worktree it created and tracks in `RunState`; it has no visibility
-    into, and no mandate to reap, worktrees an agent created through
-    its own `bash` access for inspection or probing. Not fixed here;
-    likely needs either a documented convention (agents clean up their
-    own scratch worktrees before reporting) or a supervisor-side sweep
-    of unexpected worktrees at a safe point, whichever proves less
-    fragile.
+50. ~~**Agent-created worktrees outside the supervisor's own bookkeeping
+    survive task cleanup.**~~ **Resolved as a documentation fix, not a
+    supervisor-side sweep.** (Tier 5 — documentation/testing debt;
+    demoted from Tier 3)
+    Observed after the overnight run: six `git worktree` entries
+    beyond the supervisor's own task worktree were still registered
+    afterward -- four under `/tmp/opencode/`, two as siblings of the
+    integration checkout -- two of them left dirty. Each was a
+    detached-HEAD checkout of a specific historical commit
+    (`59784fb`, `a28f203`, `a048ead`, `055ba82`), not agent
+    carelessness: they were failing-first verification probes,
+    exactly what README's "Testing discipline" section (mandatory
+    probe self-check) asks every builder to do before trusting a new
+    test's result, just performed by creating a second worktree
+    rather than swapping source in place.
+
+    A supervisor-side sweep was considered and rejected.
+    `remove_task_worktree_only` (`src/loop_supervisor/git.py:529`) is
+    deliberately conservative -- it refuses to remove even its own
+    task worktree if it has uncommitted changes, because "any
+    remaining dirty content is either accidental or unreviewed and
+    must be preserved for manual inspection rather than silently
+    discarded." Two of the six leftovers here were dirty; a sweep
+    would have to override that principle by construction. There is
+    also no reliable way to distinguish "an agent's disposable scratch
+    worktree" from "the operator's own manual worktree" or "a second
+    supervisor's, sharing the same `git_common_dir`" -- detached HEAD
+    plus absence from `RunState` is a signature for the former, not a
+    proof of it.
+
+    Instead: the task worktree the supervisor already creates persists
+    unchanged through `verifying`/`auditing`/`merging`
+    (`cleanup_worktree` only runs after a reviewed merge,
+    `supervisor.py:1448`, and only once
+    `_validate_merge_cleanup_safety` confirms the branch tip has not
+    moved since that review), so it was already the right place to do
+    failing-first verification in place -- README's "isolated trial
+    environment" wording just never said how. Fixed here by replacing
+    that wording with the actual recipe (back up the file, `git show
+    <prior-commit>:path` in, run the new test, restore, confirm
+    `git status` clean before reporting COMPLETE -- `verify_builder_-
+    commit` rejects a dirty worktree at that point,
+    `src/loop_supervisor/git.py:362-363`) and telling the builder
+    directly to work in its own worktree rather than create another.
+    A bounded escape hatch (a temp-path scratch worktree, removed
+    before reporting) remains available for the case this technique
+    cannot cover: a probe that needs a whole prior commit checked out
+    rather than one file swapped, which at least some of the six
+    leftovers here appear to have been.
 
 51. **`^C` at an `awaiting_input` prompt prints a raw
     `KeyboardInterrupt` traceback instead of exiting cleanly.** (Tier
