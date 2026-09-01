@@ -22,6 +22,7 @@ import loop_supervisor.runtime as rt
 import loop_supervisor.tui.app as app_mod
 from loop_supervisor.git import GitRepo
 from loop_supervisor.locking import LockError, _lock_path
+from loop_supervisor.opencode import InvocationRef
 from loop_supervisor.state import RunOptions, load_state
 from loop_supervisor.supervisor import PHASE_OPERATIONAL_FAILURE
 from loop_supervisor.tui.app import (
@@ -116,6 +117,14 @@ class _FakeServer:
     def abort_active_sessions(self) -> None:
         self.call_log.append("abort_sessions")
 
+    def active_invocations(self) -> list[InvocationRef]:
+        return []
+
+    def reconcile_invocation(
+        self, ref: InvocationRef
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        raise AssertionError("no active fake invocation")
+
 
 def _patch_server(monkeypatch, *, fail: bool = False, call_log=None, factory=None):
     """Patch OpenCodeServer where it is actually constructed.
@@ -205,6 +214,167 @@ async def test_refresh_durable_shows_denied_permissions_from_session(tmp_path, m
         assert "2" in content_after
         assert "bash" in content_after
         assert "webfetch" in content_after
+
+        screen.action_request_shutdown()
+        for _ in range(50):
+            if not _lock_path(repo.common_dir()).exists():
+                break
+            await pilot.pause(0.05)
+
+
+@pytest.mark.asyncio
+async def test_sse_gap_notice_is_visible(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path / "repo")
+    _patch_server(monkeypatch)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        await pilot.pause()
+        await asyncio.to_thread(
+            screen._on_sse_notice,
+            "SSE disconnected; activity during disconnect may be missing. Reconnecting in 1.0s.",
+        )
+        await pilot.pause()
+
+        content = _static_text(screen.query_one("#live-content", app_mod.Static))
+        assert "activity during disconnect may be missing" in content
+
+        screen.action_request_shutdown()
+        for _ in range(50):
+            if not _lock_path(repo.common_dir()).exists():
+                break
+            await pilot.pause(0.05)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_reconciles_active_invocation_state(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path / "repo")
+
+    class ReconciliationServer(_FakeServer):
+        def __init__(self, project_dir, config, *, call_log=None):
+            super().__init__(project_dir, config, call_log=call_log)
+            self.ref = InvocationRef(
+                "session-exact", "loop-builder", tmp_path / "repo", time.monotonic()
+            )
+
+        def active_invocations(self) -> list[InvocationRef]:
+            return [self.ref]
+
+        def reconcile_invocation(
+            self, ref: InvocationRef
+        ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            assert ref == self.ref
+            self.call_log.append((ref.session_id, str(ref.directory)))
+            return (
+                {"type": "busy"},
+                [
+                    {
+                        "info": {
+                            "id": "message-exact",
+                            "sessionID": ref.session_id,
+                            "role": "assistant",
+                        },
+                        "parts": [
+                            {
+                                "id": "part-exact",
+                                "sessionID": ref.session_id,
+                                "messageID": "message-exact",
+                                "type": "text",
+                                "text": "restored after reconnect",
+                            }
+                        ],
+                    }
+                ],
+            )
+
+    call_log: list[Any] = []
+    _patch_server(
+        monkeypatch,
+        factory=lambda project_dir, config: ReconciliationServer(
+            project_dir, config, call_log=call_log
+        ),
+    )
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        await pilot.pause()
+        assert screen._session is not None
+        refs = screen._session.active_invocations()
+        assert len(refs) == 1
+        screen.on_invocation_started(app_mod.InvocationStarted(refs[0]))
+        screen.on_live_connection_changed(
+            app_mod.LiveConnectionChanged(app_mod.SSEConnectionState.LIVE, "connected")
+        )
+        screen.on_live_connection_changed(
+            app_mod.LiveConnectionChanged(app_mod.SSEConnectionState.RECONNECTING, "retrying")
+        )
+        screen.on_live_connection_changed(
+            app_mod.LiveConnectionChanged(app_mod.SSEConnectionState.LIVE, "connected")
+        )
+        content = ""
+        for _ in range(50):
+            await pilot.pause(0.05)
+            content = _static_text(screen.query_one("#live-content", app_mod.Static))
+            if "restored after reconnect" in content:
+                break
+
+        assert ("session-exact", str(tmp_path / "repo")) in call_log
+        assert "restored after reconnect" in content
+
+        screen.action_request_shutdown()
+        for _ in range(50):
+            if not _lock_path(repo.common_dir()).exists():
+                break
+            await pilot.pause(0.05)
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_failure_is_visible_and_nonfatal(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path / "repo")
+
+    class FailingReconciliationServer(_FakeServer):
+        ref = InvocationRef("session-fail", "loop-builder", tmp_path / "repo", time.monotonic())
+
+        def active_invocations(self) -> list[InvocationRef]:
+            return [self.ref]
+
+        def reconcile_invocation(
+            self, ref: InvocationRef
+        ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            raise RuntimeError("status endpoint unavailable")
+
+    _patch_server(
+        monkeypatch,
+        factory=lambda project_dir, config: FailingReconciliationServer(project_dir, config),
+    )
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.on_live_connection_changed(
+            app_mod.LiveConnectionChanged(app_mod.SSEConnectionState.LIVE, "connected")
+        )
+        screen.on_live_connection_changed(
+            app_mod.LiveConnectionChanged(app_mod.SSEConnectionState.RECONNECTING, "retrying")
+        )
+        screen.on_live_connection_changed(
+            app_mod.LiveConnectionChanged(app_mod.SSEConnectionState.LIVE, "connected")
+        )
+        content = ""
+        for _ in range(50):
+            await pilot.pause(0.05)
+            content = _static_text(screen.query_one("#live-content", app_mod.Static))
+            if "status endpoint unavailable" in content:
+                break
+
+        assert "reconciliation failed" in content.lower()
+        assert "status endpoint" in content
+        assert "unavailable" in content
+        assert screen._state is not None
 
         screen.action_request_shutdown()
         for _ in range(50):

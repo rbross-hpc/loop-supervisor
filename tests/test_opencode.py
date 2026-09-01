@@ -12,6 +12,7 @@ import pytest
 import loop_supervisor.opencode as oc_module
 from loop_supervisor.opencode import (
     AgentInvocationError,
+    InvocationRef,
     OpenCodeCleanupError,
     OpenCodeError,
     OpenCodeServer,
@@ -90,6 +91,66 @@ class _FakeServer(OpenCodeServer):
             "--port",
             str(port),
         ]
+
+
+def test_reconcile_invocation_uses_exact_session_and_directory(monkeypatch, tmp_path):
+    server = OpenCodeServer(tmp_path, _config())
+    ref = InvocationRef(
+        session_id="session-exact",
+        agent="loop-builder",
+        directory=tmp_path / "task",
+        started_monotonic=1.0,
+    )
+    requests: list[tuple[str, dict[str, str] | None]] = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self, data):
+            self._data = data
+
+        def json(self):
+            return self._data
+
+    class Client:
+        def get(self, path, *, params=None):
+            requests.append((path, params))
+            if path == "/session/status":
+                return Response({"session-exact": {"type": "busy"}})
+            return Response([])
+
+    monkeypatch.setattr(server, "_client", Client())
+
+    status, messages = server.reconcile_invocation(ref)
+
+    assert status == {"type": "busy"}
+    assert messages == []
+    assert requests == [
+        ("/session/status", {"directory": str(ref.directory)}),
+        ("/session/session-exact/message", {"directory": str(ref.directory)}),
+    ]
+
+
+def test_reconcile_invocation_rejects_status_without_exact_session(monkeypatch, tmp_path):
+    server = OpenCodeServer(tmp_path, _config())
+    ref = InvocationRef("session-exact", "loop-builder", tmp_path / "task", 1.0)
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"session-other": {"type": "busy"}}
+
+    class Client:
+        def get(self, path, *, params=None):
+            return Response()
+
+    monkeypatch.setattr(server, "_client", Client())
+
+    with pytest.raises(OpenCodeError, match="omitted active session 'session-exact'"):
+        server.reconcile_invocation(ref)
 
 
 def test_build_agent_env_prepends_relative_venv_bin_unconditionally(tmp_path):

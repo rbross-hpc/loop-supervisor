@@ -84,6 +84,9 @@ def render_live_summary(snapshot: LiveActivitySnapshot) -> Table:
     conn_color = "green" if conn.state == "live" else "red"
     grid.add_row("SSE", Text(conn.state, style=conn_color))
 
+    if snapshot.notices:
+        grid.add_row("Notice", Text(snapshot.notices[-1], style="yellow", overflow="fold"))
+
     for inv in snapshot.invocations:
         status_color = "yellow" if inv.status == "running" else "dim"
         agent_label = Text(f"[{inv.agent}]")

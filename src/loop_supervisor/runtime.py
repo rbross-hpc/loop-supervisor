@@ -127,13 +127,14 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Literal, NoReturn
+from typing import Any, Literal, NoReturn
 
 from .git import GitError, GitRepo
 from .input_providers import StdinInputProvider
 from .locking import LockError, SupervisorLock
 from .opencode import (
     InvocationObserver,
+    InvocationRef,
     OpenCodeServer,
     OpenCodeServerConfig,
     build_agent_env,
@@ -687,6 +688,20 @@ class RunSession:
                 "add_observer() requires an entered session; the server does not exist yet"
             )
         self._server.add_observer(observer)
+
+    def active_invocations(self) -> list[InvocationRef]:
+        """Return a snapshot of supervisor-owned in-flight invocations."""
+        if self._server is None:
+            return []
+        return self._server.active_invocations()
+
+    def reconcile_invocation(
+        self, ref: InvocationRef
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Fetch ephemeral OpenCode state for an exact active invocation."""
+        if self._server is None:
+            raise RuntimeError_("reconciliation requires a started server")
+        return self._server.reconcile_invocation(ref)
 
     def abort_active_invocations(self) -> None:
         """Best-effort abort of any in-flight agent invocations.

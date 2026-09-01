@@ -49,6 +49,22 @@ class LiveDisconnected(Message):
         self.reason = reason
 
 
+class LiveNotice(Message):
+    """Posted for visible, non-fatal ephemeral telemetry diagnostics."""
+
+    def __init__(self, notice: str) -> None:
+        super().__init__()
+        self.notice = notice
+
+
+class ReconciliationCompleted(Message):
+    """Carries state restored by a reconnect reconciliation worker."""
+
+    def __init__(self, events: tuple[OpenCodeEvent, ...]) -> None:
+        super().__init__()
+        self.events = events
+
+
 class OpenCodeEventReceived(Message):
     """Posted by the SSE thread (via call_from_thread) with a normalized event.
 

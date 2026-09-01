@@ -500,12 +500,32 @@ after the fact get written down.
 
 ## Tier 4 — telemetry/UI
 
-14. **SSE reconnect/session-registration reconciliation is absent.**
-    `src/loop_supervisor/sse.py:247-277`, `src/loop_supervisor/tui/app.py:796-797`.
-    `_on_sse_notice()` discards gap notices; there is no reconciliation of
-    active-session state after a reconnect, and events that arrive before
-    the corresponding session is registered can be misattributed or
-    dropped.
+14. ~~**SSE reconnect/session-registration reconciliation is absent.**~~
+    **Resolved.** Every transport reconnect still emits the explicit lossy-gap
+    notice, and the TUI now retains and renders bounded ephemeral notices rather
+    than discarding `_on_sse_notice()`. A transition back to `LIVE` after an
+    earlier live connection starts a non-fatal worker that snapshots only
+    supervisor-owned active invocations, then queries `/session/status` and each
+    exact `/session/{id}/message` with that invocation's exact directory. The
+    resulting status/message snapshots are translated back through the live
+    reducer only after returned message and part session IDs match; they never
+    infer or mutate durable supervisor phase.
+
+    The observer-to-Textual registration race is closed with a 256-event FIFO
+    in `LiveActivityReducer`: recognized session-bearing events received before
+    registration are replayed only after both exact session ID and exact
+    directory match. Mismatches remain rejected, and notices are independently
+    bounded to 20 entries, preserving ADR 0019's ownership, exact-attribution,
+    and memory invariants. Reconciliation errors are visible notices and never
+    fail the run. Focused tests cover race replay, exact-directory rejection,
+    bounded retention, restored status/message state, visible gap notices, exact
+    endpoint parameters, and non-fatal reconciliation failure; the five primary
+    regression tests were verified failing against pre-task commit `fc91c04`
+    with an old-code symbol self-check, then passing after the fix. Full pytest,
+    `ruff check .`, `ruff format --check .`, and `mypy src tests` pass.
+
+    Item 15's trailing-event behavior and item 19's general parser/reconnect-
+    backoff acceptance coverage remain explicitly out of scope.
 
 15. **Trailing-event attribution loss.**
     `src/loop_supervisor/tui/live.py:224-236`.
