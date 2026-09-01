@@ -116,6 +116,10 @@ def main() -> int:
                 os.environ.pop("FAKE_LAUNCHER_TERM_ERROR_ONCE")
                 _write_event(event_fd, "term-error:simulated EPERM")
                 continue
+            term_block_file = os.environ.get("FAKE_LAUNCHER_TERM_BLOCK_FILE")
+            if term_block_file and os.path.exists(term_block_file):
+                _write_event(event_fd, "term-error:simulated EPERM")
+                continue
             try:
                 os.killpg(pgid, signal.SIGTERM)
             except OSError as exc:

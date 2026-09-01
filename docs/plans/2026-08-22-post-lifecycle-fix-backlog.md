@@ -452,10 +452,51 @@ after the fact get written down.
     runtime uses (`runtime.py:869-925`) — exactly the parallel this item
     asked for, not a separate TUI-specific implementation.
 
-13. **Acceptance tests for**: orphan-child prevention under process
+13. ~~**Acceptance tests for**: orphan-child prevention under process
     kill/crash, stale-lock recovery end-to-end, repeated cleanup attempts
     against a real (not faked) OpenCode process, and process-exit
-    behavior under SIGINT/SIGTERM.
+    behavior under SIGINT/SIGTERM.~~ **Resolved for the headless fake-binary
+    acceptance boundary; TUI and real-OpenCode-binary scope remains under
+    item 22b.**
+
+    Coverage was reconciled rather than duplicated. Real SIGINT and SIGTERM
+    delivery to the headless CLI, including process exit, lock release, and
+    fake-server termination, was already covered by
+    `tests/test_signal_handling.py` (item 22a / ADR 0015). Process-group
+    shutdown itself was already exercised in `tests/test_opencode.py` with
+    real spawned server descendants, including a SIGTERM-ignoring descendant,
+    SIGKILL escalation, early leader exit, and ownership retention after an
+    unconfirmed launcher wait. `tests/test_locking.py` already covered dead-PID
+    rejection/recovery and concurrent stale-lock replacement at the lock API
+    boundary. `tests/test_runtime.py` already covered retry budgets,
+    primary-error precedence, retained-lock diagnostics, and repeated cleanup
+    using synthetic servers.
+
+    The two missing cross-component combinations now live in
+    `tests/test_headless_lifecycle.py`. One launches the real headless CLI,
+    an actual fake OpenCode server, and its process-group descendant, then
+    SIGKILLs the active supervisor: the OpenCode group and lock are observed
+    surviving (the unavoidable crash outcome), an ordinary successor is
+    rejected without changing the stale record, the test performs the
+    operator-required group termination, and a successor with
+    `--recover-stale-lock` completes and releases its replacement lock. The
+    other drives a real `RunSession` and spawned launcher/server through an
+    intentionally unconfirmed bounded stop sequence, verifies the same server
+    ownership and repository lock remain, then removes the launcher fault and
+    verifies a later `close()` confirms group shutdown before releasing the
+    lock. The launcher fixture's file-controlled TERM error is only a
+    deterministic process-boundary fault seam; neither `OpenCodeServer` nor
+    `RunSession` is monkeypatched.
+
+    The new scenarios passed against the pre-task production implementation;
+    no production lifecycle defect was exposed. Failing-first verification for
+    the newly added acceptance assertions used their missing launcher fixture
+    seam: before that seam was added, the real-process retry case failed because
+    its first cleanup was confirmed and discarded ownership, rather than
+    entering the required unconfirmed-cleanup state. No SIGINT/SIGTERM tests
+    were duplicated. Tests against the actual OpenCode binary, app-level/TUI
+    exit refusal and retry, TUI initialization races, TUI signal behavior, and
+    other TUI process-kill scenarios remain explicitly scoped to item 22b.
 
 ## Tier 4 — telemetry/UI
 
