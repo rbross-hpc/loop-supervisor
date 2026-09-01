@@ -21,6 +21,7 @@ def _make_options(**overrides) -> RunOptions:
         max_revisions_per_task=5,
         max_replans_per_task=3,
         max_architect_retries=3,
+        max_builder_guidance_attempts=3,
         malformed_output_retries=1,
         role_timeout=1800.0,
         worktree_root=None,

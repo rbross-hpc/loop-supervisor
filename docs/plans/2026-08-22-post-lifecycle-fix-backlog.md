@@ -1722,25 +1722,52 @@ after the fact get written down.
     (struck) for the disproportionate-cost reasoning against a
     config-level command allowlist/denylist as defence-in-depth here.
 
-49. **Repeated builder `INCOMPLETE`/`BLOCKED` results have no circuit
-    breaker.** (Tier 3 — reliability)
+49. ~~**Repeated builder `INCOMPLETE`/`BLOCKED` results have no circuit
+    breaker.**~~ **Resolved.** (Tier 3 — reliability)
     `src/loop_supervisor/supervisor.py:1227-1236` (the non-`COMPLETE`
     branch of `_do_building`'s result handling) sets a fresh
     `pending_question`/`PHASE_AWAITING_INPUT` on every
-    `INCOMPLETE`/`BLOCKED` builder result, but never increments
+    `INCOMPLETE`/`BLOCKED` builder result, but never incremented
     `state.revision_count`. That counter is only incremented on the
     auditor's `REVISE` disposition (`supervisor.py:1345`), so
-    `max_revisions_per_task` (`RunOptions`, default 5) never trips for
-    this path -- a builder can report `INCOMPLETE` an unbounded number
+    `max_revisions_per_task` (`RunOptions`, default 5) never tripped for
+    this path -- a builder could report `INCOMPLETE` an unbounded number
     of times across successive operator/guidance answers without the
     run ever escalating to a terminal failure on its own. Observed
     directly in run `5611ee6e8e66`: three consecutive
     `builder_guidance` prompts against the same task, each following
     an `INCOMPLETE` report, with `revision_count` remaining `0`
-    throughout. Not fixed here; needs a design decision on what should
-    count against the limit (e.g. a separate counter, or folding this
-    path into `revision_count` with a possibly-different threshold)
-    before implementation.
+    throughout.
+
+    Fixed with a new, dedicated `RunOptions.max_builder_guidance_attempts`
+    (default 3) and `RunState.builder_guidance_count`, rather than folding
+    this into `revision_count` (a different loop with a different
+    threshold and a different owner -- builder self-reports vs. auditor
+    judgment). Below the limit, behavior is unchanged. At the limit,
+    `_do_building` stops re-invoking the builder and instead parks a new
+    `pending_question.kind = "builder_escalation"`, whose only legal
+    answers are `replan` (send the task back to the planner, preserving
+    the worktree/branch) or `abandon` (terminal failure, worktree/branch
+    still preserved for inspection); any other answer re-asks. See
+    [ADR 0030](decisions/0030-builder-guidance-circuit-breaker.md) for the
+    full design and why exhaustion parks with an escalated question
+    rather than failing outright.
+
+    While implementing this, found and fixed an adjacent bug in the same
+    area: the operator's existing `replan` answer to ordinary
+    `builder_guidance` (`supervisor.py:1498-1502`, pre-existing) sent the
+    task back to the planner without ever incrementing `replan_count`,
+    letting an operator bypass `max_replans_per_task` entirely just by
+    answering `replan` to guidance prompts. Both `replan` paths (ordinary
+    guidance and escalation) now share one helper that increments and
+    bounds-checks `replan_count`, closing that bypass.
+
+    This adds two fields to `RunState`/`RunOptions`, which per ADR 0024
+    has no migration path -- every run state persisted before this change
+    is permanently unloadable. The three stale run states left over from
+    manual `init`-generated test projects (`test-run`, `test-run-2`) were
+    deleted as part of this change rather than left to fail confusingly
+    on the next load attempt.
 
 50. ~~**Agent-created worktrees outside the supervisor's own bookkeeping
     survive task cleanup.**~~ **Resolved as a documentation fix, not a

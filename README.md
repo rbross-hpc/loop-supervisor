@@ -118,7 +118,15 @@ parent directory with `--worktree-root`.
   starting over.
 - **`BLOCKED` / `INCOMPLETE`** (builder): the supervisor pauses, asks the
   operator for guidance, and re-invokes the builder on the same worktree.
-  Answering `replan` sends the task back to the planner instead.
+  Answering `replan` sends the task back to the planner instead. After
+  `--max-builder-guidance-attempts` consecutive non-`COMPLETE` results
+  (default 3), the supervisor stops re-invoking the builder and instead
+  escalates: answer `replan` to send the task back to the planner, or
+  `abandon` to fail the task (the worktree and branch are preserved for
+  inspection, same as any other terminal failure). An operator `replan`
+  answer, whether from ordinary guidance or from this escalation, counts
+  against `--max-replans` the same as an auditor `REPLAN` does — see
+  [ADR 0030](docs/decisions/0030-builder-guidance-circuit-breaker.md).
 - **Merge conflicts**: if a no-fast-forward merge into the integration
   branch fails, the supervisor aborts the merge (leaving the integration
   worktree untouched), preserves the task branch/worktree for diagnosis,
@@ -264,7 +272,8 @@ loop-supervisor run --project /path/to/integration/checkout
 ```
 
 Useful flags: `--worktree-root`, `--max-tasks`, `--max-revisions`,
-`--max-replans`, `--max-architect-retries`, `--role-timeout`,
+`--max-replans`, `--max-architect-retries`,
+`--max-builder-guidance-attempts`, `--role-timeout`,
 `--require-decision-approval`, `--opencode-executable`,
 `--recover-stale-lock`, and the mutually exclusive `--step`/
 `--max-steps` (bound how many phase transitions this invocation

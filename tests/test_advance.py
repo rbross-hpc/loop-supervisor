@@ -16,6 +16,7 @@ from loop_supervisor.supervisor import (
     PHASE_CLEANUP_WORKTREE,
     PHASE_CREATING_WORKTREE,
     PHASE_DONE,
+    PHASE_FAILED,
     PHASE_MERGING,
     PHASE_OPERATIONAL_FAILURE,
     PHASE_PLANNING,
@@ -165,6 +166,7 @@ def _make_options(**overrides) -> RunOptions:
         max_revisions_per_task=5,
         max_replans_per_task=3,
         max_architect_retries=3,
+        max_builder_guidance_attempts=3,
         malformed_output_retries=1,
         role_timeout=1800.0,
         worktree_root=None,
@@ -1910,3 +1912,294 @@ def test_post_transition_save_failure_after_terminal_transition_retries_phase_be
     outcome3 = supervisor.advance(state)  # planning -> done, this time saved
     assert outcome3.status == AdvanceStatus.ADVANCED
     assert state.phase == PHASE_DONE
+
+
+# -- builder guidance circuit breaker (backlog item 49) ---------------------
+
+
+def test_builder_guidance_exhaustion_escalates_without_reinvoking_builder(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [
+                _builder(status="INCOMPLETE", open_concerns=["stuck"]) for _ in range(5)
+            ],
+        }
+    )
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=ScriptedInput(["keep going", "keep going"]),
+        options=_make_options(max_builder_guidance_attempts=2),
+    )
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+
+    supervisor.advance(state)  # building (attempt 1: INCOMPLETE) -> awaiting_input
+    assert state.phase == PHASE_AWAITING_INPUT
+    assert state.pending_question["kind"] == "builder_guidance"
+    assert state.builder_guidance_count == 1
+
+    supervisor.advance(state)  # awaiting_input -> building (guidance answer)
+    supervisor.advance(state)  # building (attempt 2: INCOMPLETE) -> awaiting_input
+    assert state.phase == PHASE_AWAITING_INPUT
+    assert state.pending_question["kind"] == "builder_guidance"
+    assert state.builder_guidance_count == 2
+
+    supervisor.advance(state)  # awaiting_input -> building (guidance answer)
+    builder_calls_before = sum(1 for c in runner.calls if c[0] == "loop-builder")
+    supervisor.advance(state)  # building (attempt 3: INCOMPLETE) -> escalation
+    builder_calls_after = sum(1 for c in runner.calls if c[0] == "loop-builder")
+
+    assert state.phase == PHASE_AWAITING_INPUT
+    assert state.pending_question["kind"] == "builder_escalation"
+    assert state.builder_guidance_count == 3
+    assert builder_calls_after == builder_calls_before + 1
+
+    # A further advance() must not re-invoke the builder: it should stay
+    # parked on the escalation question until the operator answers it.
+    outcome = supervisor.advance(state)
+    assert outcome.status == AdvanceStatus.INPUT_UNAVAILABLE
+    assert state.phase == PHASE_AWAITING_INPUT
+    builder_calls_final = sum(1 for c in runner.calls if c[0] == "loop-builder")
+    assert builder_calls_final == builder_calls_after
+
+
+def test_builder_guidance_exhaustion_counts_blocked_the_same_as_incomplete(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [
+                _builder(status="INCOMPLETE", open_concerns=["stuck"]),
+                _builder(status="BLOCKED", open_concerns=["still stuck"]),
+            ],
+        }
+    )
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=ScriptedInput(["keep going"]),
+        options=_make_options(max_builder_guidance_attempts=1),
+    )
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+
+    supervisor.advance(state)  # building (attempt 1: INCOMPLETE) -> awaiting_input
+    assert state.pending_question["kind"] == "builder_guidance"
+
+    supervisor.advance(state)  # awaiting_input -> building (guidance answer)
+    supervisor.advance(state)  # building (attempt 2: BLOCKED) -> escalation
+
+    assert state.phase == PHASE_AWAITING_INPUT
+    assert state.pending_question["kind"] == "builder_escalation"
+    assert state.pending_question["context"]["status"] == "BLOCKED"
+    assert state.builder_guidance_count == 2
+
+
+def test_builder_escalation_replan_returns_to_planning_and_counts_replan(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(), _planner_complete()],
+            "loop-builder": [_builder(status="INCOMPLETE", open_concerns=["stuck"])],
+        }
+    )
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=ScriptedInput(["replan"]),
+        options=_make_options(max_builder_guidance_attempts=0),
+    )
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+    supervisor.advance(state)  # building (attempt 1: INCOMPLETE) -> escalation
+
+    assert state.phase == PHASE_AWAITING_INPUT
+    assert state.pending_question["kind"] == "builder_escalation"
+    assert state.replan_count == 0
+
+    outcome = supervisor.advance(state)  # awaiting_input -> planning
+
+    assert outcome.status == AdvanceStatus.ADVANCED
+    assert state.phase == PHASE_PLANNING
+    assert state.pending_question is None
+    assert state.builder_result is None
+    assert state.replan_count == 1
+
+
+def test_builder_escalation_abandon_fails_task_and_preserves_worktree(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="INCOMPLETE", open_concerns=["stuck"])],
+        }
+    )
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=ScriptedInput(["abandon"]),
+        options=_make_options(max_builder_guidance_attempts=0),
+    )
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+    supervisor.advance(state)  # building (attempt 1: INCOMPLETE) -> escalation
+
+    assert state.phase == PHASE_AWAITING_INPUT
+    task_worktree_path = state.task_worktree_path
+    task_branch = state.task_branch
+    assert task_worktree_path is not None
+    assert task_branch is not None
+
+    outcome = supervisor.advance(state)  # awaiting_input -> failed
+
+    assert outcome.status == AdvanceStatus.TERMINAL
+    assert state.phase == PHASE_FAILED
+    assert state.pending_question is None
+    assert state.last_error is not None
+    assert "abandoned" in state.last_error["message"]
+
+    # The task worktree and branch are left in place for manual inspection,
+    # exactly as any other terminal failure preserves them.
+    assert Path(task_worktree_path).exists()
+    assert repo.branch_exists(task_branch)
+
+    reloaded = load_state(repo.common_dir(), state.run_id)
+    assert reloaded.phase == PHASE_FAILED
+    assert reloaded.pending_question is None
+
+
+def test_builder_escalation_unrecognized_answer_reasks(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="INCOMPLETE", open_concerns=["stuck"])],
+        }
+    )
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=ScriptedInput(["banana"]),
+        options=_make_options(max_builder_guidance_attempts=0),
+    )
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+    supervisor.advance(state)  # building (attempt 1: INCOMPLETE) -> escalation
+
+    builder_calls_before = sum(1 for c in runner.calls if c[0] == "loop-builder")
+    outcome = supervisor.advance(state)  # awaiting_input, garbage answer -> re-ask
+
+    assert outcome.status == AdvanceStatus.ADVANCED
+    assert state.phase == PHASE_AWAITING_INPUT
+    assert state.pending_question["kind"] == "builder_escalation"
+    builder_calls_after = sum(1 for c in runner.calls if c[0] == "loop-builder")
+    assert builder_calls_after == builder_calls_before
+
+    reloaded = load_state(repo.common_dir(), state.run_id)
+    assert reloaded.phase == PHASE_AWAITING_INPUT
+    assert reloaded.pending_question is not None
+    assert reloaded.pending_question["kind"] == "builder_escalation"
+
+
+def test_builder_guidance_count_resets_at_task_boundary(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [
+                _planner_ready(task_id="task-1"),
+                _planner_ready(task_id="task-2"),
+                _planner_complete(),
+            ],
+            "loop-builder": [
+                _builder(status="INCOMPLETE", task_id="task-1", open_concerns=["stuck"]),
+                _builder(status="COMPLETE", task_id="task-1"),
+                _builder(status="INCOMPLETE", task_id="task-2", open_concerns=["stuck"]),
+            ],
+            "loop-auditor": [_auditor(disposition="ACCEPT", task_id="task-1")],
+        }
+    )
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=ScriptedInput(["keep going"]),
+        options=_make_options(max_builder_guidance_attempts=1),
+    )
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree (task-1)
+    supervisor.advance(state)  # creating_worktree -> building
+    supervisor.advance(state)  # building (INCOMPLETE) -> awaiting_input
+    assert state.builder_guidance_count == 1
+    supervisor.advance(state)  # awaiting_input -> building
+    supervisor.advance(state)  # building (COMPLETE) -> auditing
+    supervisor.advance(state)  # auditing (ACCEPT) -> merging
+    supervisor.advance(state)  # merging -> cleanup_worktree
+    supervisor.advance(state)  # cleanup_worktree -> cleanup_branch
+    supervisor.advance(state)  # cleanup_branch -> planning (task-1 finished)
+
+    assert state.builder_guidance_count == 0
+    assert state.accepted_task_count == 1
+
+    supervisor.advance(state)  # planning -> creating_worktree (task-2)
+    supervisor.advance(state)  # creating_worktree -> building
+    supervisor.advance(state)  # building (INCOMPLETE) -> awaiting_input
+
+    assert state.builder_guidance_count == 1
+    assert state.pending_question["kind"] == "builder_guidance"
+
+
+def test_operator_replan_from_builder_guidance_is_bounded_by_max_replans(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready() for _ in range(10)],
+            "loop-builder": [
+                _builder(status="INCOMPLETE", open_concerns=["stuck"]) for _ in range(10)
+            ],
+        }
+    )
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=ScriptedInput(["replan", "replan", "replan"]),
+        # Set high enough that guidance never escalates on its own -- this
+        # test is specifically about the operator-initiated replan bypass,
+        # not the escalation path.
+        options=_make_options(max_builder_guidance_attempts=10, max_replans_per_task=2),
+    )
+    state = supervisor.start_new_run()
+
+    with pytest.raises(LoopError, match="replans"):
+        supervisor.run(state)
+
+    assert state.phase == PHASE_FAILED
+    assert state.pending_question is None
+    assert state.replan_count == 3
+
+
+def test_builder_escalation_state_round_trips_through_save_load(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="INCOMPLETE", open_concerns=["stuck"])],
+        }
+    )
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=ScriptedInput([]),
+        options=_make_options(max_builder_guidance_attempts=0),
+    )
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+    supervisor.advance(state)  # building (attempt 1: INCOMPLETE) -> escalation
+
+    assert state.phase == PHASE_AWAITING_INPUT
+    assert state.pending_question["kind"] == "builder_escalation"
+
+    reloaded = load_state(repo.common_dir(), state.run_id)
+    assert reloaded.phase == PHASE_AWAITING_INPUT
+    assert reloaded.pending_question == state.pending_question
+    assert reloaded.builder_guidance_count == state.builder_guidance_count
+    assert reloaded.to_dict() == state.to_dict()

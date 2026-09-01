@@ -168,6 +168,7 @@ _DEFAULT_OPTIONS = RunOptions(
     max_revisions_per_task=5,
     max_replans_per_task=3,
     max_architect_retries=3,
+    max_builder_guidance_attempts=3,
     malformed_output_retries=1,
     role_timeout=1800.0,
     worktree_root=None,
@@ -698,7 +699,7 @@ class RunScreen(Screen):
         for btn in (submit, replan, approve, reject, retry, ret):
             btn.display = False
 
-        if kind == "builder_guidance":
+        if kind in ("builder_guidance", "builder_escalation"):
             submit.display = True
             replan.display = True
         elif kind == "architect_input":

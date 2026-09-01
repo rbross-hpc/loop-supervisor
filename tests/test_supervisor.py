@@ -178,6 +178,9 @@ def _make_options(**overrides):
         max_revisions_per_task=overrides.get("max_revisions_per_task", base.max_revisions_per_task),
         max_replans_per_task=overrides.get("max_replans_per_task", base.max_replans_per_task),
         max_architect_retries=overrides.get("max_architect_retries", base.max_architect_retries),
+        max_builder_guidance_attempts=overrides.get(
+            "max_builder_guidance_attempts", base.max_builder_guidance_attempts
+        ),
         malformed_output_retries=overrides.get(
             "malformed_output_retries", base.malformed_output_retries
         ),
@@ -210,6 +213,7 @@ def _make_supervisor(
                 max_revisions_per_task=limits.max_revisions_per_task,
                 max_replans_per_task=limits.max_replans_per_task,
                 max_architect_retries=limits.max_architect_retries,
+                max_builder_guidance_attempts=limits.max_builder_guidance_attempts,
                 malformed_output_retries=limits.malformed_output_retries,
                 role_timeout=limits.role_timeout,
             )

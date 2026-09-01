@@ -82,6 +82,7 @@ def _options() -> RunOptions:
         max_revisions_per_task=1,
         max_replans_per_task=1,
         max_architect_retries=1,
+        max_builder_guidance_attempts=1,
         malformed_output_retries=0,
         role_timeout=30.0,
         worktree_root=None,
