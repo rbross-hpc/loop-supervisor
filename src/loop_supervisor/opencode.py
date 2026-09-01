@@ -19,9 +19,10 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypeVar
 
 import httpx
 
@@ -333,6 +334,47 @@ def _start_bounded_close(client: httpx.Client) -> _BoundedCloseAttempt | BaseExc
             return attempt
         return exc
     return attempt
+
+
+T = TypeVar("T")
+
+
+def _run_with_deadline(
+    operation: Callable[[], T],
+    *,
+    deadline: float,
+    timeout_error: PhaseTimeoutError,
+) -> T:
+    """Run a blocking HTTP operation without letting inactivity-based
+    transport timeouts extend its absolute monotonic deadline.
+
+    httpx's synchronous API has no wall-clock timeout: each arriving byte
+    resets its read timeout. The daemon worker keeps that blocking I/O off
+    the caller thread, while the caller waits only until ``deadline``. The
+    request-local client's bounded close, performed by the caller's existing
+    error path, then interrupts the transport when possible; the daemon
+    ownership ensures an uncooperative transport cannot hold up the role.
+    """
+    done = threading.Event()
+    result: list[T] = []
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            result.append(operation())
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller thread
+            errors.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=_run, name="opencode-http-request", daemon=True)
+    worker.start()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not done.wait(timeout=remaining):
+        raise timeout_error
+    if errors:
+        raise errors[0]
+    return result[0]
 
 
 def _safe_exception_text(error: BaseException) -> str:
@@ -1168,14 +1210,24 @@ class OpenCodeServer:
         _raise_for_status(response, "health check")
         return _decode_json_object(response, "health check")
 
-    def create_session(self, directory: Path, *, title: str, timeout: float | None = None) -> str:
+    def create_session(
+        self,
+        directory: Path,
+        *,
+        title: str,
+        timeout: float | None = None,
+        deadline: float | None = None,
+    ) -> str:
         """Create a session, bounded by `timeout` (falls back to the
         long-lived control client's own timeout if not given).
 
         Uses a request-local client when `timeout` is given rather than
         the shared long-lived control client, so a hung `/session` request
         can be independently bounded per invocation instead of relying on
-        the control client's timeout=None default. Every ordinary
+        the control client's timeout=None default. When `deadline` is given,
+        it additionally enforces that absolute monotonic deadline even if a
+        response trickles bytes frequently enough to avoid httpx's inactivity
+        timeout. Every ordinary
         transport failure is translated to PhaseTimeoutError or
         AgentInvocationError, matching send_prompt(), rather than
         propagating a raw httpx exception.
@@ -1200,11 +1252,24 @@ class OpenCodeServer:
         # not held in an intermediate variable.
         try:
             try:
-                response = client.post(
-                    "/session",
-                    params={"directory": str(directory)},
-                    json={"title": title},
-                )
+
+                def request() -> httpx.Response:
+                    return client.post(
+                        "/session",
+                        params={"directory": str(directory)},
+                        json={"title": title},
+                    )
+
+                if deadline is None:
+                    response = request()
+                else:
+                    response = _run_with_deadline(
+                        request,
+                        deadline=deadline,
+                        timeout_error=PhaseTimeoutError(
+                            f"creating session for {title!r} exceeded its absolute deadline"
+                        ),
+                    )
             except httpx.TimeoutException as exc:
                 raise PhaseTimeoutError(
                     f"creating session for {title!r} did not respond within "
@@ -1240,6 +1305,7 @@ class OpenCodeServer:
         prompt: str,
         json_schema: dict[str, Any] | None = None,
         timeout: float = 1800.0,
+        deadline: float | None = None,
     ) -> str:
         body: dict[str, Any] = {
             "agent": agent,
@@ -1262,11 +1328,24 @@ class OpenCodeServer:
         # trigger a best-effort abort — see _abort_session_best_effort).
         try:
             try:
-                response = client.post(
-                    f"/session/{session_id}/message",
-                    params={"directory": str(directory)},
-                    json=body,
-                )
+
+                def request() -> httpx.Response:
+                    return client.post(
+                        f"/session/{session_id}/message",
+                        params={"directory": str(directory)},
+                        json=body,
+                    )
+
+                if deadline is None:
+                    response = request()
+                else:
+                    response = _run_with_deadline(
+                        request,
+                        deadline=deadline,
+                        timeout_error=PhaseTimeoutError(
+                            f"agent {agent!r} exceeded its absolute deadline"
+                        ),
+                    )
             except httpx.TimeoutException as exc:
                 raise PhaseTimeoutError(
                     f"agent {agent!r} did not respond within {timeout}s"
@@ -1382,10 +1461,17 @@ class OpenCodeServer:
         be bounded by role_timeout at all, since create_session() used to
         run on the long-lived control client with timeout=None. Session
         creation is charged against the same deadline as the prompt, and
-        the prompt receives whatever budget remains.
+        the prompt receives whatever budget remains. Both requests also
+        run behind the same absolute monotonic deadline, independent of
+        httpx's per-operation inactivity timeout semantics.
         """
         deadline = time.monotonic() + timeout
-        session_id = self.create_session(directory, title=f"loop:{agent}", timeout=timeout)
+        session_id = self.create_session(
+            directory,
+            title=f"loop:{agent}",
+            timeout=timeout,
+            deadline=deadline,
+        )
 
         ref = InvocationRef(
             session_id=session_id,
@@ -1412,6 +1498,7 @@ class OpenCodeServer:
                 prompt=prompt,
                 json_schema=json_schema,
                 timeout=remaining,
+                deadline=deadline,
             )
         except PhaseTimeoutError as exc:
             error = exc

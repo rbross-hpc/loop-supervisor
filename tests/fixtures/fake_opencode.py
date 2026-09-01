@@ -93,13 +93,35 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         pass
 
-    def _send_json(self, status: int, payload: object) -> None:
+    def _send_json(
+        self,
+        status: int,
+        payload: object,
+        *,
+        trickle_interval: float = 0.0,
+        completion_marker: str | None = None,
+    ) -> None:
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if trickle_interval <= 0:
+            self.wfile.write(body)
+            return
+
+        import time as _time
+
+        try:
+            for byte in body:
+                self.wfile.write(bytes((byte,)))
+                self.wfile.flush()
+                _time.sleep(trickle_interval)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        if completion_marker is not None:
+            with open(completion_marker, "w") as marker:
+                marker.write("complete")
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path.startswith("/global/health"):
@@ -208,12 +230,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             raw_response = os.environ.get("FAKE_OPENCODE_RESPONSE", "{}")
+            message_trickle = float(os.environ.get("FAKE_OPENCODE_MESSAGE_TRICKLE_INTERVAL", "0"))
             self._send_json(
                 200,
                 {
                     "info": {"structured_output": json.loads(raw_response)},
                     "parts": [],
                 },
+                trickle_interval=message_trickle,
+                completion_marker=os.environ.get("FAKE_OPENCODE_MESSAGE_COMPLETION_MARKER"),
             )
             return
 
@@ -297,7 +322,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"id": 12345})
                 return
 
-            self._send_json(200, {"id": "ses_fake123"})
+            session_trickle = float(os.environ.get("FAKE_OPENCODE_SESSION_TRICKLE_INTERVAL", "0"))
+            self._send_json(
+                200,
+                {"id": "ses_fake123"},
+                trickle_interval=session_trickle,
+                completion_marker=os.environ.get("FAKE_OPENCODE_SESSION_COMPLETION_MARKER"),
+            )
             return
 
         self._send_json(404, {"error": "not found"})
