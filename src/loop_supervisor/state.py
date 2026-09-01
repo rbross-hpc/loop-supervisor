@@ -95,6 +95,7 @@ class RunOptions:
     max_revisions_per_task: int
     max_replans_per_task: int
     max_architect_retries: int
+    max_builder_guidance_attempts: int
     malformed_output_retries: int
     role_timeout: float
     worktree_root: str | None
@@ -130,6 +131,7 @@ class RunOptions:
             "max_revisions_per_task",
             "max_replans_per_task",
             "max_architect_retries",
+            "max_builder_guidance_attempts",
             "malformed_output_retries",
         ):
             value = data[name]
@@ -350,6 +352,7 @@ class RunState:
     revision_count: int = 0
     replan_count: int = 0
     architect_retry_count: int = 0
+    builder_guidance_count: int = 0
     pending_question: dict[str, Any] | None = None
     last_task_head: str | None = None
     created_at: str = field(default_factory=_now)
@@ -453,6 +456,7 @@ def _validate_scalar_types(data: dict[str, Any]) -> None:
         "revision_count",
         "replan_count",
         "architect_retry_count",
+        "builder_guidance_count",
     ):
         value = data.get(name)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -627,6 +631,7 @@ def _validate_pending_question(data: dict[str, Any]) -> None:
         "architect_input": ({"question"}, None),
         "decision_approval": ({"title", "decision"}, None),
         "builder_guidance": ({"status"}, {"BLOCKED", "INCOMPLETE"}),
+        "builder_escalation": ({"status"}, {"BLOCKED", "INCOMPLETE"}),
     }
     if kind not in contexts:
         raise StateError(f"state field 'pending_question.kind' is unknown: {kind!r}")
@@ -835,7 +840,7 @@ def _validate_pending_context_matches_source(
 ) -> None:
     kind = pending["kind"]
     context = pending["context"]
-    if kind == "builder_guidance":
+    if kind in ("builder_guidance", "builder_escalation"):
         builder = _require_result(data, phase, "builder_result")
         if context["status"] != builder["status"]:
             raise StateError(
@@ -987,12 +992,11 @@ def _validate_effective_phase_requirements(data: dict[str, Any], phase: str) -> 
         if not isinstance(pending, dict):
             raise StateError("phase 'awaiting_input' requires a valid pending_question")
         kind = pending["kind"]
-        if kind == "builder_guidance":
+        if kind in ("builder_guidance", "builder_escalation"):
             builder = _require_result(data, phase, "builder_result")
             if builder["status"] not in ("BLOCKED", "INCOMPLETE"):
                 raise StateError(
-                    "phase 'awaiting_input' builder_guidance requires a blocked or incomplete "
-                    "builder_result"
+                    f"phase 'awaiting_input' {kind} requires a blocked or incomplete builder_result"
                 )
         elif kind == "architect_input":
             architect = _require_result(data, phase, "architect_result")

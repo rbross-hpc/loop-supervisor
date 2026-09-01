@@ -132,6 +132,7 @@ class Limits:
     max_revisions_per_task: int = 5
     max_replans_per_task: int = 3
     max_architect_retries: int = 3
+    max_builder_guidance_attempts: int = 3
     malformed_output_retries: int = 1
     role_timeout: float = 1800.0
 
@@ -143,6 +144,7 @@ def _default_run_options() -> RunOptions:
         max_revisions_per_task=defaults.max_revisions_per_task,
         max_replans_per_task=defaults.max_replans_per_task,
         max_architect_retries=defaults.max_architect_retries,
+        max_builder_guidance_attempts=defaults.max_builder_guidance_attempts,
         malformed_output_retries=defaults.malformed_output_retries,
         role_timeout=defaults.role_timeout,
         worktree_root=None,
@@ -201,6 +203,7 @@ class Supervisor:
             max_revisions_per_task=self.options.max_revisions_per_task,
             max_replans_per_task=self.options.max_replans_per_task,
             max_architect_retries=self.options.max_architect_retries,
+            max_builder_guidance_attempts=self.options.max_builder_guidance_attempts,
             malformed_output_retries=self.options.malformed_output_retries,
             role_timeout=self.options.role_timeout,
         )
@@ -867,6 +870,7 @@ class Supervisor:
             return
 
         state.revision_count = 0
+        state.builder_guidance_count = 0
 
         if result.decision_required:
             state.decision_request = DecisionRequest(
@@ -955,6 +959,7 @@ class Supervisor:
         state.pending_worktree_base = None
         self._active_worktree = worktree
         state.revision_count = 0
+        state.builder_guidance_count = 0
 
         if planner.decision_required:
             state.decision_request = DecisionRequest(
@@ -1224,6 +1229,23 @@ class Supervisor:
             state.phase = PHASE_VERIFYING if self.options.verify_commands else PHASE_AUDITING
             return
 
+        state.builder_guidance_count += 1
+        if state.builder_guidance_count > self.limits.max_builder_guidance_attempts:
+            state.pending_question = {
+                "kind": "builder_escalation",
+                "message": (
+                    f"Builder reported {result.status.value} "
+                    f"{state.builder_guidance_count} times in a row, exceeding the "
+                    f"{self.limits.max_builder_guidance_attempts}-attempt guidance limit. "
+                    f"Concerns: {'; '.join(result.open_concerns) or '(none stated)'}\n"
+                    "Type 'replan' to send back to the planner, or 'abandon' to fail "
+                    "this task."
+                ),
+                "context": {"status": result.status.value},
+            }
+            state.phase = PHASE_AWAITING_INPUT
+            return
+
         state.pending_question = {
             "kind": "builder_guidance",
             "message": (
@@ -1467,6 +1489,7 @@ class Supervisor:
         state.revision_count = 0
         state.replan_count = 0
         state.architect_retry_count = 0
+        state.builder_guidance_count = 0
         state.planner_result = None
         state.architect_result = None
         state.builder_result = None
@@ -1477,6 +1500,35 @@ class Supervisor:
         state.merge_task_head = None
         state.merge_commit = None
         self._active_worktree = None
+        state.phase = PHASE_PLANNING
+
+    def _replan_from_awaiting_input(self, state: RunState) -> None:
+        """Send a task back to the planner in response to an operator's
+        'replan' answer to builder guidance or a builder escalation.
+
+        Bounds this against `max_replans_per_task` just like an auditor
+        REPLAN disposition (`_do_auditing`): without this check, an
+        operator could bypass the replan limit entirely simply by
+        answering 'replan' to guidance prompts instead of letting the
+        auditor decide, defeating the limit's purpose.
+        """
+        state.replan_count += 1
+        if state.replan_count > self.limits.max_replans_per_task:
+            # Clear the pending question before raising: a terminal
+            # 'failed' state may only retain an answered architect_input
+            # or builder_guidance question (_validate_pending_question_phase),
+            # and the failed_phase recorded here is 'awaiting_input', which
+            # is not among those -- an operator-initiated replan/limit
+            # question left in place would make the resulting failed state
+            # unloadable.
+            state.pending_question = None
+            raise LoopError(
+                f"task {self._require_worktree(state).original_task_id!r} exceeded "
+                f"{self.limits.max_replans_per_task} replans"
+            )
+        state.pending_question = None
+        state.builder_result = None
+        state.verification_result = None
         state.phase = PHASE_PLANNING
 
     # -- pending input resolution --------------------------------------------
@@ -1496,13 +1548,31 @@ class Supervisor:
 
         if pending["kind"] == "builder_guidance":
             if answer.strip().lower() == "replan":
-                state.pending_question = None
-                state.builder_result = None
-                state.verification_result = None
-                state.phase = PHASE_PLANNING
+                self._replan_from_awaiting_input(state)
             else:
                 state.pending_question = pending
                 state.phase = PHASE_BUILDING
+        elif pending["kind"] == "builder_escalation":
+            normalized = answer.strip().lower()
+            if normalized == "replan":
+                self._replan_from_awaiting_input(state)
+            elif normalized == "abandon":
+                state.pending_question = None
+                raise LoopError(
+                    f"task {self._require_worktree(state).original_task_id!r} was "
+                    f"abandoned after exceeding {self.limits.max_builder_guidance_attempts} "
+                    "builder guidance attempts"
+                )
+            else:
+                state.pending_question = {
+                    "kind": "builder_escalation",
+                    "message": (
+                        "Unrecognized answer. Type 'replan' to send back to the "
+                        "planner, or 'abandon' to fail this task."
+                    ),
+                    "context": pending["context"],
+                }
+                state.phase = PHASE_AWAITING_INPUT
         elif pending["kind"] == "architect_input":
             state.pending_question = pending
             state.phase = PHASE_ARCHITECTING

@@ -230,6 +230,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "max_revisions_per_task": args.max_revisions,
                 "max_replans_per_task": args.max_replans,
                 "max_architect_retries": args.max_architect_retries,
+                "max_builder_guidance_attempts": args.max_builder_guidance_attempts,
                 "malformed_output_retries": 1,
                 "role_timeout": args.role_timeout,
                 "worktree_root": str(Path(args.worktree_root).resolve())
@@ -509,6 +510,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--max-revisions", type=int, default=5)
     run_parser.add_argument("--max-replans", type=int, default=3)
     run_parser.add_argument("--max-architect-retries", type=int, default=3)
+    run_parser.add_argument("--max-builder-guidance-attempts", type=int, default=3)
     run_parser.add_argument("--role-timeout", type=float, default=1800.0)
     run_parser.add_argument(
         "--recover-stale-lock",
