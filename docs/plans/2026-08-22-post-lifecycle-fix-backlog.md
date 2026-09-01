@@ -1290,9 +1290,11 @@ after the fact get written down.
     `RunScreen.action_request_shutdown()` now returns an immutable
     generation/event handle for the existing in-flight attempt or a newly
     created attempt, and returns `None` explicitly when cleanup is already
-    confirmed clean. Attempt selection and worker registration are serialized
-    under `_shutdown_attempt_lock`, preserving the no-overlap guarantee. The
-    cleanup coordinator awaits only the returned handle and no longer gates a
+    confirmed clean with no attempt still in flight. In-flight selection takes
+    precedence because cleanup can be marked clean before its worker completes.
+    Attempt selection and worker registration are serialized under
+    `_shutdown_attempt_lock`, preserving the no-overlap guarantee. The cleanup
+    coordinator awaits only the returned handle and no longer gates a
     reusable event wait with a separate `shutdown_clean` read; clean
     failed-initialization cleanup therefore proceeds directly, while exit
     requested during in-progress failed-initialization cleanup waits for the
@@ -1300,10 +1302,14 @@ after the fact get written down.
     the same request path and safely no-op after cleanup is already clean.
 
     Regression coverage in `tests/test_tui_app.py` proves consecutive attempt
-    generations have distinct events and cannot cross-signal, and that app exit
-    during blocked failed-initialization cleanup does not proceed until its
-    actual shutdown attempt completes. Both tests were verified against the
-    exact pre-fix source from commit
+    generations have distinct events and cannot cross-signal, that a request
+    made after cleanup becomes clean but before its worker completes receives
+    and waits for that same in-flight handle, and that app exit during blocked
+    failed-initialization cleanup does not proceed until its actual shutdown
+    attempt completes. The clean-before-worker-completion race test was verified
+    failing against exact task commit `3a6e8c98de6bf389f4c19cf41f40a1c81c0cfbbd`
+    after a probe confirmed the clean-first selection order. The original two
+    tests were verified against the exact pre-fix source from commit
     `a048eaded3c75c2649776e77991c0e22dea6489e`: the generation test failed
     because the old request API returned no handle, and the failed-init/exit
     test remained blocked until an external timeout because the old reusable

@@ -1190,6 +1190,61 @@ async def test_shutdown_attempt_generations_do_not_cross_signal(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_clean_in_flight_shutdown_request_returns_same_incomplete_attempt(
+    tmp_path, monkeypatch
+):
+    """Cleanup becoming clean does not finish its worker or its attempt.
+
+    A concurrent requester in that window must receive and await the existing
+    handle rather than treating the still-running worker as already complete.
+    """
+    screen = RunScreen(tmp_path, run_id=None)
+    screen._init_done_event.set()
+    cleanup_marked_clean = threading.Event()
+    release_worker = threading.Event()
+    worker_calls = []
+
+    class _WorkerCapturingApp:
+        def run_worker(self, callable_, **_kwargs):
+            worker_calls.append(callable_)
+
+        def finalize_run_screen(self, _screen):
+            pass
+
+    app = _WorkerCapturingApp()
+    monkeypatch.setattr(screen, "_app_ref", app)
+
+    def _clean_then_pause() -> None:
+        screen._cleanup_resources()
+        cleanup_marked_clean.set()
+        release_worker.wait(timeout=10)
+
+    monkeypatch.setattr(screen, "_do_shutdown", _clean_then_pause)
+
+    first = screen.action_request_shutdown()
+    assert first is not None
+    assert len(worker_calls) == 1
+    worker = threading.Thread(target=worker_calls[0])
+    worker.start()
+    assert cleanup_marked_clean.wait(timeout=2)
+    assert screen.shutdown_clean
+    assert not first.completion.is_set()
+
+    concurrent = screen.action_request_shutdown()
+    assert concurrent is not None
+    assert concurrent is first
+    concurrent_wait = asyncio.create_task(screen.await_shutdown_complete(concurrent))
+    await asyncio.sleep(0.1)
+    assert not concurrent_wait.done()
+
+    release_worker.set()
+    await asyncio.wait_for(concurrent_wait, timeout=2)
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert first.completion.is_set()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_shutdown_requests_do_not_start_overlapping_workers(tmp_path, monkeypatch):
     """Triggering shutdown from multiple call sites in quick succession
     while a slow stop() is in flight must not start a second overlapping

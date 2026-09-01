@@ -942,11 +942,11 @@ class RunScreen(Screen):
     def _maybe_start_shutdown_attempt(self) -> _ShutdownAttempt | None:
         """Return an in-flight/new cleanup attempt, or ``None`` if clean."""
         with self._shutdown_attempt_lock:
-            if self._shutdown_clean:
-                return None
             if self._shutdown_in_progress:
                 assert self._shutdown_attempt is not None
                 return self._shutdown_attempt
+            if self._shutdown_clean:
+                return None
             self._shutdown_generation += 1
             attempt = _ShutdownAttempt(self._shutdown_generation, threading.Event())
             self._shutdown_attempt = attempt
