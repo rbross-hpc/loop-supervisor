@@ -228,6 +228,10 @@ def _make_cleanup_state(run_id: str, phase: str, **overrides) -> RunState:
         task_base_commit="abc123",
         task_expected_head="def456",
         task_status_snapshot="",
+        planner_result=_planner_result(),
+        builder_result=_builder_result(),
+        auditor_result=_auditor_result(),
+        last_task_head="def456",
         merge_pre_head="abc123",
         merge_task_head="def456",
         merge_commit="ghi789",
@@ -288,9 +292,9 @@ def test_operational_failure_validates_last_error_schema(tmp_path):
     record = OperationalErrorRecord(
         error_id=uuid.uuid4().hex[:12],
         kind="git",
-        operation="merging",
-        failed_phase="merging",
-        retry_phase="merging",
+        operation="planning",
+        failed_phase="planning",
+        retry_phase="planning",
         exception_type="GitError",
         message="conflict",
         retryable=True,
@@ -862,7 +866,12 @@ def test_load_rejects_active_task_without_status_snapshot(tmp_path):
 
 def test_load_accepts_active_task_with_empty_status_snapshot(tmp_path):
     run_id = new_run_id()
-    _write_active_task(tmp_path, run_id, task_status_snapshot="")
+    _write_active_task(
+        tmp_path,
+        run_id,
+        task_status_snapshot="",
+        planner_result=_planner_result(),
+    )
     loaded = load_state(tmp_path, run_id)
     assert loaded.task_status_snapshot == ""
 
@@ -906,3 +915,318 @@ def test_failed_phase_requires_error_on_load(tmp_path):
     (path / f"{state.run_id}.json").write_text(json.dumps(data))
     with pytest.raises(StateError):
         load_state(tmp_path, state.run_id)
+
+
+# -- complete persisted-state trust boundary ---------------------------------
+
+
+def _planner_result(**overrides):
+    result = {
+        "status": "READY",
+        "task_id": "task-1",
+        "objective": "Implement the task",
+        "rationale": "It is next",
+        "acceptance_criteria": ["It works"],
+        "relevant_files": [],
+        "design_questions": [],
+        "decision_required": False,
+        "decision_question": None,
+        "decision_rationale": None,
+    }
+    result.update(overrides)
+    return result
+
+
+def _builder_result(**overrides):
+    result = {
+        "task_id": "task-1",
+        "objective": "Implement the task",
+        "status": "COMPLETE",
+        "implementation_summary": "Implemented it",
+        "implementation_strategy": [],
+        "tests_run": ["pytest"],
+        "test_results": ["passed"],
+        "files_changed": ["src/example.py"],
+        "commit": "def456",
+        "open_concerns": [],
+    }
+    result.update(overrides)
+    return result
+
+
+def _auditor_result(**overrides):
+    result = {
+        "task_id": "task-1",
+        "objective": "Implement the task",
+        "disposition": "ACCEPT",
+        "findings": [],
+        "required_changes": [],
+        "design_observations": [],
+        "decision_required": False,
+        "decision_question": None,
+        "decision_rationale": None,
+    }
+    result.update(overrides)
+    return result
+
+
+def _architect_result(**overrides):
+    result = {
+        "status": "DECIDED",
+        "question": "Which design?",
+        "rationale": "Use the durable design",
+        "adr": {
+            "title": "Durable design",
+            "context": "A choice is needed",
+            "decision": "Use the durable design",
+            "consequences": ["State remains resumable"],
+        },
+        "input_request": None,
+    }
+    result.update(overrides)
+    return result
+
+
+def _active_state_data(*, phase="building", **overrides):
+    data = _make_state(new_run_id(), phase=phase).to_dict()
+    data.update(
+        original_task_id="task-1",
+        task_worktree_path="/tmp/wt/task-1",
+        task_branch="loop/task-1",
+        task_base_commit="abc123",
+        task_expected_head="def456",
+        task_status_snapshot="",
+        planner_result=_planner_result(),
+    )
+    data.update(overrides)
+    return data
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("planner_result", {"status": "READY"}, "planner_result"),
+        ("architect_result", {"status": "DECIDED"}, "architect_result"),
+        ("builder_result", _builder_result(unexpected=True), "builder_result"),
+        ("auditor_result", _auditor_result(disposition="REVISE"), "auditor_result"),
+    ],
+)
+def test_from_dict_rejects_malformed_present_role_result(field, value, match):
+    data = _active_state_data()
+    data[field] = value
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        (lambda result: result.update(extra="nope"), "verification_result"),
+        (lambda result: result.update(ok=1), "verification_result.*ok"),
+        (lambda result: result.update(commands="pytest"), "verification_result.*commands"),
+        (lambda result: result["commands"][0].update(duration=-0.1), "duration"),
+        (lambda result: result["commands"][0].update(duration=float("nan")), "duration"),
+        (lambda result: result["commands"][0].update(timed_out=True), "timed_out"),
+        (
+            lambda result: result["commands"][0].update(timed_out=True, returncode=1, ok=False),
+            "returncode",
+        ),
+        (lambda result: result["commands"][0].update(ok=False), "command.*ok"),
+        (lambda result: result.update(ok=False), "aggregate.*ok"),
+    ],
+)
+def test_from_dict_rejects_malformed_verification_result(mutation, match):
+    result = {
+        "ok": True,
+        "commands": [
+            {
+                "command": "pytest",
+                "ok": True,
+                "returncode": 0,
+                "timed_out": False,
+                "duration": 1.5,
+                "output_path": "/repo/.git/loop-supervisor/verification/run/abc/01.log",
+                "summary": "passed",
+            }
+        ],
+    }
+    mutation(result)
+    data = _active_state_data(
+        phase="auditing",
+        builder_result=_builder_result(),
+        last_task_head="def456",
+        verification_result=result,
+    )
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "pending,match",
+    [
+        ({"kind": "unknown", "message": "Question", "context": {}}, "pending_question"),
+        (
+            {"kind": "architect_input", "message": "Question", "context": {}},
+            "pending_question.*context",
+        ),
+        (
+            {
+                "kind": "builder_guidance",
+                "message": "Question",
+                "context": {"status": "COMPLETE"},
+            },
+            "pending_question.*status",
+        ),
+        (
+            {
+                "kind": "decision_approval",
+                "message": "Question",
+                "context": {"title": "Title", "decision": "Decision"},
+                "answer": 1,
+            },
+            "pending_question.*answer",
+        ),
+    ],
+)
+def test_from_dict_rejects_malformed_pending_question(pending, match):
+    data = _active_state_data(pending_question=pending)
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+def test_awaiting_input_requires_pending_question():
+    data = _active_state_data(phase="awaiting_input", pending_question=None)
+
+    with pytest.raises(StateError, match="awaiting_input.*pending_question"):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize("phase", ["architecting", "building"])
+def test_answered_guidance_remains_loadable_during_role_retry(phase):
+    data = _active_state_data(
+        phase=phase,
+        planner_result=(
+            _planner_result(
+                decision_required=True,
+                decision_question="Which design?",
+                decision_rationale="Ambiguous",
+            )
+            if phase == "architecting"
+            else _planner_result()
+        ),
+        decision_request=(
+            {"origin": "planner", "question": "Which design?", "rationale": "Ambiguous"}
+            if phase == "architecting"
+            else None
+        ),
+        pending_question=(
+            {
+                "kind": "architect_input",
+                "message": "Please clarify",
+                "context": {"question": "Which design?"},
+                "answer": "Use option A",
+            }
+            if phase == "architecting"
+            else {
+                "kind": "builder_guidance",
+                "message": "Please clarify",
+                "context": {"status": "BLOCKED"},
+                "answer": "Continue with the fallback",
+            }
+        ),
+    )
+
+    loaded = RunState.from_dict(data)
+    assert loaded.phase == phase
+    assert loaded.pending_question is not None
+    assert isinstance(loaded.pending_question["answer"], str)
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("created_at", "not-a-timestamp", "created_at"),
+        ("created_at", "2026-01-01T00:00:00", "created_at.*timezone"),
+        ("updated_at", "2025-12-31T23:59:59+00:00", "updated_at.*precede"),
+    ],
+)
+def test_from_dict_rejects_invalid_run_timestamps(field, value, match):
+    data = _make_state(new_run_id()).to_dict()
+    data["created_at"] = "2026-01-01T00:00:00+00:00"
+    data["updated_at"] = "2026-01-01T00:00:01+00:00"
+    data[field] = value
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "phase,overrides,match",
+    [
+        ("building", {"planner_result": None}, "building.*planner_result"),
+        ("verifying", {"builder_result": None}, "verifying.*builder_result"),
+        ("auditing", {"builder_result": None}, "auditing.*builder_result"),
+        ("merging", {"auditor_result": None}, "merging.*auditor_result"),
+        (
+            "building",
+            {"builder_result": _builder_result(task_id="other-task")},
+            "builder_result.*task_id",
+        ),
+        (
+            "merging",
+            {
+                "builder_result": _builder_result(),
+                "auditor_result": _auditor_result(task_id="other-task"),
+                "merge_pre_head": "abc123",
+                "merge_task_head": "def456",
+            },
+            "auditor_result.*task_id",
+        ),
+    ],
+)
+def test_from_dict_rejects_impossible_phase_result_relationships(phase, overrides, match):
+    base: dict[str, Any] = (
+        {"last_task_head": "def456"} if phase in {"verifying", "auditing", "merging"} else {}
+    )
+    if phase == "merging":
+        base.update(
+            builder_result=_builder_result(),
+            merge_pre_head="abc123",
+            merge_task_head="def456",
+        )
+    base.update(overrides)
+    data = _active_state_data(phase=phase, **base)
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+def test_operational_failure_applies_retry_phase_prerequisites():
+    data = _active_state_data(
+        phase="operational_failure",
+        planner_result=None,
+        last_error=_base_error_record(
+            operation="building",
+            failed_phase="building",
+            retry_phase="building",
+            requires_repair=False,
+        ),
+    )
+
+    with pytest.raises(StateError, match="building.*planner_result"):
+        RunState.from_dict(data)
+
+
+def test_historical_replan_auditor_result_may_differ_from_new_planner_task():
+    data = _active_state_data(
+        phase="building",
+        planner_result=_planner_result(task_id="task-2"),
+        auditor_result=_auditor_result(task_id="task-1", disposition="REPLAN"),
+    )
+
+    loaded = RunState.from_dict(data)
+    assert loaded.auditor_result is not None
+    assert loaded.auditor_result["task_id"] == "task-1"

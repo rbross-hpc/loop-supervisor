@@ -341,12 +341,34 @@ after the fact get written down.
    accept`, a round-trip check that anything `cmd_run` builds
    successfully is also accepted by `from_dict()`).
 
-9. **Persisted nested role results, pending questions, and
-   phase/result relationships are not fully validated.**
-   `src/loop_supervisor/state.py:579-655`.
-   Deep/cross-field validation (nested role results, pending-question
-   shape, timestamp ordering, phase-vs-result consistency) is incomplete
-   compared to the flat field/type checks already in place.
+9. ~~**Persisted nested role results, pending questions, and
+   phase/result relationships are not fully validated.**~~ **Resolved.**
+   `RunState.from_dict()` in `src/loop_supervisor/state.py` now treats every
+   nested persisted value as untrusted: present planner, architect, builder,
+   and auditor dictionaries are checked with their existing strict Pydantic
+   contracts and normalized to field-specific `StateError`s; verification
+   summaries enforce an exact aggregate/per-command shape, scalar types,
+   finite non-negative durations, timeout/return-code semantics, and derived
+   `ok` consistency; pending questions enforce the three supported kinds,
+   exact kind-specific context, and optional string answers; and run timestamps
+   must be timezone-aware ISO-8601 values in nondecreasing order.
+
+   Conservative effective-phase checks now require the prerequisites needed
+   for safe resume (including task identity, current planner/builder/auditor
+   results, merge intent, decision provenance, and `last_task_head`) and apply
+   the same checks through an `operational_failure` record's `retry_phase`.
+   Builder/current-planner and non-REPLAN auditor/current-planner task IDs must
+   agree, architect answers must match their durable decision request, and
+   direct contradictions are rejected. Intentionally historical results remain
+   legal: in particular a REPLAN auditor result may describe the prior task
+   while a replacement planner result scopes the next attempt, and answered
+   architect/builder guidance remains loadable during the corresponding retry.
+
+   Regression coverage is in `tests/test_state.py`'s complete persisted-state
+   trust-boundary section, supplemented by the normal lifecycle reload tests in
+   `tests/test_advance.py`. The new rejection tests were run against the actual
+   pre-change implementation first and produced 28 expected failures before
+   the validation was added.
 
 10. ~~Non-`FileNotFoundError` spawn failures need normalization.~~
     **Already resolved; this backlog had not caught up.**

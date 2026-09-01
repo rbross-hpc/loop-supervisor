@@ -18,6 +18,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ValidationError
+
+from .contracts import ArchitectResult, AuditorResult, BuilderResult, PlannerResult
 from .phases import (
     ALL_PHASES,
     PHASE_OPERATIONAL_FAILURE,
@@ -206,6 +209,9 @@ class DecisionRequest:
             raise StateError(f"decision request is missing required fields: {sorted(missing)}")
         if data["origin"] not in ("planner", "auditor"):
             raise StateError(f"decision request has invalid origin: {data['origin']!r}")
+        for name in ("question", "rationale"):
+            if not isinstance(data[name], str) or not data[name]:
+                raise StateError(f"decision request field {name!r} must be a non-empty string")
         return cls(**data)
 
 
@@ -398,6 +404,9 @@ class RunState:
         data["options"] = RunOptions.from_dict(options_data)
 
         _validate_scalar_types(data)
+        _validate_timestamps(data)
+        _validate_nested_results(data)
+        _validate_pending_question(data)
         _validate_task_identity(data, worktree_absent=_worktree_is_absent_phase(data))
         _validate_phase_invariants(data)
 
@@ -469,6 +478,169 @@ def _validate_scalar_types(data: dict[str, Any]) -> None:
     snapshot = data.get("task_status_snapshot")
     if snapshot is not None and not isinstance(snapshot, str):
         raise StateError("state field 'task_status_snapshot' must be null or a string")
+
+
+def _parse_timestamp(data: dict[str, Any], name: str) -> datetime:
+    value = data[name]
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise StateError(
+            f"state field {name!r} is not a valid ISO-8601 timestamp: {value!r}"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise StateError(f"state field {name!r} must include a timezone offset")
+    return parsed
+
+
+def _validate_timestamps(data: dict[str, Any]) -> None:
+    created = _parse_timestamp(data, "created_at")
+    updated = _parse_timestamp(data, "updated_at")
+    if updated < created:
+        raise StateError("state field 'updated_at' must not precede 'created_at'")
+
+
+def _validate_role_result(data: dict[str, Any], field_name: str, model: type[BaseModel]) -> Any:
+    value = data.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise StateError(f"state field {field_name!r} must be an object or null")
+    try:
+        return model.model_validate(value)
+    except ValidationError as exc:
+        raise StateError(f"state field {field_name!r} failed contract validation: {exc}") from exc
+
+
+def _validate_nested_results(data: dict[str, Any]) -> None:
+    planner = _validate_role_result(data, "planner_result", PlannerResult)
+    _validate_role_result(data, "architect_result", ArchitectResult)
+    builder = _validate_role_result(data, "builder_result", BuilderResult)
+    auditor = _validate_role_result(data, "auditor_result", AuditorResult)
+    _validate_verification_result(data.get("verification_result"))
+
+    planner_task_id = getattr(planner, "task_id", None)
+    if builder is not None and planner_task_id is not None:
+        builder_task_id = builder.task_id
+        if builder_task_id != planner_task_id:
+            raise StateError(
+                "state field 'builder_result' task_id "
+                f"{builder_task_id!r} does not match planner_result task_id {planner_task_id!r}"
+            )
+    # A REPLAN auditor result is intentionally historical while a replacement
+    # planner result scopes the next attempt. Other dispositions describe the
+    # current planner task and must retain exact identity.
+    if auditor is not None and planner_task_id is not None:
+        disposition = auditor.disposition.value
+        auditor_task_id = auditor.task_id
+        if disposition != "REPLAN" and auditor_task_id != planner_task_id:
+            raise StateError(
+                "state field 'auditor_result' task_id "
+                f"{auditor_task_id!r} does not match planner_result task_id {planner_task_id!r}"
+            )
+
+
+def _validate_verification_result(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise StateError("state field 'verification_result' must be an object or null")
+    if set(value) != {"ok", "commands"}:
+        raise StateError(
+            "state field 'verification_result' must contain exactly 'ok' and 'commands'"
+        )
+    aggregate_ok = value["ok"]
+    commands = value["commands"]
+    if not isinstance(aggregate_ok, bool):
+        raise StateError("state field 'verification_result.ok' must be a bool")
+    if not isinstance(commands, list):
+        raise StateError("state field 'verification_result.commands' must be a list")
+
+    expected_fields = {
+        "command",
+        "ok",
+        "returncode",
+        "timed_out",
+        "duration",
+        "output_path",
+        "summary",
+    }
+    command_statuses: list[bool] = []
+    for index, command in enumerate(commands):
+        prefix = f"state field 'verification_result.commands[{index}]'"
+        if not isinstance(command, dict):
+            raise StateError(f"{prefix} must be an object")
+        if set(command) != expected_fields:
+            raise StateError(f"{prefix} must contain exactly {sorted(expected_fields)}")
+        for name in ("command", "output_path"):
+            scalar = command[name]
+            if not isinstance(scalar, str) or not scalar:
+                raise StateError(f"{prefix}.{name} must be a non-empty string")
+        if not isinstance(command["summary"], str):
+            raise StateError(f"{prefix}.summary must be a string")
+        for name in ("ok", "timed_out"):
+            if not isinstance(command[name], bool):
+                raise StateError(f"{prefix}.{name} must be a bool")
+        duration = command["duration"]
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            raise StateError(f"{prefix}.duration must be a number")
+        if not math.isfinite(duration) or duration < 0:
+            raise StateError(f"{prefix}.duration must be finite and non-negative")
+        returncode = command["returncode"]
+        if returncode is not None and (
+            not isinstance(returncode, int) or isinstance(returncode, bool)
+        ):
+            raise StateError(f"{prefix}.returncode must be an integer or null")
+        timed_out = command["timed_out"]
+        if timed_out and returncode is not None:
+            raise StateError(f"{prefix}.returncode must be null when timed_out is true")
+        expected_ok = not timed_out and returncode == 0
+        if command["ok"] is not expected_ok:
+            raise StateError(f"{prefix}.ok is inconsistent with timed_out and returncode")
+        command_statuses.append(expected_ok)
+    if aggregate_ok is not all(command_statuses):
+        raise StateError(
+            "state field 'verification_result' aggregate ok is inconsistent with commands"
+        )
+
+
+def _validate_pending_question(data: dict[str, Any]) -> None:
+    pending = data.get("pending_question")
+    if pending is None:
+        return
+    if not isinstance(pending, dict):
+        raise StateError("state field 'pending_question' must be an object or null")
+    allowed_fields = {"kind", "message", "context", "answer"}
+    if not set(pending) <= allowed_fields or not {"kind", "message", "context"} <= set(pending):
+        raise StateError(
+            "state field 'pending_question' must contain kind, message, context, "
+            "and optional answer"
+        )
+    kind = pending["kind"]
+    contexts = {
+        "architect_input": ({"question"}, None),
+        "decision_approval": ({"title", "decision"}, None),
+        "builder_guidance": ({"status"}, {"BLOCKED", "INCOMPLETE"}),
+    }
+    if kind not in contexts:
+        raise StateError(f"state field 'pending_question.kind' is unknown: {kind!r}")
+    if not isinstance(pending["message"], str) or not pending["message"]:
+        raise StateError("state field 'pending_question.message' must be a non-empty string")
+    context = pending["context"]
+    expected_context, allowed_statuses = contexts[kind]
+    if not isinstance(context, dict) or set(context) != expected_context:
+        raise StateError(
+            f"state field 'pending_question.context' for {kind!r} must contain exactly "
+            f"{sorted(expected_context)}"
+        )
+    if not all(isinstance(item, str) and item for item in context.values()):
+        raise StateError("state field 'pending_question.context' values must be non-empty strings")
+    if allowed_statuses is not None and context["status"] not in allowed_statuses:
+        raise StateError(
+            "state field 'pending_question.context.status' must be 'BLOCKED' or 'INCOMPLETE'"
+        )
+    if "answer" in pending and not isinstance(pending["answer"], str):
+        raise StateError("state field 'pending_question.answer' must be a string when present")
 
 
 def _worktree_is_absent_phase(data: dict[str, Any]) -> bool:
@@ -595,6 +767,144 @@ def _validate_phase_invariants(data: dict[str, Any]) -> None:
         if not isinstance(decision_request, dict):
             raise StateError("phase 'recording_decision' requires a decision_request object")
         DecisionRequest.from_dict(decision_request)
+
+    effective_phase = phase
+    if phase == PHASE_OPERATIONAL_FAILURE:
+        assert raw_error is not None
+        effective_phase = OperationalErrorRecord.from_dict(raw_error).retry_phase or ""
+    _validate_effective_phase_requirements(data, effective_phase)
+    _validate_pending_question_phase(data, effective_phase)
+
+
+def _validate_pending_question_phase(data: dict[str, Any], phase: str) -> None:
+    pending = data.get("pending_question")
+    if pending is None or phase == "awaiting_input":
+        return
+    if "answer" not in pending or phase not in {"architecting", "building"}:
+        raise StateError(
+            "state field 'pending_question' may only be retained outside awaiting_input "
+            "as answered architect or builder guidance"
+        )
+    expected_kind = "architect_input" if phase == "architecting" else "builder_guidance"
+    if pending["kind"] != expected_kind:
+        raise StateError(f"phase {phase!r} cannot retain pending_question kind {pending['kind']!r}")
+
+
+def _require_result(data: dict[str, Any], phase: str, field_name: str) -> dict[str, Any]:
+    value = data.get(field_name)
+    if not isinstance(value, dict):
+        raise StateError(f"phase {phase!r} requires {field_name}")
+    return value
+
+
+def _validate_effective_phase_requirements(data: dict[str, Any], phase: str) -> None:
+    if phase == "awaiting_input":
+        pending = data.get("pending_question")
+        if not isinstance(pending, dict):
+            raise StateError("phase 'awaiting_input' requires a valid pending_question")
+        kind = pending["kind"]
+        if kind == "builder_guidance":
+            builder = _require_result(data, phase, "builder_result")
+            if builder["status"] not in ("BLOCKED", "INCOMPLETE"):
+                raise StateError(
+                    "phase 'awaiting_input' builder_guidance requires a blocked or incomplete "
+                    "builder_result"
+                )
+        elif kind == "architect_input":
+            architect = data.get("architect_result")
+            if architect is not None and architect["status"] != "NEEDS_INPUT":
+                raise StateError(
+                    "phase 'awaiting_input' architect_input contradicts architect_result status"
+                )
+            _require_result(data, phase, "decision_request")
+        else:
+            architect = _require_result(data, phase, "architect_result")
+            if architect["status"] != "DECIDED":
+                raise StateError(
+                    "phase 'awaiting_input' decision_approval requires a DECIDED architect_result"
+                )
+            _require_result(data, phase, "decision_request")
+        return
+
+    if phase == "creating_worktree":
+        planner = _require_result(data, phase, "planner_result")
+        if planner["status"] != "READY":
+            raise StateError("phase 'creating_worktree' requires a READY planner_result")
+        return
+
+    task_phases = {
+        "architecting",
+        "recording_decision",
+        "building",
+        "verifying",
+        "auditing",
+        "merging",
+        "cleanup_worktree",
+        "cleanup_branch",
+    }
+    if phase in task_phases:
+        _require_full_task_identity(data, phase)
+
+    if phase in task_phases:
+        planner = _require_result(data, phase, "planner_result")
+        if planner["status"] != "READY":
+            raise StateError(f"phase {phase!r} requires a READY planner_result")
+
+    if phase in {"architecting", "recording_decision"}:
+        decision = _require_result(data, phase, "decision_request")
+        planner = _require_result(data, phase, "planner_result")
+        if decision["origin"] == "planner":
+            if not planner["decision_required"]:
+                raise StateError(
+                    f"phase {phase!r} has a planner decision_request but planner_result "
+                    "does not require a decision"
+                )
+            if (
+                decision["question"] != planner["decision_question"]
+                or decision["rationale"] != planner["decision_rationale"]
+            ):
+                raise StateError(f"phase {phase!r} decision_request does not match planner_result")
+        else:
+            auditor = _require_result(data, phase, "auditor_result")
+            if not auditor["decision_required"]:
+                raise StateError(
+                    f"phase {phase!r} has an auditor decision_request but auditor_result "
+                    "does not require a decision"
+                )
+            if (
+                decision["question"] != auditor["decision_question"]
+                or decision["rationale"] != auditor["decision_rationale"]
+            ):
+                raise StateError(f"phase {phase!r} decision_request does not match auditor_result")
+
+    if phase == "recording_decision":
+        architect = _require_result(data, phase, "architect_result")
+        if architect["status"] != "DECIDED":
+            raise StateError("phase 'recording_decision' requires a DECIDED architect_result")
+
+    if phase in {"verifying", "auditing", "merging", "cleanup_worktree", "cleanup_branch"}:
+        builder = _require_result(data, phase, "builder_result")
+        if builder["status"] != "COMPLETE":
+            raise StateError(f"phase {phase!r} requires a COMPLETE builder_result")
+        if data.get("last_task_head") is None:
+            raise StateError(f"phase {phase!r} requires last_task_head")
+
+    if phase == "auditing":
+        configured = bool(data["options"].verify_commands)
+        present = data.get("verification_result") is not None
+        if configured != present:
+            raise StateError(
+                "phase 'auditing' requires verification_result exactly when verify_commands "
+                "are configured"
+            )
+
+    if phase in {"merging", "cleanup_worktree", "cleanup_branch"}:
+        auditor = _require_result(data, phase, "auditor_result")
+        if auditor["disposition"] != "ACCEPT":
+            raise StateError(f"phase {phase!r} requires an ACCEPT auditor_result")
+
+    if phase == "done" and any(data.get(name) is not None for name in _TASK_IDENTITY_FIELDS):
+        raise StateError("phase 'done' cannot retain an active task identity")
 
 
 def _require_full_task_identity(data: dict[str, Any], phase: str) -> None:
