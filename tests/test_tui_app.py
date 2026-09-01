@@ -669,6 +669,91 @@ async def test_app_exit_during_blocked_initialization_waits_for_cleanup(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_app_exit_during_failed_initialization_cleanup_waits_for_its_attempt(
+    tmp_path, monkeypatch
+):
+    """Exit requested while failed-init cleanup is active must await the
+    concrete shutdown attempt that waits behind that cleanup."""
+    repo = _init_repo(tmp_path / "repo")
+    stop_entered = threading.Event()
+    release_stop = threading.Event()
+
+    class _BlockingStopServer(_FakeServer):
+        def stop(self) -> None:
+            stop_entered.set()
+            release_stop.wait(timeout=10)
+
+    def factory(project_dir, config):
+        return _BlockingStopServer(project_dir, config)
+
+    def _fail_after_server_start(self: RunScreen) -> None:
+        assert self._session is not None
+        self._session.start_server()
+        raise RuntimeError("simulated post-start initialization failure")
+
+    _patch_server(monkeypatch, factory=factory)
+    monkeypatch.setattr(RunScreen, "_do_initialize_locked", _fail_after_server_start)
+
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        for _ in range(100):
+            if stop_entered.is_set():
+                break
+            await pilot.pause(0.02)
+        assert stop_entered.is_set()
+        assert _lock_path(repo.common_dir()).exists()
+
+        app.exit()
+        attempt = None
+        for _ in range(100):
+            attempt = screen._shutdown_attempt
+            if attempt is not None:
+                break
+            await asyncio.sleep(0.02)
+        assert attempt is not None
+        assert not attempt.completion.is_set()
+        assert _lock_path(repo.common_dir()).exists()
+
+        release_stop.set()
+        for _ in range(100):
+            if attempt.completion.is_set() and not _lock_path(repo.common_dir()).exists():
+                break
+            await pilot.pause(0.05)
+
+        assert attempt.completion.is_set()
+        assert screen.shutdown_clean
+        assert not _lock_path(repo.common_dir()).exists()
+
+
+@pytest.mark.asyncio
+async def test_already_clean_shutdown_request_return_and_coordinator_are_noops(
+    tmp_path, monkeypatch
+):
+    """Direct request, Return-to-runs handler, and coordinator need no event
+    when presented with an already-clean, initialization-complete screen."""
+    app = LoopSupervisorApp(tmp_path)
+    async with app.run_test():
+        screen = RunScreen(tmp_path, run_id=None)
+        screen._app_ref = app
+        screen._init_done_event.set()
+        screen._shutdown_clean = True
+        app.register_run_screen(screen)
+
+        assert screen.action_request_shutdown() is None  # q binding
+        assert screen not in app._owned_run_screens
+
+        app.register_run_screen(screen)
+        screen.on_return()
+        assert screen not in app._owned_run_screens
+
+        app.register_run_screen(screen)
+        await asyncio.wait_for(app._run_screen_cleanup_coordinator(screen), timeout=1)
+        assert screen not in app._owned_run_screens
+
+
+@pytest.mark.asyncio
 async def test_app_exit_cleanup_ordering(tmp_path, monkeypatch):
     """Cleanup must happen in the documented order: abort sessions before
     the server is stopped, and the server stopped before the lock is
@@ -761,9 +846,10 @@ async def test_app_exit_retains_lock_when_server_stop_fails(tmp_path, monkeypatc
                 break
             await pilot.pause(0.05)
 
-        screen.action_request_shutdown()
+        attempt = screen.action_request_shutdown()
+        assert attempt is not None
         for _ in range(100):
-            if screen._shutdown_complete_event.is_set():
+            if attempt.completion.is_set():
                 break
             await pilot.pause(0.05)
 
@@ -867,7 +953,8 @@ async def test_shutdown_during_blocked_initialization_retries_after_failed_stop(
             await pilot.pause(0.02)
         assert start_entered.is_set()
 
-        screen.action_request_shutdown()
+        attempt = screen.action_request_shutdown()
+        assert attempt is not None
         # Shutdown is waiting on _init_done_event; server.start() is still
         # blocked, so nothing has been torn down yet and the session must
         # still be owned once start() finally returns.
@@ -876,7 +963,7 @@ async def test_shutdown_during_blocked_initialization_retries_after_failed_stop(
 
         release_start.set()
         for _ in range(100):
-            if screen._shutdown_complete_event.is_set():
+            if attempt.completion.is_set():
                 break
             await pilot.pause(0.05)
 
@@ -927,9 +1014,10 @@ async def test_return_to_browser_retries_transient_stop_failure(tmp_path, monkey
                 break
             await pilot.pause(0.05)
 
-        screen.action_request_shutdown()
+        attempt = screen.action_request_shutdown()
+        assert attempt is not None
         for _ in range(100):
-            if screen._shutdown_complete_event.is_set():
+            if attempt.completion.is_set():
                 break
             await pilot.pause(0.05)
 
@@ -1049,6 +1137,165 @@ async def test_app_exit_remains_pending_while_cleanup_stays_unclean(tmp_path, mo
             await pilot.pause(0.05)
 
     assert not _lock_path(repo.common_dir()).exists()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_attempt_generations_do_not_cross_signal(tmp_path, monkeypatch):
+    """Each cleanup generation owns its completion signal; completing the
+    first attempt must not release a waiter for the distinct retry."""
+    app = LoopSupervisorApp(tmp_path)
+    async with app.run_test():
+        screen = RunScreen(tmp_path, run_id=None)
+        screen._app_ref = app
+        screen._init_done_event.set()
+        entered = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+        calls = {"n": 0}
+
+        def _controlled_shutdown() -> None:
+            index = calls["n"]
+            calls["n"] += 1
+            entered[index].set()
+            release[index].wait(timeout=10)
+
+        monkeypatch.setattr(screen, "_do_shutdown", _controlled_shutdown)
+
+        first = screen.action_request_shutdown()
+        assert first is not None
+        assert screen.action_request_shutdown() is first
+        for _ in range(40):
+            if entered[0].is_set():
+                break
+            await asyncio.sleep(0.05)
+        assert entered[0].is_set()
+        release[0].set()
+        await asyncio.wait_for(screen.await_shutdown_complete(first), timeout=2)
+
+        second = screen.action_request_shutdown()
+        assert second is not None
+        assert second is not first
+        assert second.generation == first.generation + 1
+        for _ in range(40):
+            if entered[1].is_set():
+                break
+            await asyncio.sleep(0.05)
+        assert entered[1].is_set()
+
+        second_wait = asyncio.create_task(screen.await_shutdown_complete(second))
+        await asyncio.sleep(0.1)
+        assert not second_wait.done()
+        assert first.completion.is_set()
+        assert not second.completion.is_set()
+
+        release[1].set()
+        await asyncio.wait_for(second_wait, timeout=2)
+
+
+def test_shutdown_worker_registration_failure_allows_fresh_attempt(tmp_path, monkeypatch):
+    """A failed worker registration must not publish an attempt that can never run."""
+    screen = RunScreen(tmp_path, run_id=None)
+    screen._init_done_event.set()
+    registration_attempts = []
+    first_started = threading.Event()
+
+    class _FailOnceWorkerApp:
+        def run_worker(self, callable_, **_kwargs):
+            registration_attempts.append(callable_)
+            if len(registration_attempts) == 1:
+
+                def _start_first() -> None:
+                    first_started.set()
+                    callable_()
+
+                first = threading.Thread(target=_start_first, daemon=True)
+                first.start()
+                assert first_started.wait(timeout=2)
+                raise RuntimeError("simulated worker registration failure")
+
+        def finalize_run_screen(self, _screen):
+            pass
+
+    shutdown_calls = {"n": 0}
+
+    def _count_shutdown() -> None:
+        shutdown_calls["n"] += 1
+
+    monkeypatch.setattr(screen, "_app_ref", _FailOnceWorkerApp())
+    monkeypatch.setattr(screen, "_do_shutdown", _count_shutdown)
+
+    with pytest.raises(RuntimeError, match="simulated worker registration failure"):
+        screen.action_request_shutdown()
+
+    assert screen._shutdown_attempt is None
+    assert screen._shutdown_in_progress is False
+    assert shutdown_calls["n"] == 0
+
+    retry = screen.action_request_shutdown()
+    assert retry is not None
+    assert retry.generation == 2
+    assert len(registration_attempts) == 2
+
+    registration_attempts[1]()
+
+    assert retry.completion.is_set()
+    assert screen._shutdown_attempt is None
+    assert screen._shutdown_in_progress is False
+    assert shutdown_calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_clean_in_flight_shutdown_request_returns_same_incomplete_attempt(
+    tmp_path, monkeypatch
+):
+    """Cleanup becoming clean does not finish its worker or its attempt.
+
+    A concurrent requester in that window must receive and await the existing
+    handle rather than treating the still-running worker as already complete.
+    """
+    screen = RunScreen(tmp_path, run_id=None)
+    screen._init_done_event.set()
+    cleanup_marked_clean = threading.Event()
+    release_worker = threading.Event()
+    worker_calls = []
+
+    class _WorkerCapturingApp:
+        def run_worker(self, callable_, **_kwargs):
+            worker_calls.append(callable_)
+
+        def finalize_run_screen(self, _screen):
+            pass
+
+    app = _WorkerCapturingApp()
+    monkeypatch.setattr(screen, "_app_ref", app)
+
+    def _clean_then_pause() -> None:
+        screen._cleanup_resources()
+        cleanup_marked_clean.set()
+        release_worker.wait(timeout=10)
+
+    monkeypatch.setattr(screen, "_do_shutdown", _clean_then_pause)
+
+    first = screen.action_request_shutdown()
+    assert first is not None
+    assert len(worker_calls) == 1
+    worker = threading.Thread(target=worker_calls[0])
+    worker.start()
+    assert cleanup_marked_clean.wait(timeout=2)
+    assert screen.shutdown_clean
+    assert not first.completion.is_set()
+
+    concurrent = screen.action_request_shutdown()
+    assert concurrent is not None
+    assert concurrent is first
+    concurrent_wait = asyncio.create_task(screen.await_shutdown_complete(concurrent))
+    await asyncio.sleep(0.1)
+    assert not concurrent_wait.done()
+
+    release_worker.set()
+    await asyncio.wait_for(concurrent_wait, timeout=2)
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert first.completion.is_set()
 
 
 @pytest.mark.asyncio
@@ -1644,7 +1891,8 @@ async def test_registry_membership_clears_only_after_quiescence_and_clean_releas
         await pilot.pause(0.1)
         assert screen._transitioning is True
 
-        screen.action_request_shutdown()
+        attempt = screen.action_request_shutdown()
+        assert attempt is not None
         time.sleep(0.2)
         # Still registered: advance() has not unwound yet.
         assert screen in app._owned_run_screens
@@ -1652,7 +1900,7 @@ async def test_registry_membership_clears_only_after_quiescence_and_clean_releas
 
         release_advance.set()
         for _ in range(50):
-            if screen._shutdown_complete_event.is_set():
+            if attempt.completion.is_set():
                 break
             await pilot.pause(0.05)
 

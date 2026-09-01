@@ -73,11 +73,14 @@ invariants.
   mutated from a background thread, and all UI mutation is serialized
   through the Textual message queue. Lifecycle state is a deliberate
   exception to this — the init, advance, and shutdown worker threads
-  share `RunScreen._session` plus a handful of `threading.Event`/`bool`
-  fields (`_shutdown_requested`, `_shutdown_clean`, `_init_done_event`,
-  `_advance_done_event`) directly, guarded by `RunSession`'s own
-  concurrency primitives (ADR 0009) rather than by the message queue.
-  `LiveActivityReducer` is not part of this exception: it is
+  share `RunScreen._session` plus lifecycle synchronization state
+  (`_shutdown_requested`, `_shutdown_clean`, `_init_done_event`,
+  `_advance_done_event`, and per-attempt shutdown handles) directly rather
+  than through the message queue. `RunSession`'s own concurrency primitives
+  guard its resource-lifecycle state (ADR 0009); shutdown-attempt selection,
+  publication, and handle state are separately serialized by
+  `RunScreen._shutdown_attempt_lock`. `LiveActivityReducer` is not part of
+  this exception: it is
   event-loop-thread-only, enforced by its own runtime assertion
   (`test_owner_thread_assertion` in `tests/test_live_reducer.py`).
 - SSE failure leaves the durable UI fully usable; no run is failed due to

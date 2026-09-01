@@ -1227,7 +1227,7 @@ after the fact get written down.
      edits with no actual contract change, which is worse than the
      silent-drift problem it would solve.
 
-36. **TUI startup-failure deadlock (currently unreachable): the single
+36. ~~**TUI startup-failure deadlock (currently unreachable): the single
     reusable `_shutdown_complete_event` could be awaited by a caller
     with no attempt in flight to ever set it, if a future caller
     bypassed the existing guard.** (Tier 3 — reliability; demoted from
@@ -1285,7 +1285,51 @@ after the fact get written down.
     completes without deadlock; `"q"`/"Return to runs" work after clean
     startup-failure cleanup; distinct attempt generations don't
     cross-signal; app exit requested mid-failed-init-cleanup waits
-    correctly and then proceeds.
+    correctly and then proceeds.~~ **Resolved.**
+
+    `RunScreen.action_request_shutdown()` now returns an immutable
+    generation/event handle for the existing in-flight attempt or a newly
+    created attempt, and returns `None` explicitly when cleanup is already
+    confirmed clean with no attempt still in flight. In-flight selection takes
+    precedence because cleanup can be marked clean before its worker completes.
+    Attempt selection and worker registration are serialized under
+    `_shutdown_attempt_lock`, preserving the no-overlap guarantee. If
+    `run_worker()` raises before registration completes, the provisional handle
+    is signalled and unpublished under that same lock so a later request can
+    create a fresh generation rather than inherit a phantom in-flight attempt.
+    The cleanup coordinator awaits only the returned handle and no longer gates
+    a reusable event wait with a separate `shutdown_clean` read. Exit requested
+    during real failed-initialization cleanup waits for the concrete worker
+    queued behind that cleanup. A focused already-clean test exercises the
+    direct shutdown request used by `q`, the Return-to-runs handler, and the
+    cleanup coordinator; it does not simulate key dispatch or initialization.
+
+    Regression coverage in `tests/test_tui_app.py` proves consecutive attempt
+    handles have distinct events and that a second handle remains incomplete
+    after the first has completed; against exact pre-fix commit
+    `a048eaded3c75c2649776e77991c0e22dea6489e`, that test fails first at the
+    intentionally changed API boundary because the old request returned no
+    handle, so it is API-shape failing-first evidence rather than by itself a
+    behavioral reproduction of cross-signalling. A separate old-code-only probe
+    against that commit first asserted `_ShutdownAttempt` was absent, then
+    reproduced the shared-event defect behaviorally: a waiter created for a
+    completed first cleanup remained blocked after the second request cleared
+    the reusable event and was released only when the second cleanup completed.
+    The real failed-initialization/app-exit test also fails against that exact
+    pre-fix commit at the changed handle API; on fixed code it drives a genuine
+    post-server-start initialization exception, blocked failed-init cleanup,
+    and real `app.exit()`, proving exit waits until the following concrete
+    shutdown attempt completes. The clean-before-worker-completion race test was
+    verified failing against exact task commit
+    `3a6e8c97740d6079c246ac25d94581ba8ad6c5eb` after an old-code-only probe
+    asserted that commit still selected `shutdown_clean` before an in-flight
+    attempt. Finally, the worker-registration regression was verified failing
+    against exact prior commit `055ba821113921405bb687344c93e12ecef6ecd8`
+    after an old-code-only probe confirmed the registration-failure rollback
+    was absent: the old code retained an unsignalled phantom attempt, while the
+    fix permits a fresh generation to register and complete. The full pytest
+    suite, Ruff check, Ruff format check, and combined `mypy src tests` gate
+    pass.
 
 37. ~~`_confirm_server_stopped()`'s inter-attempt backoff uses
     `time.sleep()`, which is not interrupt-safe.~~ **Resolved.**
