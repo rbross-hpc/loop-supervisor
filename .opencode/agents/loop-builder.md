@@ -35,7 +35,14 @@ you write or extend (failing-first verification against the actual
 prior defect, never a hand-written injection alone; assertions are
 additive only; `monkeypatch.setattr`, not direct attribute
 assignment; and the other rules there) — these are standing
-conventions for this project, not suggestions.
+conventions for this project, not suggestions. Do your failing-first
+verification in your own task worktree, not a second one you create —
+see that same section for the in-place recipe.
+
+Follow the "Commit messages" section of README.md for your commit:
+a subject line alone is not enough. Cover what changed and why, the
+failing-first verification evidence for any new test, and any known
+limitations or deviations from the task's original scope.
 
 After implementation:
 - write or extend tests covering the task's acceptance criteria

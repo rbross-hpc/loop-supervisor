@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Anchored process-group launcher for OpenCode."""
+"""Anchored process-group launcher for OpenCode.
+
+This module carries a handful of `FAKE_LAUNCHER_*` environment-variable
+fault-injection seams (`FAKE_LAUNCHER_IDENTITY`,
+`FAKE_LAUNCHER_TERM_ERROR_ONCE`, `FAKE_LAUNCHER_TERM_BLOCK_FILE`,
+`FAKE_LAUNCHER_KILL_ERROR_ONCE`). Each is inert unless a test explicitly
+sets the corresponding variable, so none has any effect in normal
+operation. They exist because the fault they simulate happens at a real
+process boundary (this launcher is a separate `exec`'d process, not a
+Python object the caller can `monkeypatch`) -- use one of these only
+where the calling code (`OpenCodeServer`/`RunSession`) genuinely cannot
+be faulted directly; prefer `monkeypatch.setattr` on the calling code
+for anything that does not require crossing that boundary.
+"""
 
 from __future__ import annotations
 
