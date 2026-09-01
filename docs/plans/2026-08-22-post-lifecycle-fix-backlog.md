@@ -184,11 +184,15 @@ after the fact get written down.
    filesystem contract in ADR 0009; implementation in
    `src/loop_supervisor/locking.py` and `src/loop_supervisor/state.py`; and
    regression coverage in `tests/test_locking.py`
-   (`test_acquire_rejects_symlinked_lock_directory_without_touching_target`,
+   (`test_acquire_normalizes_lock_directory_creation_failure`,
+   `test_acquire_closes_temporary_fd_and_normalizes_setup_failure`,
+   `test_acquire_normalizes_lock_temporary_publication_failure`,
+   `test_acquire_rejects_symlinked_lock_directory_without_touching_target`,
    `test_inspection_and_recovery_reject_symlinked_lock_directory_without_touching_target`,
    `test_release_rejects_symlinked_lock_directory_without_touching_target`,
    `test_lock_file_mode_is_0600_under_restrictive_umask`, and the
    `test_*required_open_capability*` tests) and `tests/test_state.py` (the
+   `test_save_closes_temporary_fd_on_setup_failure`,
    `test_*symlinked_state_directory*`, `test_*state_file_symlink*`, restrictive
    umask, and required-open-capability tests). All nine original symlink
    defect-pinning cases were

@@ -700,9 +700,12 @@ def save_state(git_common_dir: Path, state: RunState) -> None:
                 0o600,
                 dir_fd=directory_fd,
             )
+            fd_owned = True
             try:
                 os.fchmod(fd, 0o600)
-                with os.fdopen(fd, "w") as handle:
+                handle = os.fdopen(fd, "w")
+                fd_owned = False
+                with handle:
                     json.dump(state.to_dict(), handle, indent=2, sort_keys=True)
                     handle.write("\n")
                 os.replace(tmp_name, target.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
@@ -712,6 +715,9 @@ def save_state(git_common_dir: Path, state: RunState) -> None:
                 except FileNotFoundError:
                     pass
                 raise
+            finally:
+                if fd_owned:
+                    os.close(fd)
     except StateError:
         raise
     except OSError as exc:

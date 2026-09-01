@@ -102,6 +102,8 @@ def _open_lock_directory(git_common_dir: Path) -> int:
         os.mkdir(directory, 0o700)
     except FileExistsError:
         pass
+    except OSError as exc:
+        raise LockError(f"cannot use lock directory {directory}: {exc}") from exc
     flags = os.O_RDONLY | directory_flag | nofollow_flag
     try:
         fd = os.open(directory, flags)
@@ -296,9 +298,12 @@ def _write_lock_file(path: Path, record: dict[str, Any], *, directory_fd: int) -
     fd = _open_no_follow(
         Path(tmp_name), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=directory_fd
     )
+    fd_owned = True
     try:
         os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as handle:
+        handle = os.fdopen(fd, "w")
+        fd_owned = False
+        with handle:
             json.dump(record, handle, indent=2)
             handle.write("\n")
         os.link(
@@ -310,9 +315,13 @@ def _write_lock_file(path: Path, record: dict[str, Any], *, directory_fd: int) -
         )
     finally:
         try:
-            os.unlink(tmp_name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
+            if fd_owned:
+                os.close(fd)
+        finally:
+            try:
+                os.unlink(tmp_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
 
 
 class SupervisorLock:
@@ -396,21 +405,28 @@ class SupervisorLock:
             self._token = None
             raise LockError(f"refusing to acquire lock with invalid metadata: {exc}") from exc
 
-        with _guarded(self._path.parent.parent) as directory_fd:
-            while True:
-                try:
-                    _write_lock_file(self._path, record, directory_fd=directory_fd)
-                    self._token = token
-                    return
-                except FileExistsError:
-                    pass
+        try:
+            with _guarded(self._path.parent.parent) as directory_fd:
+                while True:
+                    try:
+                        _write_lock_file(self._path, record, directory_fd=directory_fd)
+                        self._token = token
+                        return
+                    except FileExistsError:
+                        pass
 
-                existing = self._inspect_existing_lock(directory_fd=directory_fd)
-                if existing is None:
-                    continue
+                    existing = self._inspect_existing_lock(directory_fd=directory_fd)
+                    if existing is None:
+                        continue
 
-                self._token = None
-                raise existing
+                    self._token = None
+                    raise existing
+        except LockError:
+            self._token = None
+            raise
+        except OSError as exc:
+            self._token = None
+            raise LockError(f"cannot acquire lock {self._path}: {exc}") from exc
 
     def _inspect_existing_lock(self, *, directory_fd: int) -> LockError | None:
         """Inspect the existing lock and decide what to do.

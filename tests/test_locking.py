@@ -659,6 +659,107 @@ def test_missing_no_follow_capability_cannot_modify_symlink_target(tmp_path, mon
     assert not (outside / "supervisor.lock").exists()
 
 
+def test_acquire_normalizes_lock_directory_creation_failure(tmp_path, monkeypatch):
+    original_mkdir = os.mkdir
+
+    def _fail_lock_directory(path, *args, **kwargs):
+        if Path(path) == tmp_path / "loop-supervisor":
+            raise PermissionError("simulated lock directory denial")
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(locking_mod.os, "mkdir", _fail_lock_directory)
+    lock = _make_lock(tmp_path)
+
+    with pytest.raises(LockError, match="cannot use lock directory") as caught:
+        lock.acquire()
+
+    assert isinstance(caught.value.__cause__, PermissionError)
+    assert lock._token is None
+
+
+@pytest.mark.parametrize("failure_stage", ["fchmod", "fdopen"])
+def test_acquire_closes_temporary_fd_and_normalizes_setup_failure(
+    tmp_path, monkeypatch, failure_stage
+):
+    original_open = os.open
+    original_close = os.close
+    original_fchmod = os.fchmod
+    original_fdopen = os.fdopen
+    temporary_fd: list[int] = []
+    close_count = 0
+
+    def _recording_open(path, *args, **kwargs):
+        fd = original_open(path, *args, **kwargs)
+        if str(path).startswith(".tmp-lock-"):
+            temporary_fd.append(fd)
+        return fd
+
+    def _fchmod(fd, mode):
+        if failure_stage == "fchmod" and temporary_fd == [fd]:
+            raise OSError("simulated lock temporary fchmod failure")
+        return original_fchmod(fd, mode)
+
+    def _fdopen(fd, *args, **kwargs):
+        if failure_stage == "fdopen" and temporary_fd == [fd]:
+            raise OSError("simulated lock temporary fdopen failure")
+        return original_fdopen(fd, *args, **kwargs)
+
+    def _recording_close(fd):
+        nonlocal close_count
+        if temporary_fd == [fd]:
+            close_count += 1
+        return original_close(fd)
+
+    monkeypatch.setattr(locking_mod.os, "open", _recording_open)
+    monkeypatch.setattr(locking_mod.os, "fchmod", _fchmod)
+    monkeypatch.setattr(locking_mod.os, "fdopen", _fdopen)
+    monkeypatch.setattr(locking_mod.os, "close", _recording_close)
+    lock = _make_lock(tmp_path)
+
+    with pytest.raises(LockError, match="cannot acquire lock") as caught:
+        lock.acquire()
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert len(temporary_fd) == 1
+    assert close_count == 1
+    assert lock._token is None
+    assert not _lock_path(tmp_path).exists()
+    assert not list((tmp_path / "loop-supervisor").glob(".tmp-lock-*"))
+
+    monkeypatch.setattr(locking_mod.os, "fchmod", original_fchmod)
+    monkeypatch.setattr(locking_mod.os, "fdopen", original_fdopen)
+    lock.acquire()
+    lock.release()
+    assert lock._token is None
+
+
+@pytest.mark.parametrize("failure_stage", ["write", "link"])
+def test_acquire_normalizes_lock_temporary_publication_failure(
+    tmp_path, monkeypatch, failure_stage
+):
+    if failure_stage == "write":
+
+        def _fail_write(*args, **kwargs):
+            raise OSError("simulated lock temporary write failure")
+
+        monkeypatch.setattr(locking_mod.json, "dump", _fail_write)
+    else:
+
+        def _fail_link(*args, **kwargs):
+            raise OSError("simulated lock temporary link failure")
+
+        monkeypatch.setattr(locking_mod.os, "link", _fail_link)
+
+    lock = _make_lock(tmp_path)
+    with pytest.raises(LockError, match="cannot acquire lock") as caught:
+        lock.acquire()
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert lock._token is None
+    assert not _lock_path(tmp_path).exists()
+    assert not list((tmp_path / "loop-supervisor").glob(".tmp-lock-*"))
+
+
 def test_acquire_rejects_symlinked_lock_directory_without_touching_target(tmp_path):
     outside = tmp_path.parent / "outside-lock-acquire"
     outside.mkdir()

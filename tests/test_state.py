@@ -484,6 +484,53 @@ def test_missing_no_follow_capability_cannot_read_or_modify_symlink_target(tmp_p
     assert sorted(path.name for path in outside_runs.iterdir()) == [target.name]
 
 
+@pytest.mark.parametrize("failure_stage", ["fchmod", "fdopen"])
+def test_save_closes_temporary_fd_on_setup_failure(tmp_path, monkeypatch, failure_stage):
+    original_open = os.open
+    original_close = os.close
+    original_fchmod = os.fchmod
+    original_fdopen = os.fdopen
+    temporary_fd: list[int] = []
+    close_count = 0
+
+    def _recording_open(path, *args, **kwargs):
+        fd = original_open(path, *args, **kwargs)
+        if str(path).startswith(".tmp-"):
+            temporary_fd.append(fd)
+        return fd
+
+    def _fchmod(fd, mode):
+        if failure_stage == "fchmod" and temporary_fd == [fd]:
+            raise OSError("simulated state temporary fchmod failure")
+        return original_fchmod(fd, mode)
+
+    def _fdopen(fd, *args, **kwargs):
+        if failure_stage == "fdopen" and temporary_fd == [fd]:
+            raise OSError("simulated state temporary fdopen failure")
+        return original_fdopen(fd, *args, **kwargs)
+
+    def _recording_close(fd):
+        nonlocal close_count
+        if temporary_fd == [fd]:
+            close_count += 1
+        return original_close(fd)
+
+    monkeypatch.setattr(state_mod.os, "open", _recording_open)
+    monkeypatch.setattr(state_mod.os, "fchmod", _fchmod)
+    monkeypatch.setattr(state_mod.os, "fdopen", _fdopen)
+    monkeypatch.setattr(state_mod.os, "close", _recording_close)
+    state = _make_state("temporary-setup-failure")
+
+    with pytest.raises(StateError, match="could not be saved") as caught:
+        save_state(tmp_path, state)
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert len(temporary_fd) == 1
+    assert close_count == 1
+    assert not state_path(tmp_path, state.run_id).exists()
+    assert not list((tmp_path / "loop-supervisor" / "runs").glob(".tmp-*"))
+
+
 @pytest.mark.parametrize("component", ["loop-supervisor", "runs"])
 def test_save_rejects_symlinked_state_directory_and_leaves_target_untouched(tmp_path, component):
     outside = tmp_path.parent / f"outside-save-{component}"

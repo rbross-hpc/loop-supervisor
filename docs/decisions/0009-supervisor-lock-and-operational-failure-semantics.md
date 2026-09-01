@@ -57,7 +57,13 @@ external symlink target is read or modified. State storage likewise requires
 `O_NOFOLLOW` and `O_DIRECTORY` and fails with `StateError` when either secure
 open capability is unavailable. Newly created lock and state temporary files
 are explicitly `fchmod`ed to exactly mode 0600 before publication, preserving
-that guarantee independently of the caller's umask.
+that guarantee independently of the caller's umask. Until `fdopen` successfully
+assumes ownership, the raw temporary-file descriptor remains the persistence
+routine's responsibility and is closed exactly once on every setup failure;
+temporary names are still removed. Filesystem failures during lock-directory or
+lock-temporary-file setup are exposed as `LockError` with their original cause,
+and a failed acquisition retains no ownership token so the object remains safe
+to retry.
 
 **Lock release requires confirmed OpenCode shutdown.** The lock is
 released only after `OpenCodeServer.stop()` (or the TUI's equivalent
