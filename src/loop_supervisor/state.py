@@ -273,6 +273,10 @@ class OperationalErrorRecord:
         if requires_repair and not retryable:
             raise StateError("error record has requires_repair=True but retryable=False")
 
+        operation = data["operation"]
+        if operation != failed_phase:
+            raise StateError("error record operation must match failed_phase")
+
         retry_phase = data["retry_phase"]
         if retryable:
             if retry_phase is None:
@@ -282,6 +286,8 @@ class OperationalErrorRecord:
                     f"error record retry_phase {retry_phase!r} is not a valid retry target "
                     "(operational_failure and terminal phases are never valid retry targets)"
                 )
+            if retry_phase != failed_phase:
+                raise StateError("error record retry_phase must match failed_phase")
         elif retry_phase is not None:
             raise StateError(
                 f"error record is not retryable but has retry_phase={retry_phase!r}; "
@@ -780,14 +786,20 @@ def _validate_pending_question_phase(data: dict[str, Any], phase: str) -> None:
     pending = data.get("pending_question")
     if pending is None or phase == "awaiting_input":
         return
-    if "answer" not in pending or phase not in {"architecting", "building"}:
+    allowed_phase = phase
+    if phase == "failed":
+        raw_error = data.get("last_error")
+        if isinstance(raw_error, dict):
+            allowed_phase = raw_error.get("failed_phase", "")
+    if "answer" not in pending or allowed_phase not in {"architecting", "building"}:
         raise StateError(
             "state field 'pending_question' may only be retained outside awaiting_input "
             "as answered architect or builder guidance"
         )
-    expected_kind = "architect_input" if phase == "architecting" else "builder_guidance"
+    expected_kind = "architect_input" if allowed_phase == "architecting" else "builder_guidance"
     if pending["kind"] != expected_kind:
         raise StateError(f"phase {phase!r} cannot retain pending_question kind {pending['kind']!r}")
+    _validate_pending_context_matches_source(data, pending, phase)
 
 
 def _require_result(data: dict[str, Any], phase: str, field_name: str) -> dict[str, Any]:
@@ -797,8 +809,109 @@ def _require_result(data: dict[str, Any], phase: str, field_name: str) -> dict[s
     return value
 
 
+def _validate_decision_relationships(data: dict[str, Any], phase: str) -> None:
+    decision = _require_result(data, phase, "decision_request")
+    planner = _require_result(data, phase, "planner_result")
+    if decision["origin"] == "planner":
+        if not planner["decision_required"]:
+            raise StateError(
+                f"phase {phase!r} has a planner decision_request but planner_result "
+                "does not require a decision"
+            )
+        if (
+            decision["question"] != planner["decision_question"]
+            or decision["rationale"] != planner["decision_rationale"]
+        ):
+            raise StateError(f"phase {phase!r} decision_request does not match planner_result")
+    else:
+        auditor = _require_result(data, phase, "auditor_result")
+        if auditor["task_id"] != planner["task_id"]:
+            raise StateError(
+                f"phase {phase!r} auditor decision_request has an auditor_result task_id "
+                "that does not match planner_result task_id"
+            )
+        if not auditor["decision_required"]:
+            raise StateError(
+                f"phase {phase!r} has an auditor decision_request but auditor_result "
+                "does not require a decision"
+            )
+        if (
+            decision["question"] != auditor["decision_question"]
+            or decision["rationale"] != auditor["decision_rationale"]
+        ):
+            raise StateError(f"phase {phase!r} decision_request does not match auditor_result")
+
+    architect = data.get("architect_result")
+    if isinstance(architect, dict) and architect["question"] != decision["question"]:
+        raise StateError(
+            "state field 'architect_result.question' does not match decision_request question"
+        )
+
+
+def _validate_pending_context_matches_source(
+    data: dict[str, Any], pending: dict[str, Any], phase: str
+) -> None:
+    kind = pending["kind"]
+    context = pending["context"]
+    if kind == "builder_guidance":
+        builder = _require_result(data, phase, "builder_result")
+        if context["status"] != builder["status"]:
+            raise StateError(
+                "state field 'pending_question.context.status' does not match builder_result status"
+            )
+        return
+
+    _validate_decision_relationships(data, phase)
+    decision = _require_result(data, phase, "decision_request")
+    if kind == "architect_input":
+        if context["question"] != decision["question"]:
+            raise StateError(
+                "state field 'pending_question.context.question' does not match decision_request"
+            )
+        return
+
+    architect = _require_result(data, phase, "architect_result")
+    adr = architect["adr"]
+    assert isinstance(adr, dict)
+    for field_name in ("title", "decision"):
+        if context[field_name] != adr[field_name]:
+            raise StateError(
+                f"state field 'pending_question.context.{field_name}' does not match "
+                "architect_result ADR"
+            )
+
+
+def _validate_verification_for_phase(data: dict[str, Any], phase: str) -> None:
+    configured_commands = data["options"].verify_commands
+    result = data.get("verification_result")
+    if phase == "verifying":
+        if not configured_commands:
+            raise StateError("phase 'verifying' requires configured verify_commands")
+        if result is not None:
+            raise StateError("phase 'verifying' must not already have verification_result")
+        return
+
+    present = result is not None
+    if bool(configured_commands) != present:
+        raise StateError(
+            f"phase {phase!r} requires verification_result exactly when verify_commands "
+            "are configured"
+        )
+    if isinstance(result, dict):
+        persisted_commands = [item["command"] for item in result["commands"]]
+        if persisted_commands != list(configured_commands):
+            raise StateError(
+                "state field 'verification_result.commands' must match configured "
+                "verify_commands in order"
+            )
+
+
 def _validate_effective_phase_requirements(data: dict[str, Any], phase: str) -> None:
     if phase == "awaiting_input":
+        _require_full_task_identity(data, phase)
+        planner = _require_result(data, phase, "planner_result")
+        if planner["status"] != "READY":
+            raise StateError("phase 'awaiting_input' requires a READY planner_result")
         pending = data.get("pending_question")
         if not isinstance(pending, dict):
             raise StateError("phase 'awaiting_input' requires a valid pending_question")
@@ -811,19 +924,18 @@ def _validate_effective_phase_requirements(data: dict[str, Any], phase: str) -> 
                     "builder_result"
                 )
         elif kind == "architect_input":
-            architect = data.get("architect_result")
-            if architect is not None and architect["status"] != "NEEDS_INPUT":
+            architect = _require_result(data, phase, "architect_result")
+            if architect["status"] not in ("NEEDS_INPUT", "DECIDED"):
                 raise StateError(
                     "phase 'awaiting_input' architect_input contradicts architect_result status"
                 )
-            _require_result(data, phase, "decision_request")
         else:
             architect = _require_result(data, phase, "architect_result")
             if architect["status"] != "DECIDED":
                 raise StateError(
                     "phase 'awaiting_input' decision_approval requires a DECIDED architect_result"
                 )
-            _require_result(data, phase, "decision_request")
+        _validate_pending_context_matches_source(data, pending, phase)
         return
 
     if phase == "creating_worktree":
@@ -851,31 +963,7 @@ def _validate_effective_phase_requirements(data: dict[str, Any], phase: str) -> 
             raise StateError(f"phase {phase!r} requires a READY planner_result")
 
     if phase in {"architecting", "recording_decision"}:
-        decision = _require_result(data, phase, "decision_request")
-        planner = _require_result(data, phase, "planner_result")
-        if decision["origin"] == "planner":
-            if not planner["decision_required"]:
-                raise StateError(
-                    f"phase {phase!r} has a planner decision_request but planner_result "
-                    "does not require a decision"
-                )
-            if (
-                decision["question"] != planner["decision_question"]
-                or decision["rationale"] != planner["decision_rationale"]
-            ):
-                raise StateError(f"phase {phase!r} decision_request does not match planner_result")
-        else:
-            auditor = _require_result(data, phase, "auditor_result")
-            if not auditor["decision_required"]:
-                raise StateError(
-                    f"phase {phase!r} has an auditor decision_request but auditor_result "
-                    "does not require a decision"
-                )
-            if (
-                decision["question"] != auditor["decision_question"]
-                or decision["rationale"] != auditor["decision_rationale"]
-            ):
-                raise StateError(f"phase {phase!r} decision_request does not match auditor_result")
+        _validate_decision_relationships(data, phase)
 
     if phase == "recording_decision":
         architect = _require_result(data, phase, "architect_result")
@@ -889,19 +977,17 @@ def _validate_effective_phase_requirements(data: dict[str, Any], phase: str) -> 
         if data.get("last_task_head") is None:
             raise StateError(f"phase {phase!r} requires last_task_head")
 
-    if phase == "auditing":
-        configured = bool(data["options"].verify_commands)
-        present = data.get("verification_result") is not None
-        if configured != present:
-            raise StateError(
-                "phase 'auditing' requires verification_result exactly when verify_commands "
-                "are configured"
-            )
+    if phase in {"verifying", "auditing", "merging", "cleanup_worktree", "cleanup_branch"}:
+        _validate_verification_for_phase(data, phase)
 
     if phase in {"merging", "cleanup_worktree", "cleanup_branch"}:
         auditor = _require_result(data, phase, "auditor_result")
         if auditor["disposition"] != "ACCEPT":
             raise StateError(f"phase {phase!r} requires an ACCEPT auditor_result")
+        if data["merge_task_head"] != data["last_task_head"]:
+            raise StateError(
+                "state field 'merge_task_head' must match last_task_head during merge and cleanup"
+            )
 
     if phase == "done" and any(data.get(name) is not None for name in _TASK_IDENTITY_FIELDS):
         raise StateError("phase 'done' cannot retain an active task identity")

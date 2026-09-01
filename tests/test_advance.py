@@ -717,6 +717,83 @@ def test_advance_decision_approval_not_reinvoked(tmp_path):
     assert arch_calls_after == arch_calls_before
 
 
+def test_rejected_decision_state_reloads_and_resumes_with_feedback(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(decision_required=True)],
+            "loop-architect": [_architect_decided(), _architect_decided()],
+        }
+    )
+    input_provider = ScriptedInput([])
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=input_provider,
+        options=_make_options(require_decision_approval=True),
+    )
+    state = supervisor.start_new_run()
+    _advance_to_phase(supervisor, state, PHASE_AWAITING_INPUT)
+    assert state.pending_question is not None
+    assert state.pending_question["kind"] == "decision_approval"
+
+    input_provider.answers = ["no"]
+    outcome = supervisor.advance(state)
+    assert outcome.status == AdvanceStatus.ADVANCED
+    assert state.phase == PHASE_AWAITING_INPUT
+    assert state.architect_result is not None
+    assert state.architect_result["status"] == "DECIDED"
+    assert state.pending_question is not None
+    assert state.pending_question["kind"] == "architect_input"
+
+    reloaded = load_state(repo.common_dir(), state.run_id)
+    fresh_input = ScriptedInput(["please reconsider"])
+    fresh_supervisor = Supervisor(
+        repo=repo,
+        runner=runner,
+        git_common_dir=repo.common_dir(),
+        input_provider=fresh_input,
+    )
+    resumed = fresh_supervisor.resume(reloaded)
+    fresh_supervisor.advance(resumed)
+    assert resumed.phase == "architecting"
+    fresh_supervisor.advance(resumed)
+    assert resumed.phase == PHASE_AWAITING_INPUT
+    assert resumed.pending_question is not None
+    assert resumed.pending_question["kind"] == "decision_approval"
+
+
+def test_architect_retry_limit_terminal_state_with_guidance_is_reloadable(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(decision_required=True)],
+            "loop-architect": [_architect_needs_input(), _architect_needs_input()],
+        }
+    )
+    input_provider = ScriptedInput([])
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=input_provider,
+        options=_make_options(max_architect_retries=1),
+    )
+    state = supervisor.start_new_run()
+    _advance_to_phase(supervisor, state, PHASE_AWAITING_INPUT)
+
+    input_provider.answers = ["pick option A"]
+    supervisor.advance(state)
+    outcome = supervisor.advance(state)
+    assert outcome.status == AdvanceStatus.TERMINAL
+    assert state.phase == "failed"
+    assert state.pending_question is not None
+    assert state.pending_question["answer"] == "pick option A"
+    assert state.last_error is not None
+    assert state.last_error["failed_phase"] == "architecting"
+
+    reloaded = load_state(repo.common_dir(), state.run_id)
+    assert reloaded.phase == "failed"
+    assert reloaded.pending_question == state.pending_question
+
+
 def test_advance_recording_decision_phase(tmp_path):
     runner = ScriptedRunner(
         {

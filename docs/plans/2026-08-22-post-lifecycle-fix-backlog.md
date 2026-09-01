@@ -354,21 +354,31 @@ after the fact get written down.
    must be timezone-aware ISO-8601 values in nondecreasing order.
 
    Conservative effective-phase checks now require the prerequisites needed
-   for safe resume (including task identity, current planner/builder/auditor
-   results, merge intent, decision provenance, and `last_task_head`) and apply
-   the same checks through an `operational_failure` record's `retry_phase`.
+   for safe resume (including task identity, a READY current planner result,
+   builder/auditor results, merge intent, decision provenance, and
+   `last_task_head`) and apply the same checks through an `operational_failure`
+   record's `retry_phase`. Verification is present exactly when configured
+   throughout verifying/auditing/merge/cleanup and its commands match the
+   persisted configuration in order. Merge and cleanup require the reviewed
+   `last_task_head` to equal `merge_task_head`.
+
    Builder/current-planner and non-REPLAN auditor/current-planner task IDs must
-   agree, architect answers must match their durable decision request, and
-   direct contradictions are rejected. Intentionally historical results remain
-   legal: in particular a REPLAN auditor result may describe the prior task
-   while a replacement planner result scopes the next attempt, and answered
-   architect/builder guidance remains loadable during the corresponding retry.
+   agree. Architect results and architect-input contexts must match the durable
+   decision request; approval title/decision and builder-guidance status must
+   match their source results. Intentionally historical results remain legal:
+   in particular a REPLAN auditor result may describe the prior task while a
+   replacement planner result scopes the next attempt, a rejected DECIDED
+   proposal remains loadable while awaiting feedback, and answered architect/
+   builder guidance remains loadable during retries and related terminal
+   failures.
 
    Regression coverage is in `tests/test_state.py`'s complete persisted-state
-   trust-boundary section, supplemented by the normal lifecycle reload tests in
-   `tests/test_advance.py`. The new rejection tests were run against the actual
-   pre-change implementation first and produced 28 expected failures before
-   the validation was added.
+   trust-boundary section and real transition/reload tests in
+   `tests/test_advance.py`, including rejected-decision feedback and architect
+   retry-limit terminal snapshots. The original tests produced 28 expected
+   failures against the pre-change implementation; the audit follow-up tests
+   were likewise run against commit `2986466` and produced 21 expected failures
+   (19 state-invariant cases and both lifecycle reload cases) before the fixes.
 
 10. ~~Non-`FileNotFoundError` spawn failures need normalization.~~
     **Already resolved; this backlog had not caught up.**
