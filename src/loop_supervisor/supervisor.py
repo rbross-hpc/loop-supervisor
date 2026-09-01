@@ -93,6 +93,22 @@ _DURABLE_SIDE_EFFECT_PHASES = {
     PHASE_CLEANUP_BRANCH,
 }
 
+# The same operational-failure exception tuple advance()'s in-`try`
+# dispatch catches (backlog item 2): a `_save()` call made after a phase
+# has already transitioned successfully -- e.g. the PHASE_AWAITING_INPUT
+# and success-path saves below -- must be classified exactly the same
+# way, not left to escape unclassified just because it happens to run
+# after the dispatch's own try block has already exited. See
+# _save_after_transition().
+_OPERATIONAL_FAILURE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    AgentInvocationError,
+    PhaseTimeoutError,
+    GitError,
+    DecisionError,
+    ContractError,
+    ProvisioningError,
+)
+
 
 class LoopError(RuntimeError):
     """Raised for unrecoverable loop-level failures (limits, conflicts)."""
@@ -498,21 +514,13 @@ class Supervisor:
         try:
             if phase_before == PHASE_AWAITING_INPUT:
                 resolved = self._try_resolve_pending_input(state)
-                self._save(state)
-                if resolved:
-                    return AdvanceOutcome(
-                        status=AdvanceStatus.ADVANCED,
-                        state=state,
-                        phase_before=phase_before,
-                        phase_after=state.phase,
-                    )
-                else:
-                    return AdvanceOutcome(
-                        status=AdvanceStatus.INPUT_UNAVAILABLE,
-                        state=state,
-                        phase_before=phase_before,
-                        phase_after=state.phase,
-                    )
+                return self._save_after_transition(
+                    state,
+                    phase_before=phase_before,
+                    success_status=(
+                        AdvanceStatus.ADVANCED if resolved else AdvanceStatus.INPUT_UNAVAILABLE
+                    ),
+                )
             elif phase_before == PHASE_PLANNING:
                 self._do_planning(state)
             elif phase_before == PHASE_ARCHITECTING:
@@ -545,14 +553,7 @@ class Supervisor:
                 phase_before=phase_before,
                 phase_after=state.phase,
             )
-        except (
-            AgentInvocationError,
-            PhaseTimeoutError,
-            GitError,
-            DecisionError,
-            ContractError,
-            ProvisioningError,
-        ) as exc:
+        except _OPERATIONAL_FAILURE_EXCEPTIONS as exc:
             return self._handle_operational_failure(
                 state,
                 exc=exc,
@@ -563,17 +564,71 @@ class Supervisor:
             return self._handle_terminal_failure(state, exc=exc, phase_before=phase_before)
 
         if state.phase == PHASE_AWAITING_INPUT:
-            self._save(state)
-            return AdvanceOutcome(
-                status=AdvanceStatus.INPUT_REQUIRED,
-                state=state,
+            return self._save_after_transition(
+                state,
                 phase_before=phase_before,
-                phase_after=state.phase,
+                success_status=AdvanceStatus.INPUT_REQUIRED,
             )
 
-        self._save(state)
+        return self._save_after_transition(
+            state,
+            phase_before=phase_before,
+            success_status=AdvanceStatus.ADVANCED,
+        )
+
+    def _save_after_transition(
+        self,
+        state: RunState,
+        *,
+        phase_before: str,
+        success_status: AdvanceStatus,
+    ) -> AdvanceOutcome:
+        """Persist `state` after a phase's dispatch has already completed
+        successfully, classifying a `_save()` failure exactly like one
+        discovered by advance()'s own in-`try` dispatch (backlog item 2).
+
+        Before this helper existed, the three success-path `_save()`
+        calls in advance() sat outside its try/except, so a `GitError`
+        from `_save()` -> `_checkpoint()` -> `repo.head_commit()`/
+        `repo.status_snapshot()` after an otherwise-successful transition
+        escaped unclassified: no `OperationalErrorRecord`, no retry
+        classification, and the completed transition itself was lost
+        (state.phase already reflects the new phase in memory, but that
+        was never persisted). Routing it through the same classifier
+        `advance()`'s in-`try` exceptions use closes that gap: the
+        already-completed transition is retried in place (`retry_phase`
+        is the phase already transitioned into, `state.phase`), not
+        silently discarded.
+
+        `state.phase` (not `phase_before`) is ordinarily the
+        classification target: the dispatch already ran and mutated
+        `state.phase` in memory (and, for pending-input resolution,
+        possibly other fields) before this save was attempted, so a
+        retry must resume from where the phase actually is now, not
+        re-run the phase that already finished producing it. The one
+        exception is a dispatch that transitioned `state.phase` straight
+        to a terminal phase (currently only `_do_planning`, on `->
+        PHASE_DONE`): a terminal phase is never a valid
+        `OperationalErrorRecord.retry_phase` (`RETRY_TARGET_PHASES`
+        excludes both terminal phases by construction), so classifying
+        against it would build an invalid record. `phase_before` is used
+        instead in that case -- it is guaranteed to be non-terminal
+        (checked at the top of `advance()`) and a valid retry target,
+        and re-running it (e.g. re-invoking the planner) is exactly as
+        safe as any other phase retry.
+        """
+        classify_phase = phase_before if state.phase in _TERMINAL_PHASES else state.phase
+        try:
+            self._save(state)
+        except _OPERATIONAL_FAILURE_EXCEPTIONS as exc:
+            return self._handle_operational_failure(
+                state,
+                exc=exc,
+                failed_phase=classify_phase,
+                phase_before=phase_before,
+            )
         return AdvanceOutcome(
-            status=AdvanceStatus.ADVANCED,
+            status=success_status,
             state=state,
             phase_before=phase_before,
             phase_after=state.phase,
@@ -919,10 +974,17 @@ class Supervisor:
         decision_request = DecisionRequest.from_dict(state.decision_request)
         directory = self._active_directory(state)
 
+        # Read, but do not yet clear, any pending operator answer: if the
+        # agent call, its retry, or a downstream contract check below
+        # raises, this phase retries from scratch on the next advance(),
+        # and _do_architecting needs prior_answer again to rebuild the
+        # same prompt. Clearing it here would silently discard guidance
+        # the operator already gave, forcing them to resupply it with no
+        # indication why (backlog item 24). It is cleared only once the
+        # architect has actually produced a usable result below.
         prior_answer = None
         if state.pending_question is not None:
             prior_answer = state.pending_question.get("answer")
-            state.pending_question = None
 
         extra_context = None
         if decision_request.origin == "auditor" and state.auditor_result is not None:
@@ -995,6 +1057,11 @@ class Supervisor:
             raise _InputRequiredSignal()
 
         self._prepare_record_decision(state)
+        # Only clear now that _prepare_record_decision has succeeded and
+        # committed this phase's forward progress (state.phase is already
+        # PHASE_RECORDING_DECISION at this point): if it had raised
+        # instead, retrying architecting still needs prior_answer above.
+        state.pending_question = None
 
     def _prepare_record_decision(self, state: RunState) -> None:
         """Persist decision-recording intent and transition to recording_decision."""
@@ -1074,10 +1141,20 @@ class Supervisor:
         planner = self._require_planner_result(state)
         worktree = self._require_worktree(state)
 
+        # Read, but do not yet clear, any pending operator guidance: if
+        # the agent call, its retry, check_task_identity, or
+        # verify_builder_commit below raises, this phase retries from
+        # scratch on the next advance(), and _do_building needs guidance
+        # again to rebuild the same prompt. Clearing it here would
+        # silently discard guidance the operator already gave, forcing
+        # them to resupply it with no indication why (backlog item 24).
+        # It is cleared once the builder has actually produced a usable,
+        # verified result below -- the BLOCKED branch further down
+        # overwrites it with a fresh pending_question of its own, so no
+        # separate clear is needed there.
         guidance = None
         if state.pending_question is not None:
             guidance = state.pending_question.get("answer")
-            state.pending_question = None
 
         required_changes = None
         audit_findings = None
@@ -1140,6 +1217,10 @@ class Supervisor:
                 )
             verified_head = self.repo.verify_builder_commit(worktree, result.commit)
             state.last_task_head = verified_head
+            # Only clear now that the commit has actually been verified:
+            # if verify_builder_commit had raised instead, retrying
+            # building still needs guidance above.
+            state.pending_question = None
             state.phase = PHASE_VERIFYING if self.options.verify_commands else PHASE_AUDITING
             return
 

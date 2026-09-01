@@ -147,6 +147,18 @@ def _architect_decided(question="Which approach?", **extra):
     return json.dumps(payload)
 
 
+def _architect_needs_input(question="Which approach?", **extra):
+    payload = {
+        "status": "NEEDS_INPUT",
+        "question": question,
+        "rationale": "unclear",
+        "adr": None,
+        "input_request": "Please pick option A or B",
+    }
+    payload.update(extra)
+    return json.dumps(payload)
+
+
 def _make_options(**overrides) -> RunOptions:
     defaults: dict[str, Any] = dict(
         max_accepted_tasks=20,
@@ -1459,3 +1471,226 @@ def test_merge_conflict_goes_to_operational_failure(tmp_path):
     assert state.last_error["kind"] == "merge_conflict"
     assert state.last_error["requires_repair"] is True
     assert state.last_error["retry_phase"] == PHASE_MERGING
+
+
+def test_operator_guidance_survives_a_retried_building_phase(tmp_path):
+    """Regression test for backlog item 24: _do_building previously
+    cleared state.pending_question (consuming the operator's guidance
+    answer) before invoking the builder agent. If that call then failed
+    and the phase retried, the guidance was gone -- the operator had to
+    resupply it with no indication why. Guidance must now survive an
+    operational failure discovered after it was read but before the
+    builder produced a usable result."""
+    from loop_supervisor.opencode import AgentInvocationError
+
+    inner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(), _planner_complete()],
+            "loop-builder": [
+                _builder(status="BLOCKED", open_concerns=["unclear"]),
+                _builder(status="COMPLETE"),
+            ],
+            "loop-auditor": [_auditor(disposition="ACCEPT")],
+        }
+    )
+    prompts: list[str] = []
+    call_count = [0]
+
+    class FlakyRunner:
+        def run_agent(self, *, agent, prompt, **kwargs):
+            if agent == "loop-builder":
+                prompts.append(prompt)
+                call_count[0] += 1
+                if call_count[0] == 2:
+                    # Fails on the first *retried* building attempt, i.e.
+                    # the call made after guidance has already been read
+                    # (and, before the fix, already cleared).
+                    raise AgentInvocationError("flaky builder call")
+            return inner.run_agent(agent=agent, prompt=prompt, **kwargs)
+
+    supervisor, repo = _make_supervisor(
+        tmp_path, FlakyRunner(), input_provider=ScriptedInput(["use approach B"])
+    )
+    state = supervisor.start_new_run()
+    _advance_to_phase(supervisor, state, PHASE_AWAITING_INPUT)
+
+    outcome = supervisor.advance(state)  # awaiting_input -> building (guidance read)
+    assert outcome.status == AdvanceStatus.ADVANCED
+    assert state.phase == PHASE_BUILDING
+    assert state.pending_question is not None
+    assert state.pending_question["answer"] == "use approach B"
+
+    outcome2 = supervisor.advance(state)  # building fails (flaky)
+    assert outcome2.status == AdvanceStatus.OPERATIONAL_FAILURE
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+    assert state.pending_question is not None
+    assert state.pending_question["answer"] == "use approach B"
+
+    outcome3 = supervisor.advance(state)  # operational_failure -> building (retry)
+    assert outcome3.status == AdvanceStatus.ADVANCED
+    assert state.phase == PHASE_BUILDING
+    assert state.pending_question is not None
+    assert state.pending_question["answer"] == "use approach B"
+
+    outcome4 = supervisor.advance(state)  # building succeeds this time
+    assert outcome4.status == AdvanceStatus.ADVANCED
+
+    assert any("use approach B" in p for p in prompts)
+    assert state.pending_question is None
+
+
+def test_operator_guidance_survives_a_retried_architecting_phase(tmp_path):
+    """Regression test for backlog item 24: _do_architecting previously
+    cleared state.pending_question (consuming prior_answer) before
+    invoking the architect agent. If that call then failed and the phase
+    retried, the operator's prior answer was gone."""
+    from loop_supervisor.opencode import AgentInvocationError
+
+    inner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(decision_required=True), _planner_complete()],
+            "loop-architect": [_architect_needs_input(), _architect_decided()],
+            "loop-builder": [_builder(status="COMPLETE")],
+            "loop-auditor": [_auditor(disposition="ACCEPT")],
+        }
+    )
+    prompts: list[str] = []
+    call_count = [0]
+
+    class FlakyRunner:
+        def run_agent(self, *, agent, prompt, **kwargs):
+            if agent == "loop-architect":
+                prompts.append(prompt)
+                call_count[0] += 1
+                if call_count[0] == 2:
+                    raise AgentInvocationError("flaky architect call")
+            return inner.run_agent(agent=agent, prompt=prompt, **kwargs)
+
+    supervisor, repo = _make_supervisor(
+        tmp_path, FlakyRunner(), input_provider=ScriptedInput(["pick option A"])
+    )
+    state = supervisor.start_new_run()
+    _advance_to_phase(supervisor, state, PHASE_AWAITING_INPUT)
+
+    outcome = supervisor.advance(state)  # awaiting_input -> architecting (answer read)
+    assert outcome.status == AdvanceStatus.ADVANCED
+    assert state.phase == "architecting"
+    assert state.pending_question is not None
+    assert state.pending_question["answer"] == "pick option A"
+
+    outcome2 = supervisor.advance(state)  # architecting fails (flaky)
+    assert outcome2.status == AdvanceStatus.OPERATIONAL_FAILURE
+    assert state.pending_question is not None
+    assert state.pending_question["answer"] == "pick option A"
+
+    outcome3 = supervisor.advance(state)  # operational_failure -> architecting (retry)
+    assert outcome3.status == AdvanceStatus.ADVANCED
+
+    assert any("pick option A" in p for p in prompts)
+
+
+def test_post_transition_save_failure_is_classified_not_escaped(tmp_path):
+    """Regression test for backlog item 2: advance()'s success-path
+    _save() call previously sat outside its try/except, so a GitError
+    raised by _save() -> _checkpoint() -> repo.head_commit()/
+    status_snapshot() after an otherwise-successful phase transition
+    escaped unclassified -- no OperationalErrorRecord, no retry
+    classification -- rather than being handled like any other
+    operational failure discovered during the same advance() call."""
+    from loop_supervisor.git import GitError
+
+    runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+
+    call_count = [0]
+    real_status_snapshot = repo.status_snapshot
+
+    class FlakyRepo:
+        def status_snapshot(self, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise GitError("simulated checkpoint failure")
+            return real_status_snapshot(**kwargs)
+
+        def __getattr__(self, name):
+            return getattr(repo, name)
+
+    supervisor.repo = FlakyRepo()
+
+    outcome = supervisor.advance(state)
+
+    assert outcome.status == AdvanceStatus.OPERATIONAL_FAILURE
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+    assert state.last_error is not None
+    assert state.last_error["retryable"] is True
+    # The dispatch itself succeeded and had already advanced state.phase
+    # to creating_worktree in memory before the save failed; the retry
+    # target must be that already-completed transition, not the
+    # planning phase the dispatch ran from.
+    assert state.last_error["retry_phase"] == PHASE_CREATING_WORKTREE
+
+    reloaded = load_state(repo.common_dir(), state.run_id)
+    assert reloaded.phase == PHASE_OPERATIONAL_FAILURE
+    assert reloaded.last_error is not None
+    assert reloaded.last_error["retry_phase"] == PHASE_CREATING_WORKTREE
+
+    outcome2 = supervisor.advance(state)
+    assert outcome2.status == AdvanceStatus.ADVANCED
+    assert state.phase == PHASE_CREATING_WORKTREE
+
+
+def test_post_transition_save_failure_after_terminal_transition_retries_phase_before(
+    tmp_path,
+):
+    """Regression test for a defect that the naive fix for item 2 would
+    have introduced: if a dispatch transitions state.phase straight to a
+    terminal phase (_do_planning -> PHASE_DONE) and the subsequent save
+    then fails, classifying the failure against the terminal phase would
+    build an invalid OperationalErrorRecord (RETRY_TARGET_PHASES
+    excludes terminal phases). The retry target must fall back to
+    phase_before (planning) instead."""
+    from loop_supervisor.git import GitError
+
+    # Planning has no side effects (it is not in _DURABLE_SIDE_EFFECT_PHASES),
+    # so retrying it from scratch after this save failure is safe -- but it
+    # does mean the planner is invoked a second time; two identical
+    # COMPLETE responses are queued for that reason.
+    runner = ScriptedRunner({"loop-planner": [_planner_complete(), _planner_complete()]})
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+
+    call_count = [0]
+    real_status_snapshot = repo.status_snapshot
+
+    class FlakyRepo:
+        def status_snapshot(self, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise GitError("simulated checkpoint failure")
+            return real_status_snapshot(**kwargs)
+
+        def __getattr__(self, name):
+            return getattr(repo, name)
+
+    supervisor.repo = FlakyRepo()
+
+    outcome = supervisor.advance(state)
+
+    assert outcome.status == AdvanceStatus.OPERATIONAL_FAILURE
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+    assert state.last_error is not None
+    assert state.last_error["retryable"] is True
+    assert state.last_error["retry_phase"] == PHASE_PLANNING
+
+    reloaded = load_state(repo.common_dir(), state.run_id)
+    assert reloaded.last_error is not None
+    assert reloaded.last_error["retry_phase"] == PHASE_PLANNING
+
+    outcome2 = supervisor.advance(state)  # operational_failure -> planning
+    assert outcome2.status == AdvanceStatus.ADVANCED
+    assert state.phase == PHASE_PLANNING
+
+    outcome3 = supervisor.advance(state)  # planning -> done, this time saved
+    assert outcome3.status == AdvanceStatus.ADVANCED
+    assert state.phase == PHASE_DONE
