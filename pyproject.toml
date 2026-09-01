@@ -2,7 +2,10 @@
 name = "loop-supervisor"
 version = "0.1.0"
 description = "Headless supervisor that orchestrates an OpenCode planner/architect/builder/auditor loop over Git worktrees."
+readme = "README.md"
 requires-python = ">=3.11"
+license = "BSD-3-Clause"
+authors = [{ name = "Robert Ross", email = "rross@anl.gov" }]
 dependencies = [
   "httpx>=0.28,<0.29",
   "pydantic>=2.6,<3",
@@ -10,6 +13,9 @@ dependencies = [
   "textual>=6.0,<7",
   "rich>=13.9,<15",
 ]
+
+[project.urls]
+Repository = "https://github.com/rbross-hpc/loop-tui-experiment"
 
 [project.scripts]
 loop-supervisor = "loop_supervisor.cli:main"
