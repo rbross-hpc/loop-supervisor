@@ -35,6 +35,24 @@ Stale-lock recovery is always explicit: the operator passes
 `--recover-stale-lock`. A demonstrably dead local PID may be recovered
 with this flag. Remote-hostname and malformed locks are never auto-recovered.
 
+The storage path is also part of the trust boundary. Lock acquisition,
+inspection, stale recovery, and release open the `loop-supervisor` directory
+with no-follow semantics and perform guard/lock operations relative to that
+open directory descriptor. A symlink at that directory is rejected before any
+target file can be opened, read, written, chmodded, flocked, linked, or
+unlinked. The guard and lock leaves retain their existing no-follow and
+regular-file checks. This descriptor-relative contract also prevents a
+pathname replacement during a critical section from redirecting later
+operations elsewhere.
+
+Run-state persistence applies the same contract to
+`loop-supervisor/runs`: both directory components and the requested state-file
+leaf must be real directories/files rather than symlinks. Save and load fail
+with `StateError` on any symlink. State saves still use a mode-0600 temporary
+file and atomic replacement, but all creation, replacement, opening, and
+cleanup are relative to the verified `runs` directory descriptor, so no
+external symlink target is read or modified.
+
 **Lock release requires confirmed OpenCode shutdown.** The lock is
 released only after `OpenCodeServer.stop()` (or the TUI's equivalent
 ownership-preserving cleanup) has been *confirmed* to succeed — not

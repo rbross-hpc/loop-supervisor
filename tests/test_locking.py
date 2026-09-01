@@ -617,6 +617,88 @@ def test_dangling_lock_symlink_at_release_time_is_not_treated_as_absent(tmp_path
     assert lock_path.is_symlink()
 
 
+def test_acquire_rejects_symlinked_lock_directory_without_touching_target(tmp_path):
+    outside = tmp_path.parent / "outside-lock-acquire"
+    outside.mkdir()
+    outside_guard = outside / "supervisor.lock.guard"
+    outside_guard.write_text("outside guard\n")
+    outside_guard.chmod(0o644)
+
+    storage = tmp_path / "loop-supervisor"
+    storage.symlink_to(outside, target_is_directory=True)
+
+    lock = _make_lock(tmp_path)
+    with pytest.raises(LockError, match="symbolic link"):
+        lock.acquire()
+
+    assert storage.is_symlink()
+    assert outside_guard.read_text() == "outside guard\n"
+    assert outside_guard.stat().st_mode & 0o777 == 0o644
+    assert not (outside / "supervisor.lock").exists()
+
+
+def test_inspection_and_recovery_reject_symlinked_lock_directory_without_touching_target(
+    tmp_path,
+):
+    outside = tmp_path.parent / "outside-lock-recovery"
+    outside.mkdir()
+    dead_pid = _get_dead_pid()
+    outside_lock = outside / "supervisor.lock"
+    outside_lock.write_text(
+        json.dumps(
+            dict(
+                _VALID_RECORD,
+                pid=dead_pid,
+                hostname=socket.gethostname(),
+                token="outside-token",
+                integration_path=str(tmp_path),
+            )
+        )
+    )
+    outside_lock.chmod(0o640)
+    original = outside_lock.read_bytes()
+
+    storage = tmp_path / "loop-supervisor"
+    storage.symlink_to(outside, target_is_directory=True)
+
+    lock = _make_lock(tmp_path, recover_stale=True)
+    with pytest.raises(LockError, match="symbolic link"):
+        lock.acquire()
+
+    assert storage.is_symlink()
+    assert outside_lock.read_bytes() == original
+    assert outside_lock.stat().st_mode & 0o777 == 0o640
+    assert not (outside / "supervisor.lock.guard").exists()
+
+
+def test_release_rejects_symlinked_lock_directory_without_touching_target(tmp_path):
+    lock = _make_lock(tmp_path)
+    lock.acquire()
+    storage = tmp_path / "loop-supervisor"
+    displaced = tmp_path / "real-loop-supervisor"
+    storage.rename(displaced)
+
+    outside = tmp_path.parent / "outside-lock-release"
+    outside.mkdir()
+    outside_guard = outside / "supervisor.lock.guard"
+    outside_guard.write_text("outside guard\n")
+    outside_guard.chmod(0o644)
+    outside_lock = outside / "supervisor.lock"
+    outside_lock.write_text("outside lock\n")
+    outside_lock.chmod(0o640)
+    storage.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(LockError, match="symbolic link"):
+        lock.release()
+
+    assert lock._token is not None
+    assert storage.is_symlink()
+    assert outside_guard.read_text() == "outside guard\n"
+    assert outside_guard.stat().st_mode & 0o777 == 0o644
+    assert outside_lock.read_text() == "outside lock\n"
+    assert outside_lock.stat().st_mode & 0o777 == 0o640
+
+
 # -- retryable release --------------------------------------------------------
 
 
@@ -656,11 +738,11 @@ def test_release_retries_after_transient_read_failure(tmp_path, monkeypatch):
     original_read_lock = locking_mod._read_lock
     call_count = [0]
 
-    def _flaky_read_lock(path):
+    def _flaky_read_lock(path, *, directory_fd=None):
         call_count[0] += 1
         if call_count[0] == 1:
             raise MalformedLockError("simulated transient read failure")
-        return original_read_lock(path)
+        return original_read_lock(path, directory_fd=directory_fd)
 
     monkeypatch.setattr(locking_mod, "_read_lock", _flaky_read_lock)
 

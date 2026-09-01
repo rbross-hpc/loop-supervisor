@@ -430,6 +430,84 @@ def test_list_runs_skips_unsafe_filenames(tmp_path):
     assert result == [state.run_id]
 
 
+# -- state storage symlink safety ---------------------------------------------
+
+
+@pytest.mark.parametrize("component", ["loop-supervisor", "runs"])
+def test_save_rejects_symlinked_state_directory_and_leaves_target_untouched(tmp_path, component):
+    outside = tmp_path.parent / f"outside-save-{component}"
+    outside.mkdir()
+    marker = outside / "marker.txt"
+    marker.write_text("outside\n")
+
+    if component == "loop-supervisor":
+        (tmp_path / "loop-supervisor").symlink_to(outside, target_is_directory=True)
+    else:
+        parent = tmp_path / "loop-supervisor"
+        parent.mkdir()
+        (parent / "runs").symlink_to(outside, target_is_directory=True)
+
+    state = _make_state("symlink-save")
+    with pytest.raises(StateError, match="symbolic link"):
+        save_state(tmp_path, state)
+
+    assert marker.read_text() == "outside\n"
+    assert sorted(path.name for path in outside.iterdir()) == ["marker.txt"]
+
+
+@pytest.mark.parametrize("component", ["loop-supervisor", "runs"])
+def test_load_rejects_symlinked_state_directory_without_reading_target(tmp_path, component):
+    outside = tmp_path.parent / f"outside-load-{component}"
+    outside.mkdir()
+    run_id = "symlink-load"
+    target = outside / f"{run_id}.json"
+    target.write_text("outside secret that is not JSON")
+
+    if component == "loop-supervisor":
+        (tmp_path / "loop-supervisor").symlink_to(outside, target_is_directory=True)
+    else:
+        parent = tmp_path / "loop-supervisor"
+        parent.mkdir()
+        (parent / "runs").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(StateError, match="symbolic link"):
+        load_state(tmp_path, run_id)
+
+    assert target.read_text() == "outside secret that is not JSON"
+
+
+def test_save_rejects_state_file_symlink_and_leaves_target_untouched(tmp_path):
+    run_id = "symlink-save-leaf"
+    runs = tmp_path / "loop-supervisor" / "runs"
+    runs.mkdir(parents=True)
+    outside = tmp_path.parent / "outside-save-state.json"
+    outside.write_text("outside state\n")
+    target = runs / f"{run_id}.json"
+    target.symlink_to(outside)
+
+    with pytest.raises(StateError, match="symbolic link"):
+        save_state(tmp_path, _make_state(run_id))
+
+    assert target.is_symlink()
+    assert outside.read_text() == "outside state\n"
+
+
+def test_load_rejects_state_file_symlink_without_reading_target(tmp_path):
+    run_id = "symlink-load-leaf"
+    runs = tmp_path / "loop-supervisor" / "runs"
+    runs.mkdir(parents=True)
+    outside = tmp_path.parent / "outside-load-state.json"
+    outside.write_text("outside secret that is not JSON")
+    target = runs / f"{run_id}.json"
+    target.symlink_to(outside)
+
+    with pytest.raises(StateError, match="symbolic link"):
+        load_state(tmp_path, run_id)
+
+    assert target.is_symlink()
+    assert outside.read_text() == "outside secret that is not JSON"
+
+
 # -- strict phase / error-record validation ----------------------------------
 
 

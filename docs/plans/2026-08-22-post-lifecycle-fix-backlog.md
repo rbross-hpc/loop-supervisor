@@ -164,14 +164,29 @@ after the fact get written down.
    `docs/decisions/0009-supervisor-lock-and-operational-failure-semantics.md`'s
    Consequences section.
 
-4. **Symlinked lock/state ancestor directories, and state-file symlinks,
-   are not rejected.**
-   `src/loop_supervisor/locking.py:76-115` (`_lock_path`, `_guard_path`,
-   `_guarded`), `src/loop_supervisor/state.py:684-730` (`save_state`,
-   `load_state`); corrected from a stale `:76-103`/`:665-695` citation.
-   `_open_no_follow` guards the leaf lock/guard files, but a symlinked
-   `loop-supervisor` *ancestor* directory could redirect lock/state writes
-   outside Git metadata entirely.
+4. ~~**Symlinked lock/state ancestor directories, and state-file symlinks,
+   are not rejected.**~~ **Resolved.**
+   Lock operations now open `<git-common-dir>/loop-supervisor` with
+   `O_NOFOLLOW|O_DIRECTORY` and perform guard and lock opens, links, stats,
+   and unlinks relative to that verified directory descriptor. Acquisition,
+   inspection, stale recovery, and release therefore reject a symlinked
+   storage directory before touching its target; existing leaf no-follow,
+   atomicity, stale-recovery, and retryable-release behavior remain intact.
+   State save/load likewise walk `loop-supervisor/runs` one descriptor at a
+   time without following either component, reject a symlinked requested
+   state-file leaf, and perform mode-0600 temporary-file replacement and
+   reads relative to the verified runs descriptor. Failures are normalized
+   to `LockError`/`StateError` and outside targets remain untouched. See the
+   filesystem contract in ADR 0009; implementation in
+   `src/loop_supervisor/locking.py` and `src/loop_supervisor/state.py`; and
+   regression coverage in `tests/test_locking.py`
+   (`test_acquire_rejects_symlinked_lock_directory_without_touching_target`,
+   `test_inspection_and_recovery_reject_symlinked_lock_directory_without_touching_target`,
+   `test_release_rejects_symlinked_lock_directory_without_touching_target`)
+   and `tests/test_state.py` (the `test_*symlinked_state_directory*` and
+   `test_*state_file_symlink*` tests). All nine defect-pinning cases were
+   verified failing against the pre-fix implementation and passing after the
+   fix.
 
 5. ~~Dangling lock symlink can spin acquisition.~~ **Resolved.**
    `src/loop_supervisor/locking.py:364` (`_inspect_existing_lock`) and
