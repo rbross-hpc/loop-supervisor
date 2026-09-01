@@ -11,6 +11,24 @@ This is a prioritized list of substantiated findings from the lifecycle
 audit that were judged **not** to block release, but that should be
 tracked and addressed in follow-up work rather than dropped.
 
+## Deferred: TUI work
+
+The repository owner wants the TUI eventually, primarily for
+monitoring an in-progress run, but it is not a current priority and
+should not be picked up as planner-selected work right now. Items
+marked **DEFERRED** below (16, 17, 18, 31, 40) are open, substantiated
+findings that remain genuinely unresolved -- they are not being
+closed or judged unimportant -- but must not be selected as the next
+unit of work until this note is removed or a specific item is
+explicitly reopened. This is distinct from items resolved, struck, or
+closed with a documented alternative elsewhere in this file, all of
+which are settled and will not be revisited absent new information.
+
+Items 14, 15, 19, and 42 also touch TUI/SSE code but are left in
+normal rotation: they are correctness or test-coverage gaps in
+existing, already-built behavior, not blocked on an undecided design
+question the way the deferred items are.
+
 ## Corrections to prior commit messages
 
 Commit messages in this project are treated as part of the durable
@@ -356,19 +374,23 @@ after the fact get written down.
 15. **Trailing-event attribution loss.**
     `src/loop_supervisor/tui/live.py:224-236`.
 
-16. **Browser, durable-state, and live rendering remain behind
-    README/plan claims.**
+16. **DEFERRED. Browser, durable-state, and live rendering remain
+    behind README/plan claims.**
     `src/loop_supervisor/tui/app.py:204-243`,
     `src/loop_supervisor/tui/renderers.py:58-78`.
     Reasoning, tools, files, feed, and connection-reason rendering are
     incomplete relative to documented scope. Either implement the
     missing rendering or narrow the README/plan language for this slice.
+    Repository owner's call: the TUI is wanted eventually for
+    monitoring, but is not on the critical path right now and should
+    not be picked up as a planner task until reopened. See the
+    "Deferred: TUI work" note at the top of this file.
 
-17. **`tui` should validate new-run options the same way `run` does,
-    and accept the same run-behavior flags instead of a hardcoded
-    default.** `src/loop_supervisor/cli.py:416-422` (the `tui`
-    subparser accepts only `--project`/`--recover-stale-lock`, none of
-    `run`'s nine flags), `src/loop_supervisor/tui/app.py:159-170`
+17. **DEFERRED. `tui` should validate new-run options the same way
+    `run` does, and accept the same run-behavior flags instead of a
+    hardcoded default.** `src/loop_supervisor/cli.py:416-422` (the
+    `tui` subparser accepts only `--project`/`--recover-stale-lock`,
+    none of `run`'s nine flags), `src/loop_supervisor/tui/app.py:159-170`
     (`_DEFAULT_OPTIONS`). (Citation to `cli.py:257-302` in an earlier
     version of this item had drifted from the `tui` parser it was
     meant to describe; corrected here.) Also covers `max_steps`/
@@ -378,10 +400,12 @@ after the fact get written down.
     `max_steps` (`supervisor.py:718-735`). See
     `docs/decisions/0021-tui-drives-runsession-in-process.md` for the
     full accounting of where the TUI's step loop diverges from the
-    headless one.
+    headless one. Deferred alongside item 16; see the note at the top
+    of this file.
 
-18. **Define and propagate meaningful TUI process exit status.**
-    `src/loop_supervisor/cli.py:234-250`.
+18. **DEFERRED. Define and propagate meaningful TUI process exit
+    status.** `src/loop_supervisor/cli.py:234-250`. Deferred alongside
+    item 16; see the note at the top of this file.
 
 19. **Add parser event-size limits and reconnect/backoff acceptance
     coverage** for the SSE client.
@@ -406,8 +430,17 @@ after the fact get written down.
     `docs/decisions/0019-live-activity-reducer-bounds-and-event-
     filtering.md`.
 
-21. **Correct merge-conflict repair instructions.**
-    `README.md:267-272`.
+21. ~~**Correct merge-conflict repair instructions.**~~ **Resolved.**
+    `README.md`'s "Merge-conflict repair" section described the repair
+    steps accurately but did not say *when* a conflict can actually
+    arise. The supervisor is the sole writer of the integration branch
+    during a normal run (every task branch is created from, and merged
+    back into, the integration HEAD it itself observed), so a conflict
+    cannot originate from the loop's own operation alone -- it
+    requires something external to change the integration branch
+    mid-run (a manual commit, a second supervisor run against the same
+    repository). Added that precondition directly to the section
+    rather than leaving it implied.
 
 22a. ~~Add missing end-to-end tests for signals (SIGINT/SIGTERM against
     a real headless process)~~ **Resolved.**
@@ -725,8 +758,19 @@ after the fact get written down.
     the live failure required manually reading OpenCode's own log
     instead of the supervisor's own output explaining itself.
 
-28. **Add a config-level catch-all `deny` so no permission can ever
-    evaluate to `ask`, closing the general case behind item 27.**
+28. ~~**Add a config-level catch-all `deny` so no permission can ever
+    evaluate to `ask`, closing the general case behind item 27.**~~
+    **Struck.** Repository owner's call: item 27's own resolution
+    already established that `Permission.evaluate`'s `ask` fallback is
+    hard-coded and no config can fully eliminate it, so this was
+    defence-in-depth on top of an already-resolved item, not a fix for
+    a live gap. Applying it would also require auditing all four agent
+    permission blocks and a live smoke run before it could be trusted
+    (see below) — cost disproportionate to the residual risk it closes.
+    Left here rather than deleted, per this file's convention of never
+    dropping a substantiated finding outright. The analysis below
+    (`Permission.evaluate`'s exact merge/`findLast` semantics) remains
+    accurate and is worth keeping for reference if this is revisited.
     `opencode.json`. Verified against the installed OpenCode 1.18.22
     binary (`/home/node/.npm-global/lib/node_modules/opencode-ai/bin/opencode.exe`)
     by reading its (minified) permission-resolution code directly,
@@ -869,10 +913,10 @@ after the fact get written down.
     the project ever acquires a real installed user base whose
     in-flight run state would need to survive an upgrade.
 
-31. **Decide whether the TUI should get its own say over
+31. ~~**Decide whether the TUI should get its own say over
     `permission.asked` auto-denial, rather than silently inheriting
-    the headless denier.** `src/loop_supervisor/tui/app.py`,
-    `src/loop_supervisor/permissions.py`.
+    the headless denier.**~~ **Closed: headless denier stands.**
+    `src/loop_supervisor/tui/app.py`, `src/loop_supervisor/permissions.py`.
 
     Corrected premise (see `docs/decisions/0021-tui-drives-
     runsession-in-process.md`): `PermissionDenier` is **not**
@@ -886,14 +930,15 @@ after the fact get written down.
     called only from `run_new`/`run_resume`, so the TUI silently
     inherits the denial behavior without surfacing it (see the fix
     that reads `denied_permission_count`/`denied_permission_summary`
-    into the durable pane, addressing the reporting half only). The
-    open question this item still tracks is a real UX/design one: is
-    "the headless denier decides, TUI just gets told" the right
-    answer, or should an operator watching the TUI be able to see the
-    request and reply themselves before it is auto-rejected? That
-    needs its own answer plus a second SSE consumer sharing one
-    connection's event dispatch, not just reusing `PermissionDenier`
-    as-is.
+    into the durable pane, addressing the reporting half only).
+
+    Repository owner's call: "the headless denier decides, TUI just
+    gets told" is the answer. Letting an operator answer a permission
+    prompt live from the TUI needs its own SSE consumer sharing one
+    connection's event dispatch -- real design and implementation
+    work for a UI surface that is itself deferred (see the "Deferred:
+    TUI work" note at the top of this file). Not worth building ahead
+    of the TUI itself becoming a live priority again.
 
 32. ~~**Consider having the supervisor provision each task worktree's
     `.venv` itself, instead of relying on the builder agent to do
@@ -990,42 +1035,61 @@ after the fact get written down.
     prompt-injection parameter, and what would supersede it once item
     30's schema squash lands.
 
-34. **No supported way for a new project to also hack on
+34. ~~**No supported way for a new project to also hack on
     `loop-supervisor`'s own source (self-hosting regression from item
-    25's fix).**
+    25's fix).**~~ **Resolved: documented workaround, no new feature.**
     `docs/decisions/0018-bootstrap-generates-a-dependent-skeleton-not-a-vendored-copy.md`.
     This repository improves itself via its own loop today — the
     builder can freely edit `src/loop_supervisor/` because that source
     is right there in the checkout. Once a new project depends on
     `loop-supervisor` as an installed package (item 25's fix), it has
     no supervisor source to edit at all, and no supported bootstrap
-    mode reintroduces one. A project that specifically wants to
-    co-develop the supervisor alongside its own work (as this
-    repository does) has no path there other than manually cloning
-    `loop-supervisor` itself and switching its dependency to a local
-    editable path. If this is judged to matter, the likely shape is an
-    `init --fork` mode that vendors (today's old behavior, minus the
-    scope problem item 25 fixed) as an explicit opt-in alternative to
-    the new default, not a repurposing of the removed `--in-place`.
+    mode reintroduces one.
 
-35. **Versioning: generated projects pin `loop-supervisor` to a Git
-    URL with no released version, and agent-definition compatibility
-    across upgrades is unenforced.**
-    `src/loop_supervisor/_skeleton/pyproject.toml.tmpl`,
-    `docs/decisions/0018-bootstrap-generates-a-dependent-skeleton-not-a-vendored-copy.md`.
-    The generated `pyproject.toml`'s dependency is `loop-supervisor @
-    git+<url>` with an explicit "TODO: pin this to a released version
-    or tag once one exists" comment, because no released version
-    exists yet. Once one does, a generated project and the
-    `loop-supervisor` version it depends on can drift: the four
-    `.opencode/agents/*.md` files are a point-in-time copy made at
-    `init` time, not something re-synced on a `pip install --upgrade`,
-    so an upgraded supervisor's expectations about, e.g., the
-    structured JSON contract (`contracts.py`) or prompt content could
-    silently diverge from what the copied agent definitions actually
-    say. No compatibility check exists between an installed
-    `loop-supervisor` version and a project's own copied agent
-    definitions.
+    Repository owner's call: no `init --fork` mode. The manual
+    workaround this item already identified (clone `loop-supervisor`
+    separately, point the dependency at a local editable install) is
+    sufficient and is now documented in `docs/ADOPTING.md`'s
+    "Co-developing `loop-supervisor` itself alongside a project"
+    section rather than left as an unwritten escape hatch. Revisit
+    only if a real second project actually needs this in practice —
+    speculative tooling for a single hypothetical user was judged not
+    worth building.
+
+35a. **Pin generated projects' `loop-supervisor` dependency to a
+     released version once one exists.** `src/loop_supervisor/
+     _skeleton/pyproject.toml.tmpl` currently generates `loop-supervisor
+     @ git+<url>` with a "TODO: pin this to a released version or tag
+     once one exists" comment, because no released version existed.
+     Item 45 (LICENSE + distribution metadata) has since been
+     resolved, which was the actual blocker: a release needs a license
+     to publish under. Mechanical once a version is actually cut: tag
+     a release (e.g. `v0.1.0`) and change the template to
+     `loop-supervisor @ git+<url>@v0.1.0`, or an equivalent
+     `>=`-pinned form once this project is on PyPI.
+
+35b. **Agent-definition/version compatibility across upgrades is
+     unenforced.**
+     `docs/decisions/0018-bootstrap-generates-a-dependent-skeleton-not-a-vendored-copy.md`.
+     The four `.opencode/agents/*.md` files are a point-in-time copy
+     made at `init` time, not something re-synced on a `pip install
+     --upgrade`, so an upgraded supervisor's expectations about, e.g.,
+     the structured JSON contract (`contracts.py`) or prompt content
+     could silently diverge from what the copied agent definitions
+     actually say. No compatibility check exists between an installed
+     `loop-supervisor` version and a project's own copied agent
+     definitions.
+
+     Repository owner's call (decided, not yet implemented): stamp the
+     generating `loop-supervisor` version into each of the four agent
+     files' frontmatter at `init` time, and add a `config validate`
+     check that compares it against the currently-installed version,
+     warning (not failing) on a mismatch. This surfaces drift without
+     blocking a run on it — the same posture `config validate`'s other
+     nine checks already take. A hard-fail on a contract hash was
+     considered and rejected: it would fire on harmless prompt-wording
+     edits with no actual contract change, which is worse than the
+     silent-drift problem it would solve.
 
 36. **TUI startup-failure deadlock (currently unreachable): the single
     reusable `_shutdown_complete_event` could be awaited by a caller
@@ -1176,9 +1240,10 @@ after the fact get written down.
     `test_popen_oserror_with_throwing_str_normalized_to_startup_error`
     template.
 
-40. **TUI module layout never matched the planned split; `tui/app.py`
-    has grown to ~1,400 lines holding both `RunBrowserScreen` and
-    `RunScreen`.** (Tier 5 — documentation/testing debt)
+40. **DEFERRED. TUI module layout never matched the planned split;
+    `tui/app.py` has grown to ~1,400 lines holding both
+    `RunBrowserScreen` and `RunScreen`.** (Tier 5 —
+    documentation/testing debt)
     `docs/plans/2026-08-21-tui-vertical-slice.md` (archived; see below)
     §16 named a `tui/` package with separate `screens.py` and
     `widgets.py` modules; the actual package is `__init__.py`,
@@ -1187,7 +1252,8 @@ after the fact get written down.
     observation, not a defect: nothing is currently broken by the
     combined file. Worth a real decision (revisit the split, or
     formally drop it) rather than carrying it as silent drift from an
-    abandoned plan.
+    abandoned plan -- deferred alongside the rest of the TUI work
+    rather than decided now; see the note at the top of this file.
 
 41. **`tests/fixtures/fake_opencode.py` emits only the legacy
     `structured_output` response shape; the canonical `info.structured`
