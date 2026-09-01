@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+import loop_supervisor.locking as locking_mod
 from loop_supervisor.locking import (
     LockError,
     MalformedLockError,
@@ -54,6 +55,18 @@ def test_lock_file_mode_is_0600(tmp_path):
         mode = oct(_lock_path(tmp_path).stat().st_mode)[-3:]
         assert mode == "600"
     finally:
+        lock.release()
+
+
+def test_lock_file_mode_is_0600_under_restrictive_umask(tmp_path):
+    (tmp_path / "loop-supervisor").mkdir(mode=0o700)
+    previous_umask = os.umask(0o777)
+    lock = _make_lock(tmp_path)
+    try:
+        lock.acquire()
+        assert _lock_path(tmp_path).stat().st_mode & 0o777 == 0o600
+    finally:
+        os.umask(previous_umask)
         lock.release()
 
 
@@ -615,6 +628,35 @@ def test_dangling_lock_symlink_at_release_time_is_not_treated_as_absent(tmp_path
 
     assert lock._token is not None
     assert lock_path.is_symlink()
+
+
+@pytest.mark.parametrize("capability", ["O_NOFOLLOW", "O_DIRECTORY"])
+def test_acquire_fails_closed_without_required_open_capability(tmp_path, monkeypatch, capability):
+    monkeypatch.delattr(locking_mod.os, capability)
+
+    with pytest.raises(LockError, match=rf"requires os\.{capability}"):
+        _make_lock(tmp_path).acquire()
+
+    assert not (tmp_path / "loop-supervisor").exists()
+
+
+def test_missing_no_follow_capability_cannot_modify_symlink_target(tmp_path, monkeypatch):
+    outside = tmp_path.parent / "outside-unsupported-lock"
+    outside.mkdir()
+    outside_guard = outside / "supervisor.lock.guard"
+    outside_guard.write_text("outside guard\n")
+    outside_guard.chmod(0o644)
+    storage = tmp_path / "loop-supervisor"
+    storage.symlink_to(outside, target_is_directory=True)
+    monkeypatch.delattr(locking_mod.os, "O_NOFOLLOW")
+
+    with pytest.raises(LockError, match=r"requires os\.O_NOFOLLOW"):
+        _make_lock(tmp_path).acquire()
+
+    assert storage.is_symlink()
+    assert outside_guard.read_text() == "outside guard\n"
+    assert outside_guard.stat().st_mode & 0o777 == 0o644
+    assert not (outside / "supervisor.lock").exists()
 
 
 def test_acquire_rejects_symlinked_lock_directory_without_touching_target(tmp_path):

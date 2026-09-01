@@ -175,16 +175,23 @@ after the fact get written down.
    State save/load likewise walk `loop-supervisor/runs` one descriptor at a
    time without following either component, reject a symlinked requested
    state-file leaf, and perform mode-0600 temporary-file replacement and
-   reads relative to the verified runs descriptor. Failures are normalized
-   to `LockError`/`StateError` and outside targets remain untouched. See the
+   reads relative to the verified runs descriptor. Required `O_NOFOLLOW` and
+   `O_DIRECTORY` capabilities are checked up front and unsupported platforms
+   fail closed instead of silently weakening the contract. Temporary lock and
+   state files are explicitly set to mode 0600 before publication, independent
+   of the caller's umask. Failures are normalized to `LockError`/`StateError`
+   and outside targets remain untouched. See the
    filesystem contract in ADR 0009; implementation in
    `src/loop_supervisor/locking.py` and `src/loop_supervisor/state.py`; and
    regression coverage in `tests/test_locking.py`
    (`test_acquire_rejects_symlinked_lock_directory_without_touching_target`,
    `test_inspection_and_recovery_reject_symlinked_lock_directory_without_touching_target`,
-   `test_release_rejects_symlinked_lock_directory_without_touching_target`)
-   and `tests/test_state.py` (the `test_*symlinked_state_directory*` and
-   `test_*state_file_symlink*` tests). All nine defect-pinning cases were
+   `test_release_rejects_symlinked_lock_directory_without_touching_target`,
+   `test_lock_file_mode_is_0600_under_restrictive_umask`, and the
+   `test_*required_open_capability*` tests) and `tests/test_state.py` (the
+   `test_*symlinked_state_directory*`, `test_*state_file_symlink*`, restrictive
+   umask, and required-open-capability tests). All nine original symlink
+   defect-pinning cases were
    verified failing against the pre-fix implementation and passing after the
    fix.
 

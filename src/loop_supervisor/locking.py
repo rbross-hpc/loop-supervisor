@@ -80,6 +80,14 @@ def _guard_path(git_common_dir: Path) -> Path:
     return git_common_dir / "loop-supervisor" / "supervisor.lock.guard"
 
 
+def _required_open_flag(name: str) -> int:
+    """Return a required secure-open flag, or fail closed if unavailable."""
+    value = getattr(os, name, None)
+    if not isinstance(value, int):
+        raise LockError(f"secure lock storage requires os.{name}; this platform is unsupported")
+    return value
+
+
 def _open_lock_directory(git_common_dir: Path) -> int:
     """Open the lock storage directory without following its leaf.
 
@@ -87,12 +95,14 @@ def _open_lock_directory(git_common_dir: Path) -> int:
     so replacing or redirecting the pathname cannot move an in-progress
     critical section outside Git metadata.
     """
+    directory_flag = _required_open_flag("O_DIRECTORY")
+    nofollow_flag = _required_open_flag("O_NOFOLLOW")
     directory = git_common_dir / "loop-supervisor"
     try:
         os.mkdir(directory, 0o700)
     except FileExistsError:
         pass
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | directory_flag | nofollow_flag
     try:
         fd = os.open(directory, flags)
     except OSError as exc:
@@ -158,13 +168,14 @@ def _pid_is_alive(pid: int) -> bool:
 
 
 def _open_no_follow(path: Path, flags: int, mode: int = 0o600, *, dir_fd: int | None = None) -> int:
-    """Open a path with symlink-following refused where the platform
-    supports O_NOFOLLOW, and verify the resulting descriptor refers to a
-    regular file. Used for both the guard file and the lock file itself:
+    """Open a path with mandatory symlink-following refusal and verify the
+    resulting descriptor refers to a regular file. Platforms without
+    ``O_NOFOLLOW`` are rejected rather than silently weakening this contract.
+    Used for both the guard file and the lock file itself:
     neither acquisition, inspection, nor release must ever be tricked into
     operating on an arbitrary attacker-controlled target reached via a
     symlink placed at the expected path."""
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nofollow = _required_open_flag("O_NOFOLLOW")
     fd = os.open(str(path), flags | nofollow, mode, dir_fd=dir_fd)
     try:
         st = os.fstat(fd)
@@ -286,6 +297,7 @@ def _write_lock_file(path: Path, record: dict[str, Any], *, directory_fd: int) -
         Path(tmp_name), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=directory_fd
     )
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as handle:
             json.dump(record, handle, indent=2)
             handle.write("\n")

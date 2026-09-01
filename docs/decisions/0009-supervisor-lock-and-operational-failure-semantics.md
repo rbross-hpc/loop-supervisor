@@ -43,7 +43,9 @@ target file can be opened, read, written, chmodded, flocked, linked, or
 unlinked. The guard and lock leaves retain their existing no-follow and
 regular-file checks. This descriptor-relative contract also prevents a
 pathname replacement during a critical section from redirecting later
-operations elsewhere.
+operations elsewhere. `O_NOFOLLOW` and `O_DIRECTORY` support is mandatory:
+on a platform that lacks either flag, lock storage fails with `LockError`
+rather than substituting zero and weakening the no-follow contract.
 
 Run-state persistence applies the same contract to
 `loop-supervisor/runs`: both directory components and the requested state-file
@@ -51,7 +53,11 @@ leaf must be real directories/files rather than symlinks. Save and load fail
 with `StateError` on any symlink. State saves still use a mode-0600 temporary
 file and atomic replacement, but all creation, replacement, opening, and
 cleanup are relative to the verified `runs` directory descriptor, so no
-external symlink target is read or modified.
+external symlink target is read or modified. State storage likewise requires
+`O_NOFOLLOW` and `O_DIRECTORY` and fails with `StateError` when either secure
+open capability is unavailable. Newly created lock and state temporary files
+are explicitly `fchmod`ed to exactly mode 0600 before publication, preserving
+that guarantee independently of the caller's umask.
 
 **Lock release requires confirmed OpenCode shutdown.** The lock is
 released only after `OpenCodeServer.stop()` (or the TUI's equivalent

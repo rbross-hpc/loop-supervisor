@@ -1,8 +1,10 @@
 import json
+import os
 from typing import Any
 
 import pytest
 
+import loop_supervisor.state as state_mod
 from loop_supervisor.state import (
     STATE_SCHEMA_VERSION,
     DecisionRequest,
@@ -71,6 +73,18 @@ def test_save_sets_permissions(tmp_path):
     path = state_path(tmp_path, state.run_id)
     mode = path.stat().st_mode & 0o777
     assert mode == 0o600
+
+
+def test_save_sets_permissions_under_restrictive_umask(tmp_path):
+    state = _make_state(new_run_id())
+    (tmp_path / "loop-supervisor" / "runs").mkdir(parents=True, mode=0o700)
+    previous_umask = os.umask(0o777)
+    try:
+        save_state(tmp_path, state)
+    finally:
+        os.umask(previous_umask)
+
+    assert state_path(tmp_path, state.run_id).stat().st_mode & 0o777 == 0o600
 
 
 def test_load_missing_run_raises(tmp_path):
@@ -433,6 +447,43 @@ def test_list_runs_skips_unsafe_filenames(tmp_path):
 # -- state storage symlink safety ---------------------------------------------
 
 
+@pytest.mark.parametrize("capability", ["O_NOFOLLOW", "O_DIRECTORY"])
+def test_state_storage_fails_closed_without_required_open_capability(
+    tmp_path, monkeypatch, capability
+):
+    monkeypatch.delattr(state_mod.os, capability)
+    state = _make_state("unsupported-platform")
+
+    with pytest.raises(StateError, match=rf"requires os\.{capability}"):
+        save_state(tmp_path, state)
+    with pytest.raises(StateError, match=rf"requires os\.{capability}"):
+        load_state(tmp_path, state.run_id)
+
+    assert not (tmp_path / "loop-supervisor").exists()
+
+
+def test_missing_no_follow_capability_cannot_read_or_modify_symlink_target(tmp_path, monkeypatch):
+    outside = tmp_path.parent / "outside-unsupported-state"
+    outside.mkdir()
+    outside_runs = outside / "runs"
+    outside_runs.mkdir()
+    run_id = "unsupported-symlink"
+    target = outside_runs / f"{run_id}.json"
+    target.write_text("outside secret\n")
+    storage = tmp_path / "loop-supervisor"
+    storage.symlink_to(outside, target_is_directory=True)
+    monkeypatch.delattr(state_mod.os, "O_NOFOLLOW")
+
+    with pytest.raises(StateError, match=r"requires os\.O_NOFOLLOW"):
+        save_state(tmp_path, _make_state(run_id))
+    with pytest.raises(StateError, match=r"requires os\.O_NOFOLLOW"):
+        load_state(tmp_path, run_id)
+
+    assert storage.is_symlink()
+    assert target.read_text() == "outside secret\n"
+    assert sorted(path.name for path in outside_runs.iterdir()) == [target.name]
+
+
 @pytest.mark.parametrize("component", ["loop-supervisor", "runs"])
 def test_save_rejects_symlinked_state_directory_and_leaves_target_untouched(tmp_path, component):
     outside = tmp_path.parent / f"outside-save-{component}"
@@ -460,7 +511,9 @@ def test_load_rejects_symlinked_state_directory_without_reading_target(tmp_path,
     outside = tmp_path.parent / f"outside-load-{component}"
     outside.mkdir()
     run_id = "symlink-load"
-    target = outside / f"{run_id}.json"
+    target_parent = outside / "runs" if component == "loop-supervisor" else outside
+    target_parent.mkdir(exist_ok=True)
+    target = target_parent / f"{run_id}.json"
     target.write_text("outside secret that is not JSON")
 
     if component == "loop-supervisor":

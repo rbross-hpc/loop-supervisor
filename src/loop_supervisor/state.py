@@ -620,9 +620,19 @@ def state_path(git_common_dir: Path, run_id: str) -> Path:
     return state_dir(git_common_dir) / f"{validated}.json"
 
 
+def _required_open_flag(name: str) -> int:
+    """Return a required secure-open flag, or fail closed if unavailable."""
+    value = getattr(os, name, None)
+    if not isinstance(value, int):
+        raise StateError(f"secure state storage requires os.{name}; this platform is unsupported")
+    return value
+
+
 @contextlib.contextmanager
 def _open_state_directory(git_common_dir: Path, *, create: bool):
     """Yield the runs directory descriptor without following storage symlinks."""
+    directory_flag = _required_open_flag("O_DIRECTORY")
+    nofollow_flag = _required_open_flag("O_NOFOLLOW")
     supervisor = git_common_dir / "loop-supervisor"
     runs = supervisor / "runs"
     try:
@@ -633,7 +643,7 @@ def _open_state_directory(git_common_dir: Path, *, create: bool):
                 pass
         supervisor_fd = os.open(
             supervisor,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | directory_flag | nofollow_flag,
         )
     except OSError as exc:
         raise StateError(
@@ -648,7 +658,7 @@ def _open_state_directory(git_common_dir: Path, *, create: bool):
                     pass
             runs_fd = os.open(
                 "runs",
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | directory_flag | nofollow_flag,
                 dir_fd=supervisor_fd,
             )
         except OSError as exc:
@@ -686,11 +696,12 @@ def save_state(git_common_dir: Path, state: RunState) -> None:
             _reject_state_symlink(directory_fd, target.name, target)
             fd = os.open(
                 tmp_name,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | _required_open_flag("O_NOFOLLOW"),
                 0o600,
                 dir_fd=directory_fd,
             )
             try:
+                os.fchmod(fd, 0o600)
                 with os.fdopen(fd, "w") as handle:
                     json.dump(state.to_dict(), handle, indent=2, sort_keys=True)
                     handle.write("\n")
@@ -725,7 +736,7 @@ def load_state(git_common_dir: Path, run_id: str) -> RunState:
             try:
                 fd = os.open(
                     path.name,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    os.O_RDONLY | _required_open_flag("O_NOFOLLOW"),
                     dir_fd=directory_fd,
                 )
             except FileNotFoundError:
