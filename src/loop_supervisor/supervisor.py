@@ -1175,6 +1175,7 @@ class Supervisor:
         downstream test failure the auditor also needs to see.
         """
         worktree = self._require_worktree(state)
+        commit = self.repo.head_commit(cwd=worktree.path)
         results = run_commands(
             self.options.verify_commands,
             cwd=worktree.path,
@@ -1182,7 +1183,7 @@ class Supervisor:
             env=build_agent_env(worktree.path),
             stop_on_failure=False,
         )
-        log_dir = _verification_log_dir(self.git_common_dir, state.run_id)
+        log_dir = _verification_log_dir(self.git_common_dir, state.run_id, commit)
         state.verification_result = _summarize_verification(results, log_dir)
         state.phase = PHASE_AUDITING
 
@@ -1593,12 +1594,36 @@ _MESSAGE_HEAD_LENGTH = 500
 # is structurally immune to this: it is never inside any worktree's
 # working tree, so it can never appear in that worktree's `git status`
 # regardless of what a project's `.gitignore` does or doesn't contain.
-def _verification_log_dir(git_common_dir: Path, run_id: str) -> Path:
+#
+# Keyed by (run_id, commit) rather than run_id alone (ADR 0028): a run
+# accepts up to max_accepted_tasks (default 20) tasks one after
+# another, and REVISE re-verifies a new commit within the same task,
+# all sharing one run_id. An earlier version keyed on run_id alone and
+# wrote logs by position (01.log, 02.log, ...), so a later
+# verification with fewer commands than an earlier one only partially
+# overwrote the directory -- an earlier task's failing 02.log could
+# survive alongside a later, unrelated task's passing 01.log, both
+# presented to the auditor as if they belonged together. Every
+# verification run targets a distinct, immutable commit (the builder's
+# committed work for that attempt), so keying on it gives each
+# verification its own directory without needing a new counter field
+# in RunState.
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+def _validate_commit_sha(commit: str) -> str:
+    if not isinstance(commit, str) or not _COMMIT_SHA_RE.match(commit):
+        raise LoopError(f"expected a git commit hash, got {commit!r}")
+    return commit
+
+
+def _verification_log_dir(git_common_dir: Path, run_id: str, commit: str) -> Path:
     # Reuses state.py's run_id validation so a crafted or corrupted
     # run_id can never be used to construct a path that escapes this
     # directory, matching state_path()'s existing traversal guard.
-    validated = validate_run_id(run_id)
-    return git_common_dir / "loop-supervisor" / "verification" / validated
+    validated_run_id = validate_run_id(run_id)
+    validated_commit = _validate_commit_sha(commit)
+    return git_common_dir / "loop-supervisor" / "verification" / validated_run_id / validated_commit
 
 
 def _summarize_verification(results: list[CommandResult], log_dir: Path) -> dict[str, Any]:
@@ -1612,6 +1637,13 @@ def _summarize_verification(results: list[CommandResult], log_dir: Path) -> dict
     to write a precise finding. `output_path` is an absolute path (the
     log directory is not relative to any worktree the auditor's
     prompt could otherwise resolve it against).
+
+    Both the log directory and each log file are chmod'd to owner-only
+    (0o700 / 0o600), matching `save_state`'s posture: a verification
+    command's output can contain arbitrary build/test output, which may
+    include incidental sensitive detail the summary's best-effort
+    `_redact_secrets`/`_truncate_message` scrubbing does not extend to
+    (the full log is written unredacted, exactly as run).
     """
     log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     commands: list[dict[str, Any]] = []
@@ -1621,6 +1653,7 @@ def _summarize_verification(results: list[CommandResult], log_dir: Path) -> dict
             f"$ {result.command}\n\n--- stdout ---\n{result.stdout}\n"
             f"--- stderr ---\n{result.stderr}\n"
         )
+        os.chmod(log_path, 0o600)
         combined = (result.stdout + "\n" + result.stderr).strip()
         commands.append(
             {

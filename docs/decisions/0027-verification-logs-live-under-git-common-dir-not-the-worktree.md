@@ -9,6 +9,14 @@ everything else in ADR 0026 (the `verifying` phase, the fault/finding
 policy, the prompt changes, `RunState.verification_result`'s shape and
 clearing points) is unaffected and remains as decided there.
 
+Its own "Verification logs move to ... `<run_id>/`" paragraph and the
+`0o700`-parity claim are in turn superseded by [ADR
+0028](0028-verification-log-directory-is-keyed-by-commit-not-run-id-alone.md):
+the log directory is keyed by commit as well as `run_id`, and log
+files are individually `chmod`'d to `0o600`. Everything else here
+(moving out of the task worktree, why that is safe, the read-access
+analysis) is unaffected. Kept for historical context.
+
 ## Context
 
 A post-merge audit of the `feature/supervisor-verification` branch
