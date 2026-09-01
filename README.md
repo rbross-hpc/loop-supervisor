@@ -222,6 +222,14 @@ executables on `PATH`, a clean git worktree, `opencode.json` parses,
 permissions cover the sibling task-worktree directory, agent
 definitions present, `.env` exists — before you try to start one.
 
+This checkout's own `loop-supervisor.toml` (see "Running" below)
+provisions every task worktree with its own independent `.venv`
+before a builder touches it — a self-hosted run never shares this
+checkout's own venv with a task's, so nothing a builder does inside
+its worktree (including an editable `pip install`) can affect this
+checkout's own environment. See backlog item 48 for the incident that
+motivated this.
+
 ## Running
 
 ```bash
@@ -426,6 +434,17 @@ instead:
     back to the live repo instead of the swapped-in old source, which
     once produced a false "all tests pass" result that looked like a
     successful pin.
+  - **Never run `pip install -e` (editable or otherwise) from inside
+    a task worktree while its own `.venv` is missing or incomplete.**
+    `PATH` falls back to the integration checkout's `.venv/bin` when a
+    worktree has none of its own, so `pip` there is the *integration
+    checkout's* pip: an editable install's `.pth` file embeds an
+    absolute path, so this silently repoints the integration
+    checkout's own install at the worktree's `src` and breaks it the
+    moment that worktree is later removed. Confirm `.venv/bin/pip`
+    resolves inside your own worktree first (`which pip`); if a
+    project's `loop-supervisor.toml` provisions one automatically, use
+    it rather than reinstalling by hand.
 - **Self-authored injections only prove the test detects the
   injection** — not that it detects the real defect. If a bug must be
   injected to exercise a test before the real fix exists, treat that as

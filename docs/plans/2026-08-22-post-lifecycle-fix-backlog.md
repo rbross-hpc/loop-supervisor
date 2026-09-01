@@ -1677,6 +1677,108 @@ after the fact get written down.
     pruning policy is easier to design once there's a real retention
     pattern to observe rather than guessed upfront).
 
+48. **A builder running `pip install -e .` from its task worktree can
+    hijack the parent integration checkout's shared venv.** (Tier 1 —
+    correctness/security)
+    Observed during an overnight self-hosted run
+    (`5611ee6e8e66`): a builder task ran `pip install -e .` from
+    inside its own task worktree while `PATH` still resolved tools
+    against the *integration checkout's* `.venv` (`build_agent_env`,
+    `opencode.py:500-556`, prepends a relative `.venv/bin` entry
+    resolved fresh per command, but falls back to the integration
+    root's absolute `.venv/bin` when the worktree has none of its
+    own). An editable install's `.pth` file embeds an absolute path,
+    so this silently repointed the integration checkout's
+    `__editable__.loop_supervisor-*.pth` at the task worktree's `src`.
+    When that worktree was later removed at task-boundary cleanup, the
+    integration checkout's own `import loop_supervisor` and bare
+    `pytest` broke outright (`ModuleNotFoundError`, 24 collection
+    errors), surviving until manually repaired.
+
+    The immediate trigger was plausibly this project's own
+    README.md's "Testing discipline" section (mandatory probe
+    self-check bullet), which correctly warns that an editable install
+    can silently resolve imports back to the live repo during
+    failing-first verification -- a builder following that advice
+    literally, without realizing which venv `pip` on its `PATH` would
+    actually mutate, reproduces this exact hazard. The next task in
+    the same run then spent a large share of its 80-step budget
+    chasing the resulting failure as an "unrelated" regression before
+    exhausting its budget and parking the run on repeated
+    `builder_guidance` prompts.
+
+    Mitigated in this same change by populating `loop-supervisor.toml`
+    with a real `[provision]` config, giving every task worktree its
+    own fully independent venv (via `uv venv --seed`, which -- unlike
+    a bare `uv venv` -- installs `pip` into the new venv so a
+    subsequent `pip install` inside the worktree cannot fall through
+    to the parent's `PATH` entry) and pinning the install itself with
+    `uv pip install --python .venv/bin/python` so an inherited
+    `VIRTUAL_ENV` environment variable cannot redirect it elsewhere
+    either (confirmed reproducible and confirmed fixed in a scratch
+    trial). This closes the specific mechanism observed, but does not
+    prevent every possible variant (e.g. an agent modifying the
+    integration checkout directly via some other command); see item 28
+    (struck) for the disproportionate-cost reasoning against a
+    config-level command allowlist/denylist as defence-in-depth here.
+
+49. **Repeated builder `INCOMPLETE`/`BLOCKED` results have no circuit
+    breaker.** (Tier 3 — reliability)
+    `src/loop_supervisor/supervisor.py:1227-1236` (the non-`COMPLETE`
+    branch of `_do_building`'s result handling) sets a fresh
+    `pending_question`/`PHASE_AWAITING_INPUT` on every
+    `INCOMPLETE`/`BLOCKED` builder result, but never increments
+    `state.revision_count`. That counter is only incremented on the
+    auditor's `REVISE` disposition (`supervisor.py:1345`), so
+    `max_revisions_per_task` (`RunOptions`, default 5) never trips for
+    this path -- a builder can report `INCOMPLETE` an unbounded number
+    of times across successive operator/guidance answers without the
+    run ever escalating to a terminal failure on its own. Observed
+    directly in run `5611ee6e8e66`: three consecutive
+    `builder_guidance` prompts against the same task, each following
+    an `INCOMPLETE` report, with `revision_count` remaining `0`
+    throughout. Not fixed here; needs a design decision on what should
+    count against the limit (e.g. a separate counter, or folding this
+    path into `revision_count` with a possibly-different threshold)
+    before implementation.
+
+50. **Agent-created worktrees outside the supervisor's own bookkeeping
+    survive task cleanup.** (Tier 3 — reliability)
+    Observed after the same overnight run: six `git worktree`
+    entries beyond the supervisor's own task worktree were still
+    registered afterward -- four under `/tmp/opencode/`, two as
+    siblings of the integration checkout -- created by prior audit/
+    investigation agent sessions rather than by the supervisor itself,
+    two of them left dirty. `cleanup_worktree`
+    (`src/loop_supervisor/git.py`) only ever removes the one task
+    worktree it created and tracks in `RunState`; it has no visibility
+    into, and no mandate to reap, worktrees an agent created through
+    its own `bash` access for inspection or probing. Not fixed here;
+    likely needs either a documented convention (agents clean up their
+    own scratch worktrees before reporting) or a supervisor-side sweep
+    of unexpected worktrees at a safe point, whichever proves less
+    fragile.
+
+51. **`^C` at an `awaiting_input` prompt prints a raw
+    `KeyboardInterrupt` traceback instead of exiting cleanly.** (Tier
+    4 — telemetry/UI, low priority)
+    `StdinInputProvider.request()` (`input_providers.py:18-19`) blocks
+    on `input("> ")` under an interactive TTY; a `^C` there raises
+    `KeyboardInterrupt` in the main thread as Python's default SIGINT
+    disposition, and `cli.py`'s `_EXPECTED_CLI_ERRORS` deliberately
+    excludes `KeyboardInterrupt`/`SystemExit`
+    (`cli.py:32-33`) so it is never caught and sanitized into the
+    single-line `error: ...` form other expected failures get --
+    it propagates as a raw traceback. This is not a defect in the
+    exception-unwinding cleanup path itself (SIGINT's default
+    disposition already gets that for free, same reasoning as the
+    SIGTERM handler documented at `cli.py:55-83` and ADR 0015); it is
+    purely a cosmetic difference in how the CLI reports an operator-
+    initiated interrupt versus every other expected failure. Any fix
+    must not weaken the unwinding guarantee that stops the OpenCode
+    process group and releases the lock -- printing a clean message
+    and re-raising (rather than swallowing) is the likely shape.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in
