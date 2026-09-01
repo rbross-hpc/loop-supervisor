@@ -31,6 +31,8 @@ _MAX_TOOLS = 100
 _MAX_TOUCHED_FILES = 200
 _MAX_TOOL_RESULT_SUMMARY = 1024
 _MAX_EVENT_IDS = 2048
+_MAX_PENDING_EVENTS = 256
+_MAX_NOTICES = 20
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,7 @@ class LiveActivitySnapshot:
     invocations: tuple[LiveInvocation, ...] = ()
     feed: tuple[LiveFeedItem, ...] = ()
     touched_files: tuple[str, ...] = ()
+    notices: tuple[str, ...] = ()
     unknown_event_count: int = 0
 
 
@@ -120,8 +123,12 @@ class LiveActivityReducer:
         self._touched_files: list[str] = []
         self._touched_files_set: set[str] = set()
         self._unknown_event_count = 0
+        self._notices: collections.deque[str] = collections.deque(maxlen=_MAX_NOTICES)
         self._active_invocations: dict[str, str] = {}
         self._seen_event_ids: collections.deque[str] = collections.deque(maxlen=_MAX_EVENT_IDS)
+        self._pending_events: collections.deque[OpenCodeEvent] = collections.deque(
+            maxlen=_MAX_PENDING_EVENTS
+        )
 
     def _assert_owner(self) -> None:
         if self._owner is not None and threading.current_thread() is not self._owner:
@@ -133,6 +140,10 @@ class LiveActivityReducer:
     def set_connection(self, state: str, reason: str) -> None:
         self._assert_owner()
         self._connection = LiveConnection(state=state, reason=reason)
+
+    def add_notice(self, notice: str) -> None:
+        self._assert_owner()
+        self._notices.append(notice)
 
     def register_invocation(self, ref: InvocationRef) -> None:
         self._assert_owner()
@@ -149,6 +160,15 @@ class LiveActivityReducer:
             old_id = self._invocation_order.pop(0)
             self._invocations.pop(old_id, None)
 
+        pending = tuple(self._pending_events)
+        self._pending_events.clear()
+        for event in pending:
+            if event.session_id == ref.session_id:
+                if event.directory == str(ref.directory):
+                    self.on_event(event)
+                continue
+            self._pending_events.append(event)
+
     def unregister_invocation(self, ref: InvocationRef) -> None:
         self._assert_owner()
         self._active_invocations.pop(ref.session_id, None)
@@ -160,13 +180,17 @@ class LiveActivityReducer:
         """Process a normalized OpenCodeEvent. Must be called on the owner thread."""
         self._assert_owner()
 
+        event_type = event.type
+
+        if self._should_buffer(event):
+            self._pending_events.append(event)
+            return
+
         event_id = event.event_id
         if event_id is not None:
             if event_id in self._seen_event_ids:
                 return
             self._seen_event_ids.append(event_id)
-
-        event_type = event.type
 
         if event_type == "server.connected":
             self._connection = LiveConnection(state="live", reason="connected")
@@ -220,6 +244,23 @@ class LiveActivityReducer:
             return
 
         self._unknown_event_count += 1
+
+    def _should_buffer(self, event: OpenCodeEvent) -> bool:
+        return (
+            event.session_id is not None
+            and event.session_id not in self._active_invocations
+            and event.type
+            in {
+                "session.status",
+                "session.idle",
+                "session.error",
+                "message.updated",
+                "message.part.updated",
+                "message.part.delta",
+                "todo.updated",
+                "session.diff",
+            }
+        )
 
     def _is_attributed(self, event: OpenCodeEvent) -> bool:
         """Accept iff session is registered AND directory exactly matches."""
@@ -340,5 +381,6 @@ class LiveActivityReducer:
             invocations=tuple(ordered_invs),
             feed=tuple(self._feed),
             touched_files=tuple(self._touched_files),
+            notices=tuple(self._notices),
             unknown_event_count=self._unknown_event_count,
         )

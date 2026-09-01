@@ -1445,6 +1445,45 @@ class OpenCodeServer:
         with self._active_sessions_lock:
             return list(self._active_sessions.values())
 
+    def reconcile_invocation(
+        self, ref: InvocationRef
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Fetch best-effort live state for one exact active invocation.
+
+        Both requests carry the invocation's registered directory and the
+        message request carries its exact session ID.  The caller remains
+        responsible for treating this telemetry as non-authoritative.
+        """
+        status_response = self.client.get(
+            "/session/status", params={"directory": str(ref.directory)}
+        )
+        _raise_for_status(status_response, f"reconcile status for session {ref.session_id!r}")
+        statuses = _decode_json_object(
+            status_response, f"reconcile status for session {ref.session_id!r}"
+        )
+        status = statuses.get(ref.session_id)
+        if not isinstance(status, dict):
+            raise OpenCodeError(
+                f"status reconciliation response omitted active session {ref.session_id!r}"
+            )
+
+        messages_response = self.client.get(
+            f"/session/{ref.session_id}/message",
+            params={"directory": str(ref.directory)},
+        )
+        _raise_for_status(messages_response, f"reconcile messages for session {ref.session_id!r}")
+        try:
+            messages = messages_response.json()
+        except (ValueError, TypeError) as exc:
+            raise OpenCodeError(
+                f"invalid JSON reconciling messages for session {ref.session_id!r}"
+            ) from exc
+        if not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
+            raise OpenCodeError(
+                f"message reconciliation response for session {ref.session_id!r} is not a list"
+            )
+        return status, messages
+
     def run_agent(
         self,
         *,

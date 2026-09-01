@@ -132,7 +132,7 @@ from textual.widgets import (
 from ..config import DEFAULT_PROVISION_TIMEOUT, DEFAULT_VERIFY_TIMEOUT
 from ..git import GitRepo
 from ..opencode import InvocationRef
-from ..opencode_events import OpenCodeEventError, normalize_global_event
+from ..opencode_events import OpenCodeEvent, OpenCodeEventError, normalize_global_event
 from ..runtime import RunSession, _RunOutcome, new_run_session, resume_run_session
 from ..sse import SSEClient, SSEConnectionState
 from ..state import RunOptions, RunState, list_runs
@@ -151,8 +151,10 @@ from .messages import (
     InvocationStarted,
     LiveConnectionChanged,
     LiveDisconnected,
+    LiveNotice,
     LiveUpdated,
     OpenCodeEventReceived,
+    ReconciliationCompleted,
 )
 from .renderers import (
     render_durable_summary,
@@ -406,6 +408,7 @@ class RunScreen(Screen):
         self._reducer = LiveActivityReducer(owner_thread=threading.current_thread())
 
         self._sse_client: SSEClient | None = None
+        self._sse_was_live = False
         self._transitioning = False
         self._submission_in_flight = False
         self._shutdown_requested = False
@@ -798,7 +801,13 @@ class RunScreen(Screen):
     @on(LiveConnectionChanged)
     def on_live_connection_changed(self, message: LiveConnectionChanged) -> None:
         self._reducer.set_connection(str(message.state), message.reason)
-        if message.state != SSEConnectionState.LIVE:
+        if message.state == SSEConnectionState.LIVE:
+            if self._sse_was_live:
+                self.run_worker(self._reconcile_live_activity, exclusive=False, thread=True)
+            self._sse_was_live = True
+            snapshot = self._reducer.snapshot()
+            self.query_one("#live-content", Static).update(render_live_summary(snapshot))
+        else:
             snapshot = self._reducer.snapshot()
             self.query_one("#live-content", Static).update(render_live_summary(snapshot))
             self.post_message(LiveDisconnected(message.reason))
@@ -811,12 +820,28 @@ class RunScreen(Screen):
     def on_invocation_finished(self, message: InvocationFinished) -> None:
         self._reducer.unregister_invocation(message.invocation)
 
+    @on(ReconciliationCompleted)
+    def on_reconciliation_completed(self, message: ReconciliationCompleted) -> None:
+        for event in message.events:
+            self._reducer.on_event(event)
+        snapshot = self._reducer.snapshot()
+        self.query_one("#live-content", Static).update(render_live_summary(snapshot))
+
+    @on(LiveNotice)
+    def on_live_notice(self, message: LiveNotice) -> None:
+        self._reducer.add_notice(message.notice)
+        snapshot = self._reducer.snapshot()
+        self.query_one("#live-content", Static).update(render_live_summary(snapshot))
+
     @on(LiveUpdated)
     def on_live_updated(self, message: LiveUpdated) -> None:
         self.query_one("#live-content", Static).update(render_live_summary(message.snapshot))
 
     @on(LiveDisconnected)
     def on_live_disconnected(self, message: LiveDisconnected) -> None:
+        # The transport's reconnect notice carries the explicit lossy-gap
+        # wording. Connection-state updates alone include initial CONNECTING
+        # and intentional STOPPED transitions, neither of which is a gap.
         pass
 
     @on(Button.Pressed, "#submit-btn")
@@ -878,10 +903,84 @@ class RunScreen(Screen):
         panel.remove_class("visible")
         self._start_advance()
 
+    def _reconcile_live_activity(self) -> None:
+        """Restore best-effort live state after a lossy SSE reconnect."""
+        session = self._session
+        if session is None:
+            return
+        restored: list[OpenCodeEvent] = []
+        for ref in session.active_invocations():
+            try:
+                status, messages = session.reconcile_invocation(ref)
+                status_type = status.get("type")
+                restored.append(
+                    OpenCodeEvent(
+                        directory=str(ref.directory),
+                        event_id=None,
+                        type="session.status",
+                        session_id=ref.session_id,
+                        status=str(status_type) if status_type is not None else "running",
+                    )
+                )
+                for message in messages:
+                    restored.extend(self._message_reconciliation_events(ref, message))
+            except Exception as exc:
+                self._on_sse_notice(
+                    f"Live activity reconciliation failed for session {ref.session_id}: {exc}"
+                )
+        self.app.call_from_thread(self.post_message, ReconciliationCompleted(tuple(restored)))
+
+    @staticmethod
+    def _message_reconciliation_events(
+        ref: InvocationRef, message: dict[str, object]
+    ) -> list[OpenCodeEvent]:
+        info = message.get("info")
+        if not isinstance(info, dict) or info.get("sessionID") != ref.session_id:
+            return []
+        message_id = info.get("id")
+        if not isinstance(message_id, str):
+            return []
+        events = [
+            OpenCodeEvent(
+                directory=str(ref.directory),
+                event_id=None,
+                type="message.updated",
+                session_id=ref.session_id,
+                message_id=message_id,
+                role=str(info.get("role", "assistant")),
+            )
+        ]
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            return events
+        for raw_part in parts:
+            if not isinstance(raw_part, dict):
+                continue
+            if (
+                raw_part.get("sessionID") != ref.session_id
+                or raw_part.get("messageID") != message_id
+            ):
+                continue
+            try:
+                event = normalize_global_event(
+                    {
+                        "directory": str(ref.directory),
+                        "payload": {
+                            "type": "message.part.updated",
+                            "properties": {"part": raw_part},
+                        },
+                    }
+                )
+            except OpenCodeEventError:
+                continue
+            events.append(event)
+        return events
+
     def _on_sse_event(self, raw_event: dict) -> None:
         try:
             event = normalize_global_event(raw_event)
-        except OpenCodeEventError:
+        except OpenCodeEventError as exc:
+            self._on_sse_notice(f"SSE event ignored: {exc}")
             return
         self.app.call_from_thread(self.post_message, OpenCodeEventReceived(event))
 
@@ -889,7 +988,7 @@ class RunScreen(Screen):
         self.app.call_from_thread(self.post_message, LiveConnectionChanged(state, reason))
 
     def _on_sse_notice(self, notice: str) -> None:
-        pass
+        self.app.call_from_thread(self.post_message, LiveNotice(notice))
 
     @property
     def shutdown_clean(self) -> bool:

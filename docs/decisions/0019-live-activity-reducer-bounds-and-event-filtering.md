@@ -51,6 +51,8 @@ corresponding `test_*_bounded` test in `tests/test_live_reducer.py`):
 | `_MAX_TOUCHED_FILES` | 200 | Distinct touched-file paths retained |
 | `_MAX_TOOL_RESULT_SUMMARY` | 1 KiB | Each tool's stored result summary |
 | `_MAX_EVENT_IDS` | 2048 | Deduplication window (`collections.deque(maxlen=...)`) |
+| `_MAX_PENDING_EVENTS` | 256 | Session-bearing events awaiting invocation registration |
+| `_MAX_NOTICES` | 20 | Visible ephemeral transport/reconciliation notices |
 
 `_tail()` truncates to a byte bound while re-decoding as UTF-8 (never
 splitting a multi-byte character), so `_MAX_TEXT_TAIL` is an exact
@@ -71,11 +73,19 @@ byte ceiling, not an approximate one.
   directly: an invocation registered at `/repo` must not accept a
   `file.edited` event whose directory is `/repo-other`, even though
   `/repo` is a string prefix of `/repo-other`.
-- An event whose session is not registered, or whose directory does
-  not exactly match, is silently dropped — it does not raise, does not
-  increment `unknown_event_count` (that counter is reserved for
-  genuinely unrecognized event/part *types*, a different failure
-  mode), and never appears in any snapshot.
+- A recognized session-bearing event whose session is not yet registered is
+  retained in the bounded pending-event queue. Registration replays only
+  entries whose session ID **and** directory exactly match the new invocation;
+  a mismatched directory is rejected and retained only until ordinary bounded
+  eviction. Once a session is registered, mismatched-directory events are
+  dropped immediately. This closes the observer-to-Textual-message race without
+  weakening exact attribution or allowing unbounded state.
+- Reconnect reconciliation is attempted only for the server's currently active,
+  supervisor-owned `InvocationRef` values. Both status and message requests use
+  each reference's exact directory, and the message request uses its exact
+  session ID. Returned message records and parts must repeat that session ID
+  before they become reducer events. Reconciliation remains ephemeral and never
+  changes durable supervisor phase.
 
 **Ownership** (see also ADR 0008, which this ADR is a companion to):
 every reducer method calls `_assert_owner()` first and raises
@@ -92,11 +102,10 @@ directly.
   that widens matching (e.g. "helpfully" supporting path prefixes) or
   removes a bound is now a decision that contradicts this ADR and
   should be escalated to the architect rather than made silently.
-- All of the above was already true and already tested before this
-  ADR; this document adds no new behavior and changes no constant.
-  Closes backlog item 20 in full (both halves: the owner-thread
-  contract via ADR 0008's Consequences section, and the bounds/
-  filtering invariants via this ADR).
+- The original bounds and filtering rules were already true when this ADR was
+  accepted. Task 048 extends the same invariants to pending registration events,
+  visible notices, and reconnect reconciliation. Backlog item 20 remains closed;
+  backlog item 14 is resolved without widening the attribution boundary.
 - The bounds are fixed constants, not configurable. If a future need
   arises for a longer-lived TUI session to retain more history (or a
   memory-constrained environment to retain less), that would be a new

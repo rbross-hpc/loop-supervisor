@@ -131,6 +131,43 @@ def test_unknown_session_event_ignored():
     assert snap.feed == ()
 
 
+def test_event_before_registration_is_applied_after_exact_attribution():
+    reducer = LiveActivityReducer()
+    reducer.on_event(_ev("session.idle", session_id="s1", directory="/repo"))
+
+    reducer.register_invocation(_ref("s1", directory="/repo"))
+
+    snap = reducer.snapshot()
+    assert snap.invocations[0].status == "idle"
+    assert len(snap.feed) == 1
+
+
+def test_event_before_registration_wrong_directory_is_rejected():
+    reducer = LiveActivityReducer()
+    reducer.on_event(_ev("session.idle", session_id="s1", directory="/repo-other"))
+
+    reducer.register_invocation(_ref("s1", directory="/repo"))
+
+    snap = reducer.snapshot()
+    assert snap.invocations[0].status == "running"
+    assert snap.feed == ()
+
+
+def test_pending_registration_events_are_bounded():
+    pending_limit = 256
+    reducer = LiveActivityReducer()
+    for index in range(pending_limit + 1):
+        reducer.on_event(_ev("session.idle", session_id=f"s{index}", directory=f"/repo/{index}"))
+
+    reducer.register_invocation(_ref("s0", directory="/repo/0"))
+    reducer.register_invocation(_ref(f"s{pending_limit}", directory=f"/repo/{pending_limit}"))
+
+    snap = reducer.snapshot()
+    by_session = {inv.session_id: inv for inv in snap.invocations}
+    assert by_session["s0"].status == "running"
+    assert by_session[f"s{pending_limit}"].status == "idle"
+
+
 def test_session_idle_with_wrong_directory_ignored():
     reducer = LiveActivityReducer()
     ref = _ref("s1", directory="/repo")
