@@ -1446,3 +1446,142 @@ def test_phase_verification_must_match_configuration(phase, commands, result, ma
 
     with pytest.raises(StateError, match=match):
         RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "phase,overrides",
+    [
+        ("planning", {}),
+        (
+            "creating_worktree",
+            {
+                "pending_worktree_path": "/tmp/wt/task-1",
+                "pending_worktree_branch": "loop/task-1",
+                "pending_worktree_base": "abc123",
+            },
+        ),
+        (
+            "architecting",
+            {
+                "planner_result": _planner_decision_result(),
+                "decision_request": _decision_request(),
+            },
+        ),
+        (
+            "recording_decision",
+            {
+                "planner_result": _planner_decision_result(),
+                "decision_request": _decision_request(),
+                "architect_result": _architect_result(),
+                "pending_adr_path": "/tmp/wt/task-1/docs/decisions/0001-design.md",
+                "pending_adr_hash": "adr-hash",
+            },
+        ),
+        ("building", {}),
+        (
+            "awaiting_input",
+            {
+                "builder_result": _builder_result(status="BLOCKED", commit=None),
+                "pending_question": {
+                    "kind": "builder_guidance",
+                    "message": "Guide the builder",
+                    "context": {"status": "BLOCKED"},
+                },
+            },
+        ),
+    ],
+)
+def test_pre_verification_phases_reject_stale_verification_result(phase, overrides):
+    if phase in {"planning", "creating_worktree"}:
+        data = _make_state(new_run_id(), phase=phase).to_dict()
+        data["planner_result"] = _planner_result()
+    else:
+        data = _active_state_data(phase=phase)
+    data.update(overrides)
+    data["verification_result"] = _verification_result()
+    data["options"]["verify_commands"] = ["pytest"]
+
+    with pytest.raises(StateError, match=f"{phase}.*verification_result"):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "phase", ["verifying", "auditing", "merging", "cleanup_worktree", "cleanup_branch"]
+)
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("last_task_head", "b" * 40),
+        ("task_expected_head", "b" * 40),
+    ],
+)
+def test_post_build_phases_reject_commit_identity_mismatch(phase, field, value):
+    reviewed_commit = "a" * 40
+    extras = {
+        "builder_result": _builder_result(commit=reviewed_commit[:12]),
+        "last_task_head": reviewed_commit,
+    }
+    if phase in {"merging", "cleanup_worktree", "cleanup_branch"}:
+        extras.update(
+            auditor_result=_auditor_result(),
+            merge_pre_head="c" * 40,
+            merge_task_head=reviewed_commit,
+            merge_commit="d" * 40 if phase != "merging" else None,
+        )
+    data = _active_state_data(phase=phase, **extras)
+    data["task_expected_head"] = reviewed_commit
+    if phase == "cleanup_branch":
+        data["task_status_snapshot"] = None
+    if phase == "verifying":
+        data["options"]["verify_commands"] = ["pytest"]
+    data[field] = value
+
+    expected_field = "last_task_head" if phase == "cleanup_branch" else field
+    with pytest.raises(StateError, match=expected_field):
+        RunState.from_dict(data)
+
+
+def test_post_build_phase_accepts_abbreviated_builder_commit_for_reviewed_head():
+    reviewed_commit = "a" * 40
+    data = _active_state_data(
+        phase="auditing",
+        builder_result=_builder_result(commit=reviewed_commit[:12]),
+        last_task_head=reviewed_commit,
+        task_expected_head=reviewed_commit,
+    )
+
+    loaded = RunState.from_dict(data)
+    assert loaded.last_task_head == reviewed_commit
+
+
+def test_creating_worktree_rejects_active_task_identity_and_checkpoints():
+    data = _active_state_data(
+        phase="creating_worktree",
+        pending_worktree_path="/tmp/wt/new-task",
+        pending_worktree_branch="loop/new-task",
+        pending_worktree_base="abc123",
+    )
+
+    with pytest.raises(StateError, match="creating_worktree.*active task identity"):
+        RunState.from_dict(data)
+
+
+def test_architecting_allows_historical_result_for_prior_decision():
+    data = _active_state_data(
+        phase="architecting",
+        planner_result=_planner_result(
+            decision_required=True,
+            decision_question="Which new design?",
+            decision_rationale="A second choice is needed",
+        ),
+        decision_request={
+            "origin": "planner",
+            "question": "Which new design?",
+            "rationale": "A second choice is needed",
+        },
+        architect_result=_architect_result(question="Which old design?"),
+    )
+
+    loaded = RunState.from_dict(data)
+    assert loaded.architect_result is not None
+    assert loaded.architect_result["question"] == "Which old design?"

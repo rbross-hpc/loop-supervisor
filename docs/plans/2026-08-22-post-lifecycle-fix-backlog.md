@@ -357,28 +357,38 @@ after the fact get written down.
    for safe resume (including task identity, a READY current planner result,
    builder/auditor results, merge intent, decision provenance, and
    `last_task_head`) and apply the same checks through an `operational_failure`
-   record's `retry_phase`. Verification is present exactly when configured
-   throughout verifying/auditing/merge/cleanup and its commands match the
-   persisted configuration in order. Merge and cleanup require the reviewed
-   `last_task_head` to equal `merge_task_head`.
+   record's `retry_phase`. Verification evidence is forbidden before the
+   verifying phase, absent while verification is running, and present exactly
+   when configured throughout auditing/merge/cleanup; its commands must match
+   the persisted configuration in order. Post-build checkpoints require
+   `builder_result.commit`, canonical `last_task_head`, and
+   `task_expected_head` to identify the same reviewed commit (with ADR 0013's
+   safe prefix handling for an abbreviated builder report), while merge and
+   cleanup intent must identify that same commit. Worktree-creation intent is
+   rejected if active task identity or checkpoints are already present.
 
    Builder/current-planner and non-REPLAN auditor/current-planner task IDs must
-   agree. Architect results and architect-input contexts must match the durable
-   decision request; approval title/decision and builder-guidance status must
-   match their source results. Intentionally historical results remain legal:
-   in particular a REPLAN auditor result may describe the prior task while a
-   replacement planner result scopes the next attempt, a rejected DECIDED
-   proposal remains loadable while awaiting feedback, and answered architect/
-   builder guidance remains loadable during retries and related terminal
-   failures.
+   agree. Architect input/approval and decision-recording states require the
+   architect answer to match the durable decision request; approval
+   title/decision and builder-guidance status must match their source results.
+   Intentionally historical results remain legal: in particular a REPLAN
+   auditor result may describe the prior task while a replacement planner
+   scopes the next attempt, and an earlier architect result may remain when a
+   distinct new request first enters architecting. A rejected DECIDED proposal
+   remains loadable while awaiting feedback, and answered architect/builder
+   guidance remains loadable during retries and related terminal failures.
 
    Regression coverage is in `tests/test_state.py`'s complete persisted-state
    trust-boundary section and real transition/reload tests in
-   `tests/test_advance.py`, including rejected-decision feedback and architect
-   retry-limit terminal snapshots. The original tests produced 28 expected
-   failures against the pre-change implementation; the audit follow-up tests
-   were likewise run against commit `2986466` and produced 21 expected failures
-   (19 state-invariant cases and both lifecycle reload cases) before the fixes.
+   `tests/test_advance.py`, including sequential distinct design escalations,
+   stale pre-verification evidence, contradictory post-build commit identities,
+   creation intent combined with active identity, rejected-decision feedback,
+   and architect retry-limit terminal snapshots. The original tests produced 28
+   expected failures against the pre-change implementation; the first audit
+   follow-up tests produced 21 expected failures against commit `2986466`, and
+   the final focused revision probe self-checked and ran against exact task
+   commit `a28f203e7f08a7fa528fbb3cc8c17976f9aa4dfd`, producing 14 expected
+   state-test failures plus the expected sequential-lifecycle reload failure.
 
 10. ~~Non-`FileNotFoundError` spawn failures need normalization.~~
     **Already resolved; this backlog had not caught up.**

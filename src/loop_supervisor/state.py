@@ -687,14 +687,18 @@ def _validate_task_identity(data: dict[str, Any], *, worktree_absent: bool) -> N
             raise StateError(f"task identity field {f!r} must be a non-empty string")
 
     expected_head = data.get("task_expected_head")
-    if not isinstance(expected_head, str) or not expected_head:
-        raise StateError("an active task requires a non-empty task_expected_head checkpoint")
     snapshot = data.get("task_status_snapshot")
     if worktree_absent:
-        # The task worktree has been removed (cleanup_branch); the status
-        # snapshot is intentionally cleared to null.
+        # The task worktree has been removed (cleanup_branch); its last known
+        # verified HEAD is retained while the status snapshot is cleared.
+        if not isinstance(expected_head, str) or not expected_head:
+            raise StateError(
+                "an active cleanup task requires a non-empty task_expected_head checkpoint"
+            )
         if snapshot is not None and not isinstance(snapshot, str):
             raise StateError("state field 'task_status_snapshot' must be null or a string")
+    elif not isinstance(expected_head, str) or not expected_head:
+        raise StateError("an active task requires a non-empty task_expected_head checkpoint")
     elif not isinstance(snapshot, str):
         raise StateError(
             "an active task requires a task_status_snapshot string (empty string means clean)"
@@ -734,34 +738,6 @@ def _validate_phase_invariants(data: dict[str, Any]) -> None:
             raise StateError("state field 'decision_request' must be an object or null")
         DecisionRequest.from_dict(raw_decision)
 
-    if phase == "creating_worktree":
-        for field_name in (
-            "pending_worktree_path",
-            "pending_worktree_branch",
-            "pending_worktree_base",
-        ):
-            if not data.get(field_name):
-                raise StateError(f"phase 'creating_worktree' requires {field_name}")
-        planner_result = data.get("planner_result")
-        if not isinstance(planner_result, dict) or not planner_result.get("task_id"):
-            raise StateError(
-                "phase 'creating_worktree' requires a planner_result with a task_id "
-                "to recover the original task identity for reconciliation"
-            )
-    if phase == "merging":
-        if data.get("merge_pre_head") is None or data.get("merge_task_head") is None:
-            raise StateError("phase 'merging' requires merge_pre_head and merge_task_head")
-        _require_full_task_identity(data, "merging")
-    if phase in ("cleanup_worktree", "cleanup_branch"):
-        for field_name in ("merge_pre_head", "merge_task_head", "merge_commit"):
-            if data.get(field_name) is None:
-                raise StateError(f"phase {phase!r} requires {field_name}")
-        _require_full_task_identity(data, phase)
-    if phase == "recording_decision":
-        if data.get("pending_adr_path") is None or data.get("pending_adr_hash") is None:
-            raise StateError(
-                "phase 'recording_decision' requires pending_adr_path and pending_adr_hash"
-            )
     if phase == "operational_failure" and raw_error is None:
         raise StateError("phase 'operational_failure' requires last_error")
 
@@ -809,7 +785,9 @@ def _require_result(data: dict[str, Any], phase: str, field_name: str) -> dict[s
     return value
 
 
-def _validate_decision_relationships(data: dict[str, Any], phase: str) -> None:
+def _validate_decision_relationships(
+    data: dict[str, Any], phase: str, *, require_architect_answer: bool = True
+) -> None:
     decision = _require_result(data, phase, "decision_request")
     planner = _require_result(data, phase, "planner_result")
     if decision["origin"] == "planner":
@@ -842,7 +820,11 @@ def _validate_decision_relationships(data: dict[str, Any], phase: str) -> None:
             raise StateError(f"phase {phase!r} decision_request does not match auditor_result")
 
     architect = data.get("architect_result")
-    if isinstance(architect, dict) and architect["question"] != decision["question"]:
+    if (
+        require_architect_answer
+        and isinstance(architect, dict)
+        and architect["question"] != decision["question"]
+    ):
         raise StateError(
             "state field 'architect_result.question' does not match decision_request question"
         )
@@ -884,6 +866,21 @@ def _validate_pending_context_matches_source(
 def _validate_verification_for_phase(data: dict[str, Any], phase: str) -> None:
     configured_commands = data["options"].verify_commands
     result = data.get("verification_result")
+    pre_verification_phases = {
+        "planning",
+        "creating_worktree",
+        "architecting",
+        "recording_decision",
+        "building",
+        "awaiting_input",
+    }
+    if phase in pre_verification_phases:
+        if result is not None:
+            raise StateError(f"phase {phase!r} cannot contain verification_result")
+        return
+    post_build_phases = {"verifying", "auditing", "merging", "cleanup_worktree", "cleanup_branch"}
+    if phase not in post_build_phases:
+        return
     if phase == "verifying":
         if not configured_commands:
             raise StateError("phase 'verifying' requires configured verify_commands")
@@ -906,7 +903,69 @@ def _validate_verification_for_phase(data: dict[str, Any], phase: str) -> None:
             )
 
 
+def _commit_ids_match(reported: str, canonical: str) -> bool:
+    """Compare persisted builder and verified commit identities.
+
+    Runtime commit verification accepts a bare 7-40 character hexadecimal
+    abbreviation and persists the canonical HEAD separately (ADR 0013). State
+    loading has no repository available for rev-parse, so it can only enforce
+    the corresponding safe prefix relationship.
+    """
+    if reported == canonical:
+        return True
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", reported):
+        return False
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", canonical):
+        return False
+    return canonical.lower().startswith(reported.lower())
+
+
 def _validate_effective_phase_requirements(data: dict[str, Any], phase: str) -> None:
+    if phase == "creating_worktree":
+        for field_name in (
+            "pending_worktree_path",
+            "pending_worktree_branch",
+            "pending_worktree_base",
+        ):
+            if not data.get(field_name):
+                raise StateError(f"phase 'creating_worktree' requires {field_name}")
+        if any(data.get(name) is not None for name in _TASK_IDENTITY_FIELDS) or any(
+            data.get(name) is not None for name in ("task_expected_head", "task_status_snapshot")
+        ):
+            raise StateError(
+                "phase 'creating_worktree' cannot contain active task identity or task checkpoints"
+            )
+        planner_result = data.get("planner_result")
+        if not isinstance(planner_result, dict) or not planner_result.get("task_id"):
+            raise StateError(
+                "phase 'creating_worktree' requires a planner_result with a task_id "
+                "to recover the original task identity for reconciliation"
+            )
+    if phase == "merging":
+        if data.get("merge_pre_head") is None or data.get("merge_task_head") is None:
+            raise StateError("phase 'merging' requires merge_pre_head and merge_task_head")
+        _require_full_task_identity(data, "merging")
+    if phase in ("cleanup_worktree", "cleanup_branch"):
+        for field_name in ("merge_pre_head", "merge_task_head", "merge_commit"):
+            if data.get(field_name) is None:
+                raise StateError(f"phase {phase!r} requires {field_name}")
+        _require_full_task_identity(data, phase)
+    if phase == "recording_decision":
+        if data.get("pending_adr_path") is None or data.get("pending_adr_hash") is None:
+            raise StateError(
+                "phase 'recording_decision' requires pending_adr_path and pending_adr_hash"
+            )
+
+    if phase in {
+        "planning",
+        "creating_worktree",
+        "architecting",
+        "recording_decision",
+        "building",
+        "awaiting_input",
+    }:
+        _validate_verification_for_phase(data, phase)
+
     if phase == "awaiting_input":
         _require_full_task_identity(data, phase)
         planner = _require_result(data, phase, "planner_result")
@@ -963,31 +1022,52 @@ def _validate_effective_phase_requirements(data: dict[str, Any], phase: str) -> 
             raise StateError(f"phase {phase!r} requires a READY planner_result")
 
     if phase in {"architecting", "recording_decision"}:
-        _validate_decision_relationships(data, phase)
+        # Entering architecting may retain the answer to an earlier, distinct
+        # decision while a newly active request is awaiting its first response.
+        # Once input/approval or decision recording exists, the architect result
+        # is established as the answer and must match exactly.
+        _validate_decision_relationships(
+            data,
+            phase,
+            require_architect_answer=phase == "recording_decision"
+            or data.get("pending_question") is not None,
+        )
 
     if phase == "recording_decision":
         architect = _require_result(data, phase, "architect_result")
         if architect["status"] != "DECIDED":
             raise StateError("phase 'recording_decision' requires a DECIDED architect_result")
 
+    if phase in {"merging", "cleanup_worktree", "cleanup_branch"}:
+        if data["merge_task_head"] != data["last_task_head"]:
+            raise StateError(
+                "state field 'merge_task_head' must match last_task_head during merge and cleanup"
+            )
+
     if phase in {"verifying", "auditing", "merging", "cleanup_worktree", "cleanup_branch"}:
         builder = _require_result(data, phase, "builder_result")
         if builder["status"] != "COMPLETE":
             raise StateError(f"phase {phase!r} requires a COMPLETE builder_result")
-        if data.get("last_task_head") is None:
+        last_task_head = data.get("last_task_head")
+        if last_task_head is None:
             raise StateError(f"phase {phase!r} requires last_task_head")
-
-    if phase in {"verifying", "auditing", "merging", "cleanup_worktree", "cleanup_branch"}:
+        reported_commit = builder["commit"]
+        assert isinstance(reported_commit, str)
+        if not _commit_ids_match(reported_commit, last_task_head):
+            raise StateError(
+                "state field 'last_task_head' must identify builder_result.commit "
+                "(an unambiguous abbreviated builder commit is allowed)"
+            )
+        if data.get("task_expected_head") != last_task_head:
+            raise StateError(
+                "state field 'task_expected_head' must match last_task_head after building"
+            )
         _validate_verification_for_phase(data, phase)
 
     if phase in {"merging", "cleanup_worktree", "cleanup_branch"}:
         auditor = _require_result(data, phase, "auditor_result")
         if auditor["disposition"] != "ACCEPT":
             raise StateError(f"phase {phase!r} requires an ACCEPT auditor_result")
-        if data["merge_task_head"] != data["last_task_head"]:
-            raise StateError(
-                "state field 'merge_task_head' must match last_task_head during merge and cleanup"
-            )
 
     if phase == "done" and any(data.get(name) is not None for name in _TASK_IDENTITY_FIELDS):
         raise StateError("phase 'done' cannot retain an active task identity")

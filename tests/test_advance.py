@@ -762,6 +762,42 @@ def test_rejected_decision_state_reloads_and_resumes_with_feedback(tmp_path):
     assert resumed.pending_question["kind"] == "decision_approval"
 
 
+def test_sequential_distinct_design_escalations_reload_at_second_architecting(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(decision_required=True)],
+            "loop-architect": [_architect_decided()],
+            "loop-builder": [_builder(status="COMPLETE")],
+            "loop-auditor": [
+                _auditor(
+                    disposition="REPLAN",
+                    decision_required=True,
+                    decision_question="Which replacement design?",
+                    decision_rationale="The first design exposed a new issue",
+                )
+            ],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    _advance_to_phase(supervisor, state, "architecting")
+    supervisor.advance(state)  # architecting -> recording_decision
+    supervisor.advance(state)  # recording_decision -> building
+    supervisor.advance(state)  # building -> auditing
+    supervisor.advance(state)  # auditing -> architecting for a distinct question
+
+    assert state.phase == "architecting"
+    assert state.architect_result is not None
+    assert state.architect_result["question"] == "Which approach?"
+    assert state.decision_request is not None
+    assert state.decision_request["question"] == "Which replacement design?"
+
+    reloaded = load_state(repo.common_dir(), state.run_id)
+    assert reloaded.phase == "architecting"
+    assert reloaded.architect_result == state.architect_result
+    assert reloaded.decision_request == state.decision_request
+
+
 def test_architect_retry_limit_terminal_state_with_guidance_is_reloadable(tmp_path):
     runner = ScriptedRunner(
         {
