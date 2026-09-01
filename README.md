@@ -302,10 +302,17 @@ Non-recoverable failures (policy limits, invariant violations) set
 
 ### Merge-conflict repair
 
-If a `--no-ff` merge conflicts, the supervisor aborts the merge, records
-the conflict as an operational failure requiring repair, and stops. Resolve
-the conflict manually in the integration worktree, then resume (or click
-Retry in the TUI).
+The supervisor is the sole writer of the integration branch during a
+normal run: every task branch is created from, and merged back into,
+the integration HEAD it itself observed, so a conflict cannot arise
+from the loop's own operation alone. It can only happen if something
+external changes the integration branch while a run is in progress
+(e.g. an operator manually committing to it, or a second supervisor
+run pointed at the same repository). If a `--no-ff` merge conflicts,
+the supervisor aborts the merge, records the conflict as an
+operational failure requiring repair, and stops. Resolve the conflict
+manually in the integration worktree, then resume (or click Retry in
+the TUI).
 
 ## Bootstrapping a new project
 

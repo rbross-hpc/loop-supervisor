@@ -32,3 +32,27 @@ adopt` command: the hardest part of adoption — writing an accurate
 objective and inferring a new project's already-existing, unwritten
 design decisions — is a judgment call best made by an agent reading
 the actual codebase, not a mechanical file copy.
+
+## Co-developing `loop-supervisor` itself alongside a project
+
+`init` and the adoption skill both make a project depend on
+`loop-supervisor` as an installed package (`loop-supervisor @
+git+<url>` in `pyproject.toml`), not a vendored copy — see
+[ADR 0018](decisions/0018-bootstrap-generates-a-dependent-skeleton-not-a-vendored-copy.md).
+That means a generated or adopted project has no `loop-supervisor`
+source of its own to edit. If you also want to make changes to
+`loop-supervisor` while working on such a project (as this repository
+does for itself), clone `loop-supervisor` separately and point your
+project's dependency at that local checkout instead of the Git URL,
+e.g. with an editable install:
+
+```bash
+git clone <loop-supervisor-repo-url> ../loop-supervisor
+pip install -e ../loop-supervisor
+```
+
+There is currently no dedicated `init --fork` mode for this — it was
+considered and deliberately not built (see the resolution note on
+backlog item 34 in
+`docs/plans/2026-08-22-post-lifecycle-fix-backlog.md`); this manual
+clone-and-editable-install workaround is the supported path.
