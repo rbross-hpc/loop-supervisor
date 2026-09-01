@@ -173,6 +173,19 @@ def test_verify_builder_commit_rejects_whitespace_only(tmp_path):
         repo.verify_builder_commit(worktree, "   ")
 
 
+def test_verify_builder_commit_rejects_hash_with_surrounding_whitespace(tmp_path):
+    repo = _init_repo(tmp_path / "project")
+    worktree = _make_worktree(repo)
+
+    (worktree.path / "feature.txt").write_text("new feature\n")
+    _run(["add", "-A"], worktree.path)
+    _run(["commit", "-m", "implement feature"], worktree.path)
+    reported = repo.head_commit(cwd=worktree.path)
+
+    with pytest.raises(GitError, match="not a commit hash"):
+        repo.verify_builder_commit(worktree, f" {reported} ")
+
+
 def test_verify_builder_commit_rejects_head_revspec(tmp_path):
     # A builder reporting "HEAD" would trivially "match" whatever the
     # worktree happens to be at, defeating the point of verification.

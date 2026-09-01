@@ -226,11 +226,15 @@ def _make_cleanup_state(run_id: str, phase: str, **overrides) -> RunState:
         task_worktree_path="/tmp/worktrees/task-1",
         task_branch="feature/task-1",
         task_base_commit="abc123",
-        task_expected_head="def456",
+        task_expected_head=_TASK_HEAD,
         task_status_snapshot="",
-        merge_pre_head="abc123",
-        merge_task_head="def456",
-        merge_commit="ghi789",
+        planner_result=_planner_result(),
+        builder_result=_builder_result(),
+        auditor_result=_auditor_result(),
+        last_task_head=_TASK_HEAD,
+        merge_pre_head="a" * 40,
+        merge_task_head=_TASK_HEAD,
+        merge_commit="e" * 40,
         phase=phase,
     )
     base.update(overrides)
@@ -288,9 +292,9 @@ def test_operational_failure_validates_last_error_schema(tmp_path):
     record = OperationalErrorRecord(
         error_id=uuid.uuid4().hex[:12],
         kind="git",
-        operation="merging",
-        failed_phase="merging",
-        retry_phase="merging",
+        operation="planning",
+        failed_phase="planning",
+        retry_phase="planning",
         exception_type="GitError",
         message="conflict",
         retryable=True,
@@ -862,7 +866,12 @@ def test_load_rejects_active_task_without_status_snapshot(tmp_path):
 
 def test_load_accepts_active_task_with_empty_status_snapshot(tmp_path):
     run_id = new_run_id()
-    _write_active_task(tmp_path, run_id, task_status_snapshot="")
+    _write_active_task(
+        tmp_path,
+        run_id,
+        task_status_snapshot="",
+        planner_result=_planner_result(),
+    )
     loaded = load_state(tmp_path, run_id)
     assert loaded.task_status_snapshot == ""
 
@@ -906,3 +915,709 @@ def test_failed_phase_requires_error_on_load(tmp_path):
     (path / f"{state.run_id}.json").write_text(json.dumps(data))
     with pytest.raises(StateError):
         load_state(tmp_path, state.run_id)
+
+
+# -- complete persisted-state trust boundary ---------------------------------
+
+
+_TASK_HEAD = "d" * 40
+
+
+def _planner_result(**overrides):
+    result = {
+        "status": "READY",
+        "task_id": "task-1",
+        "objective": "Implement the task",
+        "rationale": "It is next",
+        "acceptance_criteria": ["It works"],
+        "relevant_files": [],
+        "design_questions": [],
+        "decision_required": False,
+        "decision_question": None,
+        "decision_rationale": None,
+    }
+    result.update(overrides)
+    return result
+
+
+def _builder_result(**overrides):
+    result = {
+        "task_id": "task-1",
+        "objective": "Implement the task",
+        "status": "COMPLETE",
+        "implementation_summary": "Implemented it",
+        "implementation_strategy": [],
+        "tests_run": ["pytest"],
+        "test_results": ["passed"],
+        "files_changed": ["src/example.py"],
+        "commit": _TASK_HEAD,
+        "open_concerns": [],
+    }
+    result.update(overrides)
+    return result
+
+
+def _auditor_result(**overrides):
+    result = {
+        "task_id": "task-1",
+        "objective": "Implement the task",
+        "disposition": "ACCEPT",
+        "findings": [],
+        "required_changes": [],
+        "design_observations": [],
+        "decision_required": False,
+        "decision_question": None,
+        "decision_rationale": None,
+    }
+    result.update(overrides)
+    return result
+
+
+def _architect_result(**overrides):
+    result = {
+        "status": "DECIDED",
+        "question": "Which design?",
+        "rationale": "Use the durable design",
+        "adr": {
+            "title": "Durable design",
+            "context": "A choice is needed",
+            "decision": "Use the durable design",
+            "consequences": ["State remains resumable"],
+        },
+        "input_request": None,
+    }
+    result.update(overrides)
+    return result
+
+
+def _active_state_data(*, phase="building", **overrides):
+    data = _make_state(new_run_id(), phase=phase).to_dict()
+    data.update(
+        original_task_id="task-1",
+        task_worktree_path="/tmp/wt/task-1",
+        task_branch="loop/task-1",
+        task_base_commit="abc123",
+        task_expected_head=_TASK_HEAD,
+        task_status_snapshot="",
+        planner_result=_planner_result(),
+    )
+    data.update(overrides)
+    return data
+
+
+def _verification_result(command="pytest"):
+    return {
+        "ok": True,
+        "commands": [
+            {
+                "command": command,
+                "ok": True,
+                "returncode": 0,
+                "timed_out": False,
+                "duration": 1.5,
+                "output_path": "/repo/.git/loop-supervisor/verification/run/abc/01.log",
+                "summary": "passed",
+            }
+        ],
+    }
+
+
+def _planner_decision_result():
+    return _planner_result(
+        decision_required=True,
+        decision_question="Which design?",
+        decision_rationale="Ambiguous",
+    )
+
+
+def _decision_request():
+    return {"origin": "planner", "question": "Which design?", "rationale": "Ambiguous"}
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("planner_result", {"status": "READY"}, "planner_result"),
+        ("architect_result", {"status": "DECIDED"}, "architect_result"),
+        ("builder_result", _builder_result(unexpected=True), "builder_result"),
+        ("auditor_result", _auditor_result(disposition="REVISE"), "auditor_result"),
+    ],
+)
+def test_from_dict_rejects_malformed_present_role_result(field, value, match):
+    data = _active_state_data()
+    data[field] = value
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        (lambda result: result.update(extra="nope"), "verification_result"),
+        (lambda result: result.update(ok=1), "verification_result.*ok"),
+        (lambda result: result.update(commands="pytest"), "verification_result.*commands"),
+        (lambda result: result["commands"][0].update(duration=-0.1), "duration"),
+        (lambda result: result["commands"][0].update(duration=float("nan")), "duration"),
+        (lambda result: result["commands"][0].update(timed_out=True), "timed_out"),
+        (
+            lambda result: result["commands"][0].update(timed_out=True, returncode=1, ok=False),
+            "returncode",
+        ),
+        (lambda result: result["commands"][0].update(ok=False), "command.*ok"),
+        (lambda result: result.update(ok=False), "aggregate.*ok"),
+    ],
+)
+def test_from_dict_rejects_malformed_verification_result(mutation, match):
+    result = {
+        "ok": True,
+        "commands": [
+            {
+                "command": "pytest",
+                "ok": True,
+                "returncode": 0,
+                "timed_out": False,
+                "duration": 1.5,
+                "output_path": "/repo/.git/loop-supervisor/verification/run/abc/01.log",
+                "summary": "passed",
+            }
+        ],
+    }
+    mutation(result)
+    data = _active_state_data(
+        phase="auditing",
+        builder_result=_builder_result(),
+        last_task_head=_TASK_HEAD,
+        verification_result=result,
+    )
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "pending,match",
+    [
+        ({"kind": "unknown", "message": "Question", "context": {}}, "pending_question"),
+        (
+            {"kind": "architect_input", "message": "Question", "context": {}},
+            "pending_question.*context",
+        ),
+        (
+            {
+                "kind": "builder_guidance",
+                "message": "Question",
+                "context": {"status": "COMPLETE"},
+            },
+            "pending_question.*status",
+        ),
+        (
+            {
+                "kind": "decision_approval",
+                "message": "Question",
+                "context": {"title": "Title", "decision": "Decision"},
+                "answer": 1,
+            },
+            "pending_question.*answer",
+        ),
+    ],
+)
+def test_from_dict_rejects_malformed_pending_question(pending, match):
+    data = _active_state_data(pending_question=pending)
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+def test_awaiting_input_requires_pending_question():
+    data = _active_state_data(phase="awaiting_input", pending_question=None)
+
+    with pytest.raises(StateError, match="awaiting_input.*pending_question"):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize("phase", ["architecting", "building"])
+def test_answered_guidance_remains_loadable_during_role_retry(phase):
+    data = _active_state_data(
+        phase=phase,
+        planner_result=(
+            _planner_result(
+                decision_required=True,
+                decision_question="Which design?",
+                decision_rationale="Ambiguous",
+            )
+            if phase == "architecting"
+            else _planner_result()
+        ),
+        decision_request=(
+            {"origin": "planner", "question": "Which design?", "rationale": "Ambiguous"}
+            if phase == "architecting"
+            else None
+        ),
+        builder_result=(
+            _builder_result(status="BLOCKED", commit=None) if phase == "building" else None
+        ),
+        pending_question=(
+            {
+                "kind": "architect_input",
+                "message": "Please clarify",
+                "context": {"question": "Which design?"},
+                "answer": "Use option A",
+            }
+            if phase == "architecting"
+            else {
+                "kind": "builder_guidance",
+                "message": "Please clarify",
+                "context": {"status": "BLOCKED"},
+                "answer": "Continue with the fallback",
+            }
+        ),
+    )
+
+    loaded = RunState.from_dict(data)
+    assert loaded.phase == phase
+    assert loaded.pending_question is not None
+    assert isinstance(loaded.pending_question["answer"], str)
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("created_at", "not-a-timestamp", "created_at"),
+        ("created_at", "2026-01-01T00:00:00", "created_at.*timezone"),
+        ("updated_at", "2025-12-31T23:59:59+00:00", "updated_at.*precede"),
+    ],
+)
+def test_from_dict_rejects_invalid_run_timestamps(field, value, match):
+    data = _make_state(new_run_id()).to_dict()
+    data["created_at"] = "2026-01-01T00:00:00+00:00"
+    data["updated_at"] = "2026-01-01T00:00:01+00:00"
+    data[field] = value
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "phase,overrides,match",
+    [
+        ("building", {"planner_result": None}, "building.*planner_result"),
+        ("verifying", {"builder_result": None}, "verifying.*builder_result"),
+        ("auditing", {"builder_result": None}, "auditing.*builder_result"),
+        ("merging", {"auditor_result": None}, "merging.*auditor_result"),
+        (
+            "building",
+            {"builder_result": _builder_result(task_id="other-task")},
+            "builder_result.*task_id",
+        ),
+        (
+            "merging",
+            {
+                "builder_result": _builder_result(),
+                "auditor_result": _auditor_result(task_id="other-task"),
+                "merge_pre_head": "a" * 40,
+                "merge_task_head": _TASK_HEAD,
+            },
+            "auditor_result.*task_id",
+        ),
+    ],
+)
+def test_from_dict_rejects_impossible_phase_result_relationships(phase, overrides, match):
+    base: dict[str, Any] = (
+        {"last_task_head": _TASK_HEAD} if phase in {"verifying", "auditing", "merging"} else {}
+    )
+    if phase == "merging":
+        base.update(
+            builder_result=_builder_result(),
+            merge_pre_head="a" * 40,
+            merge_task_head=_TASK_HEAD,
+        )
+    base.update(overrides)
+    data = _active_state_data(phase=phase, **base)
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+def test_operational_failure_applies_retry_phase_prerequisites():
+    data = _active_state_data(
+        phase="operational_failure",
+        planner_result=None,
+        last_error=_base_error_record(
+            operation="building",
+            failed_phase="building",
+            retry_phase="building",
+            requires_repair=False,
+        ),
+    )
+
+    with pytest.raises(StateError, match="building.*planner_result"):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"operation": "planning"}, "operation.*failed_phase"),
+        ({"retry_phase": "planning"}, "retry_phase.*failed_phase"),
+    ],
+)
+def test_operational_failure_requires_consistent_phase_fields(overrides, match):
+    error = _base_error_record(
+        operation="building",
+        failed_phase="building",
+        retry_phase="building",
+        requires_repair=False,
+    )
+    error.update(overrides)
+    data = _active_state_data(phase="operational_failure", last_error=error)
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+def test_historical_replan_auditor_result_may_differ_from_new_planner_task():
+    data = _active_state_data(
+        phase="building",
+        planner_result=_planner_result(task_id="task-2"),
+        auditor_result=_auditor_result(task_id="task-1", disposition="REPLAN"),
+    )
+
+    loaded = RunState.from_dict(data)
+    assert loaded.auditor_result is not None
+    assert loaded.auditor_result["task_id"] == "task-1"
+
+
+@pytest.mark.parametrize("missing", ["original_task_id", "planner_result"])
+@pytest.mark.parametrize("kind", ["architect_input", "decision_approval", "builder_guidance"])
+def test_awaiting_input_requires_continuation_prerequisites(kind, missing):
+    common = {
+        "planner_result": _planner_decision_result(),
+        "decision_request": _decision_request(),
+        "architect_result": _architect_result(),
+        "pending_question": {
+            "kind": "decision_approval",
+            "message": "Approve?",
+            "context": {"title": "Durable design", "decision": "Use the durable design"},
+        },
+    }
+    if kind == "architect_input":
+        common["architect_result"] = _architect_result(
+            status="NEEDS_INPUT", adr=None, input_request="Please clarify"
+        )
+        common["pending_question"] = {
+            "kind": kind,
+            "message": "Clarify",
+            "context": {"question": "Which design?"},
+        }
+    elif kind == "builder_guidance":
+        common = {
+            "planner_result": _planner_result(),
+            "builder_result": _builder_result(status="BLOCKED", commit=None),
+            "pending_question": {
+                "kind": kind,
+                "message": "Guide the builder",
+                "context": {"status": "BLOCKED"},
+            },
+        }
+    data = _active_state_data(phase="awaiting_input", **common)
+    data[missing] = None
+
+    match = (
+        "partial task identity"
+        if missing == "original_task_id"
+        else "awaiting_input.*planner_result"
+    )
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        (
+            {"architect_result": _architect_result(question="Another question?")},
+            "architect_result.*question",
+        ),
+        (
+            {
+                "pending_question": {
+                    "kind": "architect_input",
+                    "message": "Clarify",
+                    "context": {"question": "Another question?"},
+                }
+            },
+            "pending_question.*question",
+        ),
+    ],
+)
+def test_architect_input_requires_matching_durable_question(overrides, match):
+    data = _active_state_data(
+        phase="awaiting_input",
+        planner_result=_planner_decision_result(),
+        decision_request=_decision_request(),
+        architect_result=_architect_result(
+            status="NEEDS_INPUT", adr=None, input_request="Please clarify"
+        ),
+        pending_question={
+            "kind": "architect_input",
+            "message": "Clarify",
+            "context": {"question": "Which design?"},
+        },
+    )
+    data.update(overrides)
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize("field", ["title", "decision"])
+def test_decision_approval_context_must_match_architect_result(field):
+    context = {"title": "Durable design", "decision": "Use the durable design"}
+    context[field] = "Unrelated"
+    data = _active_state_data(
+        phase="awaiting_input",
+        planner_result=_planner_decision_result(),
+        decision_request=_decision_request(),
+        architect_result=_architect_result(),
+        pending_question={"kind": "decision_approval", "message": "Approve?", "context": context},
+    )
+
+    with pytest.raises(StateError, match=f"pending_question.*{field}"):
+        RunState.from_dict(data)
+
+
+def test_builder_guidance_context_must_match_builder_result():
+    data = _active_state_data(
+        phase="awaiting_input",
+        builder_result=_builder_result(status="BLOCKED", commit=None),
+        pending_question={
+            "kind": "builder_guidance",
+            "message": "Guide the builder",
+            "context": {"status": "INCOMPLETE"},
+        },
+    )
+
+    with pytest.raises(StateError, match="pending_question.*status"):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize("phase", ["merging", "cleanup_worktree", "cleanup_branch"])
+def test_merge_and_cleanup_require_consistent_reviewed_task_head(phase):
+    data = _active_state_data(
+        phase=phase,
+        builder_result=_builder_result(),
+        auditor_result=_auditor_result(),
+        last_task_head=_TASK_HEAD,
+        merge_pre_head="a" * 40,
+        merge_task_head="e" * 40,
+        merge_commit="f" * 40 if phase != "merging" else None,
+    )
+    if phase == "cleanup_branch":
+        data["task_status_snapshot"] = None
+
+    with pytest.raises(StateError, match="merge_task_head.*last_task_head"):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "phase,commands,result,match",
+    [
+        ("verifying", [], None, "verifying.*verify_commands"),
+        ("verifying", ["pytest"], _verification_result(), "verifying.*verification_result"),
+        ("auditing", ["pytest"], {"ok": True, "commands": []}, "verification_result.*commands"),
+        ("auditing", ["ruff check ."], _verification_result(), "verification_result.*commands"),
+        ("merging", ["pytest"], None, "merging.*verification_result"),
+        ("cleanup_worktree", [], _verification_result(), "cleanup_worktree.*verification_result"),
+    ],
+)
+def test_phase_verification_must_match_configuration(phase, commands, result, match):
+    extras = {
+        "builder_result": _builder_result(),
+        "last_task_head": _TASK_HEAD,
+        "verification_result": result,
+    }
+    if phase in {"merging", "cleanup_worktree"}:
+        extras.update(
+            auditor_result=_auditor_result(),
+            merge_pre_head="a" * 40,
+            merge_task_head=_TASK_HEAD,
+            merge_commit="e" * 40 if phase == "cleanup_worktree" else None,
+        )
+    data = _active_state_data(phase=phase, **extras)
+    data["options"]["verify_commands"] = commands
+
+    with pytest.raises(StateError, match=match):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "phase,overrides",
+    [
+        ("planning", {}),
+        (
+            "creating_worktree",
+            {
+                "pending_worktree_path": "/tmp/wt/task-1",
+                "pending_worktree_branch": "loop/task-1",
+                "pending_worktree_base": "abc123",
+            },
+        ),
+        (
+            "architecting",
+            {
+                "planner_result": _planner_decision_result(),
+                "decision_request": _decision_request(),
+            },
+        ),
+        (
+            "recording_decision",
+            {
+                "planner_result": _planner_decision_result(),
+                "decision_request": _decision_request(),
+                "architect_result": _architect_result(),
+                "pending_adr_path": "/tmp/wt/task-1/docs/decisions/0001-design.md",
+                "pending_adr_hash": "adr-hash",
+            },
+        ),
+        ("building", {}),
+        (
+            "awaiting_input",
+            {
+                "builder_result": _builder_result(status="BLOCKED", commit=None),
+                "pending_question": {
+                    "kind": "builder_guidance",
+                    "message": "Guide the builder",
+                    "context": {"status": "BLOCKED"},
+                },
+            },
+        ),
+    ],
+)
+def test_pre_verification_phases_reject_stale_verification_result(phase, overrides):
+    if phase in {"planning", "creating_worktree"}:
+        data = _make_state(new_run_id(), phase=phase).to_dict()
+        data["planner_result"] = _planner_result()
+    else:
+        data = _active_state_data(phase=phase)
+    data.update(overrides)
+    data["verification_result"] = _verification_result()
+    data["options"]["verify_commands"] = ["pytest"]
+
+    with pytest.raises(StateError, match=f"{phase}.*verification_result"):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "phase", ["verifying", "auditing", "merging", "cleanup_worktree", "cleanup_branch"]
+)
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("last_task_head", "b" * 40),
+        ("task_expected_head", "b" * 40),
+    ],
+)
+def test_post_build_phases_reject_commit_identity_mismatch(phase, field, value):
+    reviewed_commit = "a" * 40
+    extras = {
+        "builder_result": _builder_result(commit=reviewed_commit[:12]),
+        "last_task_head": reviewed_commit,
+    }
+    if phase in {"merging", "cleanup_worktree", "cleanup_branch"}:
+        extras.update(
+            auditor_result=_auditor_result(),
+            merge_pre_head="c" * 40,
+            merge_task_head=reviewed_commit,
+            merge_commit="d" * 40 if phase != "merging" else None,
+        )
+    data = _active_state_data(phase=phase, **extras)
+    data["task_expected_head"] = reviewed_commit
+    if phase == "cleanup_branch":
+        data["task_status_snapshot"] = None
+    if phase == "verifying":
+        data["options"]["verify_commands"] = ["pytest"]
+    data[field] = value
+
+    expected_field = "last_task_head" if phase == "cleanup_branch" else field
+    with pytest.raises(StateError, match=expected_field):
+        RunState.from_dict(data)
+
+
+def test_post_build_phase_accepts_abbreviated_builder_commit_for_reviewed_head():
+    reviewed_commit = "a" * 40
+    data = _active_state_data(
+        phase="auditing",
+        builder_result=_builder_result(commit=reviewed_commit[:12]),
+        last_task_head=reviewed_commit,
+        task_expected_head=reviewed_commit,
+    )
+
+    loaded = RunState.from_dict(data)
+    assert loaded.last_task_head == reviewed_commit
+
+
+@pytest.mark.parametrize("reported_commit", ["HEAD", "not-a-commit", " abcdef1 ", "abcdef"])
+def test_post_build_phase_rejects_non_hash_builder_commit_even_when_checkpoints_equal(
+    reported_commit,
+):
+    data = _active_state_data(
+        phase="auditing",
+        builder_result=_builder_result(commit=reported_commit),
+        last_task_head=reported_commit,
+        task_expected_head=reported_commit,
+    )
+
+    with pytest.raises(StateError, match="builder_result.commit.*7-40"):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize("field", ["last_task_head", "task_expected_head", "merge_task_head"])
+def test_post_build_phase_requires_full_canonical_commit_checkpoints(field):
+    reviewed_commit = "a" * 40
+    data = _active_state_data(
+        phase="merging",
+        builder_result=_builder_result(commit=reviewed_commit[:12]),
+        auditor_result=_auditor_result(),
+        last_task_head=reviewed_commit,
+        task_expected_head=reviewed_commit,
+        merge_pre_head="b" * 40,
+        merge_task_head=reviewed_commit,
+    )
+    data[field] = reviewed_commit[:12]
+
+    with pytest.raises(StateError, match=field):
+        RunState.from_dict(data)
+
+
+def test_creating_worktree_rejects_active_task_identity_and_checkpoints():
+    data = _active_state_data(
+        phase="creating_worktree",
+        pending_worktree_path="/tmp/wt/new-task",
+        pending_worktree_branch="loop/new-task",
+        pending_worktree_base="abc123",
+    )
+
+    with pytest.raises(StateError, match="creating_worktree.*active task identity"):
+        RunState.from_dict(data)
+
+
+def test_architecting_allows_historical_result_for_prior_decision():
+    data = _active_state_data(
+        phase="architecting",
+        planner_result=_planner_result(
+            decision_required=True,
+            decision_question="Which new design?",
+            decision_rationale="A second choice is needed",
+        ),
+        decision_request={
+            "origin": "planner",
+            "question": "Which new design?",
+            "rationale": "A second choice is needed",
+        },
+        architect_result=_architect_result(question="Which old design?"),
+    )
+
+    loaded = RunState.from_dict(data)
+    assert loaded.architect_result is not None
+    assert loaded.architect_result["question"] == "Which old design?"

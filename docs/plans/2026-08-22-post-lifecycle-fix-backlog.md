@@ -341,12 +341,72 @@ after the fact get written down.
    accept`, a round-trip check that anything `cmd_run` builds
    successfully is also accepted by `from_dict()`).
 
-9. **Persisted nested role results, pending questions, and
-   phase/result relationships are not fully validated.**
-   `src/loop_supervisor/state.py:579-655`.
-   Deep/cross-field validation (nested role results, pending-question
-   shape, timestamp ordering, phase-vs-result consistency) is incomplete
-   compared to the flat field/type checks already in place.
+9. ~~**Persisted nested role results, pending questions, and
+   phase/result relationships are not fully validated.**~~ **Resolved.**
+   `RunState.from_dict()` in `src/loop_supervisor/state.py` now treats every
+   nested persisted value as untrusted: present planner, architect, builder,
+   and auditor dictionaries are checked with their existing strict Pydantic
+   contracts and normalized to field-specific `StateError`s; verification
+   summaries enforce an exact aggregate/per-command shape, scalar types,
+   finite non-negative durations, timeout/return-code semantics, and derived
+   `ok` consistency; pending questions enforce the three supported kinds,
+   exact kind-specific context, and optional string answers; and run timestamps
+   must be timezone-aware ISO-8601 values in nondecreasing order.
+
+   Conservative effective-phase checks now require the prerequisites needed
+   for safe resume (including task identity, a READY current planner result,
+   builder/auditor results, merge intent, decision provenance, and
+   `last_task_head`) and apply the same checks through an `operational_failure`
+   record's `retry_phase`. Verification evidence is forbidden before the
+   verifying phase, absent while verification is running, and present exactly
+   when configured throughout auditing/merge/cleanup; its commands must match
+   the persisted configuration in order. Post-build checkpoints require
+    a bare 7-40 character hexadecimal `builder_result.commit` plus full
+    40-character hexadecimal `last_task_head` and `task_expected_head` values
+    identifying the same reviewed commit (with ADR 0013's safe prefix handling
+    for an abbreviated builder report); merge and cleanup require a full
+    `merge_task_head` identifying that same commit. Live verification and reload
+    both reject surrounding whitespace rather than accepting a result that
+    cannot survive persistence. Worktree-creation intent is
+
+   rejected if active task identity or checkpoints are already present.
+
+   Builder/current-planner and non-REPLAN auditor/current-planner task IDs must
+   agree. Architect input/approval and decision-recording states require the
+   architect answer to match the durable decision request; approval
+   title/decision and builder-guidance status must match their source results.
+   Intentionally historical results remain legal: in particular a REPLAN
+   auditor result may describe the prior task while a replacement planner
+   scopes the next attempt, and an earlier architect result may remain when a
+   distinct new request first enters architecting. A rejected DECIDED proposal
+   remains loadable while awaiting feedback, and answered architect/builder
+   guidance remains loadable during retries and related terminal failures.
+
+    Regression coverage is in `tests/test_state.py`'s complete persisted-state
+    trust-boundary section, `tests/test_git.py`'s live commit verification tests,
+    and transition/reload tests in `tests/test_advance.py`. The transition matrix
+    saves and reloads snapshots produced while planning, creating a worktree,
+    awaiting architect approval, recording its decision, building, configured
+    verification, auditing, merging, both cleanup phases, and terminal
+    completion. Focused lifecycle tests additionally cover sequential distinct
+    design escalations, rejected-decision feedback, architect retry-limit
+    terminal snapshots, ordinary operational retries, and a decision-approval
+    preparation failure that reloads and resumes with its approval prerequisite
+    intact. State mutation tests cover stale pre-verification evidence,
+    contradictory or non-hash post-build commit identities, and creation intent
+    combined with active identity.
+
+    Failing-first evidence: the original trust-boundary tests produced 28
+    expected failures against the pre-change implementation; the first audit
+    follow-up produced 21 expected failures against commit `2986466`; the next
+    focused probe against exact commit
+    `a28f203e7f08a7fa528fbb3cc8c17976f9aa4dfd` produced 16 expected state-test
+    failures plus the expected sequential-lifecycle reload failure. The final
+    audit-remediation probe self-checked exact prior commit
+    `addd29701173de961f59fe58b3f2d22e3313e2f7` and produced six expected failures
+    across invalid equal commit identities, abbreviated canonical checkpoints,
+    runtime whitespace acceptance, and approval-preparation retry durability.
+
 
 10. ~~Non-`FileNotFoundError` spawn failures need normalization.~~
     **Already resolved; this backlog had not caught up.**
