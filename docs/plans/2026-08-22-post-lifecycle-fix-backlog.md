@@ -81,26 +81,29 @@ after the fact get written down.
    makes `ContractError` consistent with that existing behavior rather
    than introducing a new hazard. Tracked as item 24, below.
 
-2. **Ordinary post-transition `_save()` failures are outside
-   classification/failure-persistence boundaries.**
-   `src/loop_supervisor/supervisor.py:543` (the `PHASE_AWAITING_INPUT`
-   save after the `try`), `:551` (the success-path save); both sit
-   outside the `try:` at `:478-540`, unlike the `_save()` call at
-   `:481` (inside the try, so a failure there at least has a chance of
-   being classified). Corrected from a stale `:534-549`/`:716-718`
-   citation.
-   A `_save()` failure after an otherwise successful phase transition is
-   not classified or recorded consistently with other operational
-   failures raised from inside the `try` block (`_handle_operational_-
-   failure`, `:592-596`; `_handle_terminal_failure`, `:631`, neither of
-   which this code path can reach once outside the `try`).
-   The realistic trigger is not a bare disk-write failure: `_save()`
-   calls `self._checkpoint(state)` (`:737-738`), which calls
-   `repo.head_commit()`/`repo.status_snapshot()` (`:448-456`) — Git
-   operations that can raise `GitError`. `GitError` is already one of
-   the exception types the in-`try` operational-failure tuple catches
-   (`:526-532`); it is simply unreachable from a `_save()` call made
-   after that `try` block has already exited.
+2. ~~**Ordinary post-transition `_save()` failures are outside
+   classification/failure-persistence boundaries.**~~ **Resolved.**
+   `src/loop_supervisor/supervisor.py`'s new `_save_after_transition()`
+   wraps all three success-path `_save()` calls (the
+   `PHASE_AWAITING_INPUT` save, and the two on the generic
+   `INPUT_REQUIRED`/`ADVANCED` path) in the same
+   `_OPERATIONAL_FAILURE_EXCEPTIONS` classification `advance()`'s
+   in-`try` dispatch already used, routing a failure to the existing
+   `_handle_operational_failure()` instead of letting it escape raw.
+   The classification target is `state.phase` (the phase already
+   transitioned into in memory), except when that phase is terminal
+   (currently only reachable via `_do_planning` -> `PHASE_DONE`), in
+   which case it falls back to `phase_before` -- a terminal phase is
+   never a valid `OperationalErrorRecord.retry_phase`
+   (`RETRY_TARGET_PHASES` excludes both terminal phases by
+   construction), so classifying against it would have built an
+   invalid, permanently-unloadable record; `phase_before` is always a
+   valid, safely-retryable target instead. See `docs/decisions/0029-
+   post-transition-save-failures-are-classified-like-any-other.md`.
+   Two new regression tests in `tests/test_advance.py` cover the
+   ordinary case and the terminal-phase edge case, both verified
+   failing-first (the pre-fix code let the simulated `GitError` escape
+   `advance()` raw).
 
 3. ~~Persisted "sanitized" messages may include HTTP response bodies or
    server output.~~ **Resolved (partially).**
@@ -503,19 +506,30 @@ after the fact get written down.
     internals) are unaffected by this finding and remain believed not
     ours to fix.
 
-24. **Retry after an operational failure discovered mid-phase can lose
-    operator-supplied guidance.**
-    `src/loop_supervisor/supervisor.py:877` (`_do_architecting`),
-    `:1032` (`_do_building`); corrected from a stale `:867-869`/
-    `:1022-1024` citation.
-    `_do_architecting()` and `_do_building()` clear
+24. ~~**Retry after an operational failure discovered mid-phase can
+    lose operator-supplied guidance.**~~ **Resolved.**
+    `_do_architecting()` and `_do_building()` previously cleared
     `state.pending_question` (consuming any operator guidance/answer)
     before invoking the role and running its contract checks. If the
-    role invocation or a downstream contract check then fails and the
-    phase is retried, the consumed guidance is gone and the operator
-    must resupply it. Pre-existing for every exception already routed
-    through `_handle_operational_failure()`, not introduced by item 1's
-    `ContractError` fix; not previously called out in this backlog.
+    role invocation or a downstream contract check then failed and the
+    phase retried, the consumed guidance was gone and the operator had
+    to resupply it with no indication why. Pre-existing for every
+    exception already routed through `_handle_operational_failure()`,
+    not introduced by item 1's `ContractError` fix.
+
+    Both methods now read the pending answer without clearing it, and
+    only clear `state.pending_question` once the phase has actually
+    produced a usable result: `_do_architecting` after
+    `_prepare_record_decision` succeeds (its two other branches already
+    overwrite `pending_question` with a fresh one of their own, so no
+    separate clear was needed there), `_do_building` after
+    `verify_builder_commit` succeeds (its `BLOCKED` branch likewise
+    already overwrites it). Two new regression tests in
+    `tests/test_advance.py` drive a `FlakyRunner` that fails on the
+    first retried invocation of each phase and assert the guidance/
+    answer text survives the failure and reaches the eventual
+    successful prompt; both verified failing-first (the pre-fix code
+    left `pending_question` as `None` after the simulated retry).
 
 25. ~~**`init --destination` bootstraps a fork of the supervisor, not a
     new project.**~~ **Resolved.** ADR 0004 stated copy-mode exists to
