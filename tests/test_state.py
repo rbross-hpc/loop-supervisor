@@ -226,15 +226,15 @@ def _make_cleanup_state(run_id: str, phase: str, **overrides) -> RunState:
         task_worktree_path="/tmp/worktrees/task-1",
         task_branch="feature/task-1",
         task_base_commit="abc123",
-        task_expected_head="def456",
+        task_expected_head=_TASK_HEAD,
         task_status_snapshot="",
         planner_result=_planner_result(),
         builder_result=_builder_result(),
         auditor_result=_auditor_result(),
-        last_task_head="def456",
-        merge_pre_head="abc123",
-        merge_task_head="def456",
-        merge_commit="ghi789",
+        last_task_head=_TASK_HEAD,
+        merge_pre_head="a" * 40,
+        merge_task_head=_TASK_HEAD,
+        merge_commit="e" * 40,
         phase=phase,
     )
     base.update(overrides)
@@ -920,6 +920,9 @@ def test_failed_phase_requires_error_on_load(tmp_path):
 # -- complete persisted-state trust boundary ---------------------------------
 
 
+_TASK_HEAD = "d" * 40
+
+
 def _planner_result(**overrides):
     result = {
         "status": "READY",
@@ -947,7 +950,7 @@ def _builder_result(**overrides):
         "tests_run": ["pytest"],
         "test_results": ["passed"],
         "files_changed": ["src/example.py"],
-        "commit": "def456",
+        "commit": _TASK_HEAD,
         "open_concerns": [],
     }
     result.update(overrides)
@@ -994,7 +997,7 @@ def _active_state_data(*, phase="building", **overrides):
         task_worktree_path="/tmp/wt/task-1",
         task_branch="loop/task-1",
         task_base_commit="abc123",
-        task_expected_head="def456",
+        task_expected_head=_TASK_HEAD,
         task_status_snapshot="",
         planner_result=_planner_result(),
     )
@@ -1084,7 +1087,7 @@ def test_from_dict_rejects_malformed_verification_result(mutation, match):
     data = _active_state_data(
         phase="auditing",
         builder_result=_builder_result(),
-        last_task_head="def456",
+        last_task_head=_TASK_HEAD,
         verification_result=result,
     )
 
@@ -1212,8 +1215,8 @@ def test_from_dict_rejects_invalid_run_timestamps(field, value, match):
             {
                 "builder_result": _builder_result(),
                 "auditor_result": _auditor_result(task_id="other-task"),
-                "merge_pre_head": "abc123",
-                "merge_task_head": "def456",
+                "merge_pre_head": "a" * 40,
+                "merge_task_head": _TASK_HEAD,
             },
             "auditor_result.*task_id",
         ),
@@ -1221,13 +1224,13 @@ def test_from_dict_rejects_invalid_run_timestamps(field, value, match):
 )
 def test_from_dict_rejects_impossible_phase_result_relationships(phase, overrides, match):
     base: dict[str, Any] = (
-        {"last_task_head": "def456"} if phase in {"verifying", "auditing", "merging"} else {}
+        {"last_task_head": _TASK_HEAD} if phase in {"verifying", "auditing", "merging"} else {}
     )
     if phase == "merging":
         base.update(
             builder_result=_builder_result(),
-            merge_pre_head="abc123",
-            merge_task_head="def456",
+            merge_pre_head="a" * 40,
+            merge_task_head=_TASK_HEAD,
         )
     base.update(overrides)
     data = _active_state_data(phase=phase, **base)
@@ -1405,10 +1408,10 @@ def test_merge_and_cleanup_require_consistent_reviewed_task_head(phase):
         phase=phase,
         builder_result=_builder_result(),
         auditor_result=_auditor_result(),
-        last_task_head="reviewed-head",
-        merge_pre_head="abc123",
-        merge_task_head="different-head",
-        merge_commit="merged-head" if phase != "merging" else None,
+        last_task_head=_TASK_HEAD,
+        merge_pre_head="a" * 40,
+        merge_task_head="e" * 40,
+        merge_commit="f" * 40 if phase != "merging" else None,
     )
     if phase == "cleanup_branch":
         data["task_status_snapshot"] = None
@@ -1431,15 +1434,15 @@ def test_merge_and_cleanup_require_consistent_reviewed_task_head(phase):
 def test_phase_verification_must_match_configuration(phase, commands, result, match):
     extras = {
         "builder_result": _builder_result(),
-        "last_task_head": "def456",
+        "last_task_head": _TASK_HEAD,
         "verification_result": result,
     }
     if phase in {"merging", "cleanup_worktree"}:
         extras.update(
             auditor_result=_auditor_result(),
-            merge_pre_head="abc123",
-            merge_task_head="def456",
-            merge_commit="merged-head" if phase == "cleanup_worktree" else None,
+            merge_pre_head="a" * 40,
+            merge_task_head=_TASK_HEAD,
+            merge_commit="e" * 40 if phase == "cleanup_worktree" else None,
         )
     data = _active_state_data(phase=phase, **extras)
     data["options"]["verify_commands"] = commands
@@ -1552,6 +1555,39 @@ def test_post_build_phase_accepts_abbreviated_builder_commit_for_reviewed_head()
 
     loaded = RunState.from_dict(data)
     assert loaded.last_task_head == reviewed_commit
+
+
+@pytest.mark.parametrize("reported_commit", ["HEAD", "not-a-commit", " abcdef1 ", "abcdef"])
+def test_post_build_phase_rejects_non_hash_builder_commit_even_when_checkpoints_equal(
+    reported_commit,
+):
+    data = _active_state_data(
+        phase="auditing",
+        builder_result=_builder_result(commit=reported_commit),
+        last_task_head=reported_commit,
+        task_expected_head=reported_commit,
+    )
+
+    with pytest.raises(StateError, match="builder_result.commit.*7-40"):
+        RunState.from_dict(data)
+
+
+@pytest.mark.parametrize("field", ["last_task_head", "task_expected_head", "merge_task_head"])
+def test_post_build_phase_requires_full_canonical_commit_checkpoints(field):
+    reviewed_commit = "a" * 40
+    data = _active_state_data(
+        phase="merging",
+        builder_result=_builder_result(commit=reviewed_commit[:12]),
+        auditor_result=_auditor_result(),
+        last_task_head=reviewed_commit,
+        task_expected_head=reviewed_commit,
+        merge_pre_head="b" * 40,
+        merge_task_head=reviewed_commit,
+    )
+    data[field] = reviewed_commit[:12]
+
+    with pytest.raises(StateError, match=field):
+        RunState.from_dict(data)
 
 
 def test_creating_worktree_rejects_active_task_identity_and_checkpoints():

@@ -361,10 +361,14 @@ after the fact get written down.
    verifying phase, absent while verification is running, and present exactly
    when configured throughout auditing/merge/cleanup; its commands must match
    the persisted configuration in order. Post-build checkpoints require
-   `builder_result.commit`, canonical `last_task_head`, and
-   `task_expected_head` to identify the same reviewed commit (with ADR 0013's
-   safe prefix handling for an abbreviated builder report), while merge and
-   cleanup intent must identify that same commit. Worktree-creation intent is
+    a bare 7-40 character hexadecimal `builder_result.commit` plus full
+    40-character hexadecimal `last_task_head` and `task_expected_head` values
+    identifying the same reviewed commit (with ADR 0013's safe prefix handling
+    for an abbreviated builder report); merge and cleanup require a full
+    `merge_task_head` identifying that same commit. Live verification and reload
+    both reject surrounding whitespace rather than accepting a result that
+    cannot survive persistence. Worktree-creation intent is
+
    rejected if active task identity or checkpoints are already present.
 
    Builder/current-planner and non-REPLAN auditor/current-planner task IDs must
@@ -378,17 +382,31 @@ after the fact get written down.
    remains loadable while awaiting feedback, and answered architect/builder
    guidance remains loadable during retries and related terminal failures.
 
-   Regression coverage is in `tests/test_state.py`'s complete persisted-state
-   trust-boundary section and real transition/reload tests in
-   `tests/test_advance.py`, including sequential distinct design escalations,
-   stale pre-verification evidence, contradictory post-build commit identities,
-   creation intent combined with active identity, rejected-decision feedback,
-   and architect retry-limit terminal snapshots. The original tests produced 28
-   expected failures against the pre-change implementation; the first audit
-   follow-up tests produced 21 expected failures against commit `2986466`, and
-   the final focused revision probe self-checked and ran against exact task
-   commit `a28f203e7f08a7fa528fbb3cc8c17976f9aa4dfd`, producing 14 expected
-   state-test failures plus the expected sequential-lifecycle reload failure.
+    Regression coverage is in `tests/test_state.py`'s complete persisted-state
+    trust-boundary section, `tests/test_git.py`'s live commit verification tests,
+    and transition/reload tests in `tests/test_advance.py`. The transition matrix
+    saves and reloads snapshots produced while planning, creating a worktree,
+    awaiting architect approval, recording its decision, building, configured
+    verification, auditing, merging, both cleanup phases, and terminal
+    completion. Focused lifecycle tests additionally cover sequential distinct
+    design escalations, rejected-decision feedback, architect retry-limit
+    terminal snapshots, ordinary operational retries, and a decision-approval
+    preparation failure that reloads and resumes with its approval prerequisite
+    intact. State mutation tests cover stale pre-verification evidence,
+    contradictory or non-hash post-build commit identities, and creation intent
+    combined with active identity.
+
+    Failing-first evidence: the original trust-boundary tests produced 28
+    expected failures against the pre-change implementation; the first audit
+    follow-up produced 21 expected failures against commit `2986466`; the next
+    focused probe against exact commit
+    `a28f203e7f08a7fa528fbb3cc8c17976f9aa4dfd` produced 16 expected state-test
+    failures plus the expected sequential-lifecycle reload failure. The final
+    audit-remediation probe self-checked exact prior commit
+    `addd29701173de961f59fe58b3f2d22e3313e2f7` and produced six expected failures
+    across invalid equal commit identities, abbreviated canonical checkpoints,
+    runtime whitespace acceptance, and approval-preparation retry durability.
+
 
 10. ~~Non-`FileNotFoundError` spawn failures need normalization.~~
     **Already resolved; this backlog had not caught up.**

@@ -364,8 +364,8 @@ class GitRepo:
 
         actual_head = self.head_commit(cwd=task_worktree.path)
 
-        candidate = reported_commit.strip()
-        if not _COMMIT_HASH_RE.match(candidate):
+        candidate = reported_commit
+        if not _COMMIT_HASH_RE.fullmatch(candidate):
             raise GitError(
                 f"builder reported {reported_commit!r}, which is not a commit hash "
                 "(expected 7-40 hex characters); refusing to resolve it as a revspec"

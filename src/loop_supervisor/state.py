@@ -903,20 +903,32 @@ def _validate_verification_for_phase(data: dict[str, Any], phase: str) -> None:
             )
 
 
-def _commit_ids_match(reported: str, canonical: str) -> bool:
-    """Compare persisted builder and verified commit identities.
+_REPORTED_COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,40}")
+_CANONICAL_COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
 
-    Runtime commit verification accepts a bare 7-40 character hexadecimal
-    abbreviation and persists the canonical HEAD separately (ADR 0013). State
-    loading has no repository available for rev-parse, so it can only enforce
-    the corresponding safe prefix relationship.
+
+def _require_reported_commit(value: object) -> str:
+    if not isinstance(value, str) or _REPORTED_COMMIT_RE.fullmatch(value) is None:
+        raise StateError(
+            "state field 'builder_result.commit' must be a bare 7-40 character hexadecimal hash"
+        )
+    return value
+
+
+def _require_canonical_commit(data: dict[str, Any], field_name: str) -> str:
+    value = data.get(field_name)
+    if not isinstance(value, str) or _CANONICAL_COMMIT_RE.fullmatch(value) is None:
+        raise StateError(f"state field {field_name!r} must be a full 40-character hexadecimal hash")
+    return value
+
+
+def _commit_ids_match(reported: str, canonical: str) -> bool:
+    """Compare already-validated persisted commit identities.
+
+    State loading has no repository available for rev-parse, so ADR 0013's
+    accepted builder abbreviation can only be checked as a case-insensitive
+    prefix of the separately persisted canonical HEAD.
     """
-    if reported == canonical:
-        return True
-    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", reported):
-        return False
-    if not re.fullmatch(r"[0-9a-fA-F]{40}", canonical):
-        return False
     return canonical.lower().startswith(reported.lower())
 
 
@@ -1038,30 +1050,29 @@ def _validate_effective_phase_requirements(data: dict[str, Any], phase: str) -> 
         if architect["status"] != "DECIDED":
             raise StateError("phase 'recording_decision' requires a DECIDED architect_result")
 
-    if phase in {"merging", "cleanup_worktree", "cleanup_branch"}:
-        if data["merge_task_head"] != data["last_task_head"]:
-            raise StateError(
-                "state field 'merge_task_head' must match last_task_head during merge and cleanup"
-            )
-
     if phase in {"verifying", "auditing", "merging", "cleanup_worktree", "cleanup_branch"}:
         builder = _require_result(data, phase, "builder_result")
         if builder["status"] != "COMPLETE":
             raise StateError(f"phase {phase!r} requires a COMPLETE builder_result")
-        last_task_head = data.get("last_task_head")
-        if last_task_head is None:
-            raise StateError(f"phase {phase!r} requires last_task_head")
-        reported_commit = builder["commit"]
-        assert isinstance(reported_commit, str)
+        reported_commit = _require_reported_commit(builder["commit"])
+        last_task_head = _require_canonical_commit(data, "last_task_head")
+        task_expected_head = _require_canonical_commit(data, "task_expected_head")
         if not _commit_ids_match(reported_commit, last_task_head):
             raise StateError(
                 "state field 'last_task_head' must identify builder_result.commit "
                 "(an unambiguous abbreviated builder commit is allowed)"
             )
-        if data.get("task_expected_head") != last_task_head:
+        if task_expected_head != last_task_head:
             raise StateError(
                 "state field 'task_expected_head' must match last_task_head after building"
             )
+        if phase in {"merging", "cleanup_worktree", "cleanup_branch"}:
+            merge_task_head = _require_canonical_commit(data, "merge_task_head")
+            if merge_task_head != last_task_head:
+                raise StateError(
+                    "state field 'merge_task_head' must match last_task_head "
+                    "during merge and cleanup"
+                )
         _validate_verification_for_phase(data, phase)
 
     if phase in {"merging", "cleanup_worktree", "cleanup_branch"}:

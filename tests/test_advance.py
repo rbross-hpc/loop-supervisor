@@ -207,6 +207,56 @@ def test_advance_planning_transitions_to_creating_worktree(tmp_path):
     assert state.pending_worktree_path is not None
 
 
+def test_transition_produced_lifecycle_snapshots_round_trip(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(decision_required=True), _planner_complete()],
+            "loop-architect": [_architect_decided()],
+            "loop-builder": [_builder(status="COMPLETE")],
+            "loop-auditor": [_auditor(disposition="ACCEPT")],
+        }
+    )
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=ScriptedInput(["approve"]),
+        options=_make_options(
+            require_decision_approval=True,
+            verify_commands=("python -c 'print(42)'",),
+        ),
+    )
+    state = supervisor.start_new_run()
+    expected_phases = [
+        PHASE_PLANNING,
+        PHASE_CREATING_WORKTREE,
+        "architecting",
+        PHASE_AWAITING_INPUT,
+        PHASE_RECORDING_DECISION,
+        PHASE_BUILDING,
+        "verifying",
+        "auditing",
+        PHASE_MERGING,
+        PHASE_CLEANUP_WORKTREE,
+        PHASE_CLEANUP_BRANCH,
+        PHASE_PLANNING,
+        PHASE_DONE,
+    ]
+
+    observed = []
+    for expected_phase in expected_phases:
+        assert state.phase == expected_phase
+        loaded = load_state(repo.common_dir(), state.run_id)
+        assert loaded.phase == expected_phase
+        assert loaded.to_dict() == state.to_dict()
+        observed.append(expected_phase)
+        if expected_phase != PHASE_DONE:
+            supervisor.advance(state)
+
+    assert observed == expected_phases
+    assert state.accepted_task_count == 1
+    assert state.verification_result is None
+
+
 def test_advance_creating_worktree_creates_worktree_and_advances(tmp_path):
     runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
     supervisor, repo = _make_supervisor(tmp_path, runner)
@@ -715,6 +765,59 @@ def test_advance_decision_approval_not_reinvoked(tmp_path):
 
     arch_calls_after = sum(1 for c in runner.calls if c[0] == "loop-architect")
     assert arch_calls_after == arch_calls_before
+
+
+def test_decision_approval_preparation_failure_reloads_and_resumes(tmp_path, monkeypatch):
+    from loop_supervisor.decisions import DecisionError
+
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(decision_required=True)],
+            "loop-architect": [_architect_decided()],
+        }
+    )
+    input_provider = ScriptedInput([])
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=input_provider,
+        options=_make_options(require_decision_approval=True),
+    )
+    state = supervisor.start_new_run()
+    _advance_to_phase(supervisor, state, PHASE_AWAITING_INPUT)
+
+    real_prepare = supervisor._prepare_record_decision
+    calls = [0]
+
+    def flaky_prepare(candidate):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise DecisionError("simulated ADR path failure")
+        real_prepare(candidate)
+
+    monkeypatch.setattr(supervisor, "_prepare_record_decision", flaky_prepare)
+    input_provider.answers = ["approve"]
+    outcome = supervisor.advance(state)
+
+    assert outcome.status == AdvanceStatus.OPERATIONAL_FAILURE
+    assert state.last_error is not None
+    assert state.last_error["retry_phase"] == PHASE_AWAITING_INPUT
+    assert state.pending_question is not None
+    assert state.pending_question["kind"] == "decision_approval"
+    assert state.pending_question["answer"] == "approve"
+
+    reloaded = load_state(repo.common_dir(), state.run_id)
+    resumed = supervisor.resume(reloaded)
+    retry = supervisor.advance(resumed)
+    assert retry.status == AdvanceStatus.INPUT_REQUIRED
+    assert resumed.phase == PHASE_AWAITING_INPUT
+
+    resumed_input = ScriptedInput(["approve"])
+    supervisor.input_provider = resumed_input
+    approved = supervisor.advance(resumed)
+    assert approved.status == AdvanceStatus.ADVANCED
+    assert resumed.phase == PHASE_RECORDING_DECISION
+    assert resumed.pending_question is None
 
 
 def test_rejected_decision_state_reloads_and_resumes_with_feedback(tmp_path):

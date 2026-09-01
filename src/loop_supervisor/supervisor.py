@@ -1507,9 +1507,14 @@ class Supervisor:
             state.pending_question = pending
             state.phase = PHASE_ARCHITECTING
         elif pending["kind"] == "decision_approval":
-            state.pending_question = None
             if answer.strip().lower() in ("y", "yes", "approve"):
+                # Preparing the durable ADR intent performs fallible path and
+                # filesystem inspection. Keep the answered approval until that
+                # work succeeds so an operational failure targeting
+                # awaiting_input remains valid and resumable.
+                state.pending_question = pending
                 self._prepare_record_decision(state)
+                state.pending_question = None
             else:
                 question = (
                     DecisionRequest.from_dict(state.decision_request).question
