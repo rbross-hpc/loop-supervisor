@@ -49,6 +49,10 @@ After implementation:
 Do not merge branches.
 Do not push commits.
 Do not declare the overall project complete.
+Do not install packages (e.g. `pip install`) outside your own task
+worktree. Your worktree has its own `.venv`; installing against
+another environment can silently corrupt the integration checkout's
+environment.
 
 Return exactly one JSON object and no other text.
 

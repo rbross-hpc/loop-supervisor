@@ -1,0 +1,15 @@
+[provision]
+commands = [
+  "uv venv --clear --seed",
+  "uv pip install --quiet --python .venv/bin/python -e .[dev]",
+]
+timeout = 600.0
+
+[verify]
+commands = [
+  ".venv/bin/ruff check .",
+  ".venv/bin/ruff format --check .",
+  ".venv/bin/mypy src tests",
+  ".venv/bin/pytest -q -p no:cacheprovider",
+]
+timeout = 900.0
