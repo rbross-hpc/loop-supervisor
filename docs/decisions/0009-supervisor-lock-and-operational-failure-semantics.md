@@ -337,10 +337,20 @@ unresolved, so a new lifecycle can never begin while a prior one's
 cleanup is still outstanding.
 
 **TUI app-level exit retries indefinitely until cleanup is confirmed
-clean.** `LoopSupervisorApp._on_exit_app()` requests shutdown on every
-active `RunScreen`, awaits completion, and — if any screen's
-`shutdown_clean` is still False — retries automatically on a fixed
-interval, forever. There is deliberately no overall exit timeout: the
+clean.** Every `RunScreen` cleanup worker has an immutable attempt handle
+(generation plus its own completion event). A shutdown request returns the
+existing in-flight handle, starts and returns the next generation, or returns
+`None` when cleanup is already confirmed clean. Selection is serialized under
+the screen's attempt lock, which both prevents overlapping cleanup workers and
+ensures a later retry cannot signal an earlier or later generation's waiters.
+The app's coordinator awaits only a returned handle; it never waits on a
+reusable screen-wide event and needs no separate `shutdown_clean` pre-check to
+avoid waiting when no attempt exists.
+
+`LoopSupervisorApp._on_exit_app()` requests shutdown on every active
+`RunScreen`, awaits completion, and — if any screen's `shutdown_clean` is still
+False — retries automatically on a fixed interval, forever. There is
+deliberately no overall exit timeout: the
 underlying Textual shutdown sequence (and therefore process exit) must
 never be allowed to proceed while the repository lock is held or an
 OpenCode process may still be alive. The same retry is available

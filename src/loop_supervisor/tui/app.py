@@ -54,9 +54,12 @@ bridge fixes for the headless path; giving the TUI equivalent protection
 needs its own UX decision and is tracked separately (backlog item 22b),
 not solved here. At
 most one cleanup attempt runs at a time per screen
-(``_shutdown_attempt_lock``/``_shutdown_in_progress``); a completed
-attempt that did not achieve a clean teardown (``shutdown_clean`` is
-False — e.g. ``server.stop()`` could not confirm the process exited)
+(``_shutdown_attempt_lock``/``_shutdown_in_progress``). Each attempt has
+an immutable generation/event handle; concurrent requesters share only the
+current handle, while retries receive a new one, so one generation cannot
+release another generation's waiters. A completed attempt that did not
+achieve a clean teardown (``shutdown_clean`` is False — e.g.
+``server.stop()`` could not confirm the process exited)
 leaves every owned resource in place for a subsequent attempt, triggered
 either by the user retrying ("q"/"Return to runs" again) or automatically
 by app-level exit.
@@ -106,6 +109,8 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import cast
 
@@ -193,6 +198,14 @@ _SHUTDOWN_GRACE_SECONDS = 10.0
 # bound: app-level exit retries indefinitely until cleanup is confirmed
 # clean, since unresolved child/lock ownership must never be abandoned.
 _SHUTDOWN_RETRY_INTERVAL_SECONDS = 2.0
+
+
+@dataclass(frozen=True)
+class _ShutdownAttempt:
+    """Identity and completion signal for one cleanup worker generation."""
+
+    generation: int
+    completion: threading.Event
 
 
 class _QueueInputProvider:
@@ -403,13 +416,12 @@ class RunScreen(Screen):
         # release the lock or stop the server while initialization is
         # still in flight, since it may still be mutating durable state.
         self._init_done_event = threading.Event()
-        # Set exactly once, in _shutdown_worker's finally block, regardless
-        # of how cleanup went (including exceptions from server.stop() or
-        # lock.release()). This is the single completion signal every exit
-        # path — "q", the "Return to runs" button, an unexpected unmount,
-        # and app-level exit via LoopSupervisorApp._on_exit_app — can wait
-        # on without caring which of them actually triggered shutdown.
-        self._shutdown_complete_event = threading.Event()
+        # Each cleanup worker gets a distinct immutable attempt handle.
+        # The current handle is retained only while its worker is in flight;
+        # callers may safely keep and await older handles because a later
+        # generation can never clear or set an earlier generation's event.
+        self._shutdown_generation = 0
+        self._shutdown_attempt: _ShutdownAttempt | None = None
         # Distinct from "attempt finished" above: True only if every owned
         # resource (SSE worker, OpenCode server, repository lock) was
         # definitively released. False means the attempt finished but left
@@ -910,90 +922,70 @@ class RunScreen(Screen):
             and self._shutdown_clean
         )
 
-    def action_request_shutdown(self) -> None:
-        """Record shutdown intent and start a cleanup attempt if one is
-        not already active.
+    def action_request_shutdown(self) -> _ShutdownAttempt | None:
+        """Record shutdown intent and return the cleanup attempt to await.
 
-        Idempotent and safe to call repeatedly (e.g. "q" pressed more than
-        once, or racing app-level exit): _shutdown_requested is a
-        persistent intent flag set once, but a new _shutdown_worker is
-        only actually started when no attempt is currently running and
-        cleanup has not already succeeded. This lets a failed attempt be
-        retried by calling this method again (e.g. from _on_exit_app's
-        retry loop, or the user pressing "q"/"Return to runs" again after
-        a warning) without ever running two cleanup workers concurrently.
+        The return value is the existing in-flight attempt, a newly started
+        attempt, or ``None`` when cleanup is already confirmed clean. The
+        attempt lock makes that choice and worker registration atomic with
+        respect to other shutdown requesters, so cleanup workers never
+        overlap and every waiter receives the exact generation it requested.
         """
         self._shutdown_requested = True
-        self._maybe_start_shutdown_attempt()
+        attempt = self._maybe_start_shutdown_attempt()
+        if attempt is None and self.ready_to_finalize:
+            app = self._app_ref
+            if app is not None:
+                app.finalize_run_screen(self)
+        return attempt
 
-    def _maybe_start_shutdown_attempt(self) -> bool:
-        """Start a _shutdown_worker attempt if none is active and cleanup
-        is not already clean. Returns True if an attempt was (or already
-        is) in flight, i.e. the caller may wait on
-        _shutdown_complete_event; returns False only if shutdown was
-        already clean and there is nothing to wait for."""
+    def _maybe_start_shutdown_attempt(self) -> _ShutdownAttempt | None:
+        """Return an in-flight/new cleanup attempt, or ``None`` if clean."""
         with self._shutdown_attempt_lock:
             if self._shutdown_clean:
-                return False
+                return None
             if self._shutdown_in_progress:
-                return True
+                assert self._shutdown_attempt is not None
+                return self._shutdown_attempt
+            self._shutdown_generation += 1
+            attempt = _ShutdownAttempt(self._shutdown_generation, threading.Event())
+            self._shutdown_attempt = attempt
             self._shutdown_in_progress = True
-            self._shutdown_complete_event.clear()
 
-        app = self._app_ref or self.app
-        # Run against the App node, not this screen: Textual cancels every
-        # worker registered against a widget/screen as soon as it unmounts
-        # (Widget._on_unmount -> workers.cancel_node(self)). Since shutdown
-        # itself is what causes this screen to unmount (via pop_screen at
-        # the end of _shutdown_worker), a worker registered against the
-        # screen would race its own cancellation. Registering against the
-        # app, which outlives the screen, avoids that self-cancellation.
-        app.run_worker(self._shutdown_worker, exclusive=False, thread=True)
-        return True
+            app = self._app_ref or self.app
+            # Run against the App node, not this screen: Textual cancels every
+            # worker registered against a widget/screen as soon as it unmounts
+            # (Widget._on_unmount -> workers.cancel_node(self)). Since shutdown
+            # itself is what causes this screen to unmount (via pop_screen at
+            # the end of _shutdown_worker), a worker registered against the
+            # screen would race its own cancellation. Registering against the
+            # app, which outlives the screen, avoids that self-cancellation.
+            app.run_worker(partial(self._shutdown_worker, attempt), exclusive=False, thread=True)
+            return attempt
 
-    async def await_shutdown_complete(self) -> None:
-        """Await the current shutdown attempt's completion without
-        blocking the Textual event loop. Used by
-        LoopSupervisorApp._on_exit_app() so app-level exit (ctrl+q,
-        App.exit(), or a driver-posted ExitApp on SIGINT/SIGTERM) waits
-        for the same cleanup as "q"/on_unmount before the process is
-        allowed to actually exit. Does not itself request shutdown or
-        start an attempt; the caller must have already called
-        action_request_shutdown() or _maybe_start_shutdown_attempt().
+    async def await_shutdown_complete(self, attempt: _ShutdownAttempt) -> None:
+        """Await exactly ``attempt`` without blocking the Textual event loop.
 
-        Polls with a short bounded wait per executor call, rather than
-        one single unbounded `Event.wait()`, so this coroutine remains
-        promptly cancellable: a plain unbounded wait handed to
-        `run_in_executor()` occupies a real OS thread that keeps running
-        even after the awaiting asyncio Task is cancelled (a blocking
-        `threading.Event.wait()` cannot be interrupted), which can hang
-        the executor's own shutdown/join indefinitely if the event is
-        never set (e.g. this is called against a screen whose shutdown
-        was already "clean" with no attempt actually started/signalled).
-        Bounding each individual wait means a cancellation is observed
-        between polls, within one bound, instead of blocking forever.
+        Polling with a short bounded executor wait keeps cancellation prompt:
+        cancelling this coroutine cannot strand an executor thread forever on
+        an unbounded ``threading.Event.wait()``.
         """
         loop = asyncio.get_running_loop()
-        while not self._shutdown_complete_event.is_set():
-            await loop.run_in_executor(None, self._shutdown_complete_event.wait, 0.1)
+        while not attempt.completion.is_set():
+            await loop.run_in_executor(None, attempt.completion.wait, 0.1)
 
-    def _shutdown_worker(self) -> None:
+    def _shutdown_worker(self, attempt: _ShutdownAttempt) -> None:
         try:
             self._do_shutdown()
         finally:
-            # Reset "an attempt is running" before signalling completion,
-            # so that any waiter which wakes on _shutdown_complete_event
-            # and immediately calls action_request_shutdown() again (e.g.
-            # _on_exit_app's retry loop) can actually start a new attempt
-            # rather than seeing a stale _shutdown_in_progress=True.
-            self._shutdown_in_progress = False
-            # Signal that the shutdown *attempt* finished exactly once,
-            # regardless of whether cleanup fully succeeded, raised, or was
-            # interrupted partway: any waiter (await_shutdown_complete(), a
-            # future retry) must never block forever because of an exception
-            # inside cleanup itself. Whether cleanup was *clean* is a
-            # separate signal (self._shutdown_clean / shutdown_clean).
-            self._shutdown_complete_event.set()
+            # Publish worker completion while still holding the lock that
+            # guards current-attempt selection. A retry can only be created
+            # after this generation is no longer considered in flight.
+            with self._shutdown_attempt_lock:
+                if self._shutdown_attempt is attempt:
+                    self._shutdown_attempt = None
+                    self._shutdown_in_progress = False
+                attempt.completion.set()
 
     def _cleanup_resources(
         self, *, outcome: _RunOutcome = _RunOutcome.SUCCEEDED, error: BaseException | None = None
@@ -1300,20 +1292,13 @@ class LoopSupervisorApp(App):
         """
         try:
             while screen in self._owned_run_screens:
-                # Only await completion if shutdown is not already clean.
-                # request_shutdown()/_maybe_start_shutdown_attempt() do
-                # not set _shutdown_complete_event when cleanup already
-                # succeeded (there is no worker to run and signal it) —
-                # awaiting unconditionally here would deadlock on a
-                # screen that reached "already clean" via some path other
-                # than a _shutdown_worker attempt (e.g. cleanup performed
-                # directly by a failed-initialization handler). This
-                # check is the narrow, non-redesigning guard for that
-                # case; the full per-attempt signaling redesign is Step
-                # 5's responsibility, not this one's.
-                if not screen.shutdown_clean:
-                    screen.action_request_shutdown()
-                    await screen.await_shutdown_complete()
+                # Await only the concrete generation returned by this
+                # request. ``None`` explicitly means cleanup was already
+                # confirmed clean, so there is no completion signal to wait
+                # for and no separate shutdown_clean guard is required.
+                attempt = screen.action_request_shutdown()
+                if attempt is not None:
+                    await screen.await_shutdown_complete(attempt)
                 if screen not in self._owned_run_screens:
                     return
                 if screen.ready_to_finalize:

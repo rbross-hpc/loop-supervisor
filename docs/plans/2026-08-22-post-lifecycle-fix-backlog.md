@@ -1227,7 +1227,7 @@ after the fact get written down.
      edits with no actual contract change, which is worse than the
      silent-drift problem it would solve.
 
-36. **TUI startup-failure deadlock (currently unreachable): the single
+36. ~~**TUI startup-failure deadlock (currently unreachable): the single
     reusable `_shutdown_complete_event` could be awaited by a caller
     with no attempt in flight to ever set it, if a future caller
     bypassed the existing guard.** (Tier 3 — reliability; demoted from
@@ -1285,7 +1285,30 @@ after the fact get written down.
     completes without deadlock; `"q"`/"Return to runs" work after clean
     startup-failure cleanup; distinct attempt generations don't
     cross-signal; app exit requested mid-failed-init-cleanup waits
-    correctly and then proceeds.
+    correctly and then proceeds.~~ **Resolved.**
+
+    `RunScreen.action_request_shutdown()` now returns an immutable
+    generation/event handle for the existing in-flight attempt or a newly
+    created attempt, and returns `None` explicitly when cleanup is already
+    confirmed clean. Attempt selection and worker registration are serialized
+    under `_shutdown_attempt_lock`, preserving the no-overlap guarantee. The
+    cleanup coordinator awaits only the returned handle and no longer gates a
+    reusable event wait with a separate `shutdown_clean` read; clean
+    failed-initialization cleanup therefore proceeds directly, while exit
+    requested during in-progress failed-initialization cleanup waits for the
+    exact following worker generation. `q` and Return-to-runs continue through
+    the same request path and safely no-op after cleanup is already clean.
+
+    Regression coverage in `tests/test_tui_app.py` proves consecutive attempt
+    generations have distinct events and cannot cross-signal, and that app exit
+    during blocked failed-initialization cleanup does not proceed until its
+    actual shutdown attempt completes. Both tests were verified against the
+    exact pre-fix source from commit
+    `a048eaded3c75c2649776e77991c0e22dea6489e`: the generation test failed
+    because the old request API returned no handle, and the failed-init/exit
+    test remained blocked until an external timeout because the old reusable
+    event path could not identify the attempt to await. The full pytest suite,
+    Ruff check, Ruff format check, and combined `mypy src tests` gate pass.
 
 37. ~~`_confirm_server_stopped()`'s inter-attempt backoff uses
     `time.sleep()`, which is not interrupt-safe.~~ **Resolved.**
