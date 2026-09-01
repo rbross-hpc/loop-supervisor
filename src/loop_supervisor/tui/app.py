@@ -110,7 +110,6 @@ import asyncio
 import queue
 import threading
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import cast
 
@@ -960,7 +959,31 @@ class RunScreen(Screen):
             # the end of _shutdown_worker), a worker registered against the
             # screen would race its own cancellation. Registering against the
             # app, which outlives the screen, avoids that self-cancellation.
-            app.run_worker(partial(self._shutdown_worker, attempt), exclusive=False, thread=True)
+            registration_resolved = threading.Event()
+            registration_accepted = False
+
+            def registered_worker() -> None:
+                registration_resolved.wait()
+                if registration_accepted:
+                    self._shutdown_worker(attempt)
+
+            try:
+                app.run_worker(registered_worker, exclusive=False, thread=True)
+            except BaseException:
+                # Registration failed before a worker could own this attempt.
+                # Roll publication back while still holding the selection lock
+                # so the next request can create a fresh generation instead of
+                # inheriting a handle that no worker can ever complete. If a
+                # fallible registrar invoked or queued the callable before
+                # raising, the gate makes that callable an inert no-op rather
+                # than an overlapping cleanup worker.
+                self._shutdown_attempt = None
+                self._shutdown_in_progress = False
+                attempt.completion.set()
+                registration_resolved.set()
+                raise
+            registration_accepted = True
+            registration_resolved.set()
             return attempt
 
     async def await_shutdown_complete(self, attempt: _ShutdownAttempt) -> None:

@@ -342,10 +342,14 @@ clean.** Every `RunScreen` cleanup worker has an immutable attempt handle
 existing in-flight handle, starts and returns the next generation, or returns
 `None` when cleanup is already confirmed clean and no attempt remains in flight.
 In-flight selection takes precedence because cleanup may become clean before its
-worker finishes finalization and signals completion. Selection is serialized
-under the screen's attempt lock, which both prevents overlapping cleanup workers
-and ensures a later retry cannot signal an earlier or later generation's waiters.
-The app's coordinator awaits only a returned handle; it never waits on a
+worker finishes finalization and signals completion. Selection and worker
+registration are serialized under the screen's attempt lock, which both prevents
+overlapping cleanup workers and ensures a later retry cannot signal an earlier or
+later generation's waiters. If worker registration raises, the provisional
+attempt is signalled and unpublished under that lock before the exception
+propagates, permitting the next request to start a fresh generation without
+leaving an unsignalled phantom attempt. The app's coordinator awaits only a
+returned handle; it never waits on a
 reusable screen-wide event and needs no separate `shutdown_clean` pre-check to
 avoid waiting when no attempt exists.
 

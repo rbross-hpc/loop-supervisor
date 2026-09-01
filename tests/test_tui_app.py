@@ -728,9 +728,11 @@ async def test_app_exit_during_failed_initialization_cleanup_waits_for_its_attem
 
 
 @pytest.mark.asyncio
-async def test_clean_failed_initialization_all_shutdown_paths_are_noops(tmp_path, monkeypatch):
-    """App exit, q, and Return-to-runs need no synthetic completion event
-    after failed initialization has already cleaned the screen."""
+async def test_already_clean_shutdown_request_return_and_coordinator_are_noops(
+    tmp_path, monkeypatch
+):
+    """Direct request, Return-to-runs handler, and coordinator need no event
+    when presented with an already-clean, initialization-complete screen."""
     app = LoopSupervisorApp(tmp_path)
     async with app.run_test():
         screen = RunScreen(tmp_path, run_id=None)
@@ -1187,6 +1189,58 @@ async def test_shutdown_attempt_generations_do_not_cross_signal(tmp_path, monkey
 
         release[1].set()
         await asyncio.wait_for(second_wait, timeout=2)
+
+
+def test_shutdown_worker_registration_failure_allows_fresh_attempt(tmp_path, monkeypatch):
+    """A failed worker registration must not publish an attempt that can never run."""
+    screen = RunScreen(tmp_path, run_id=None)
+    screen._init_done_event.set()
+    registration_attempts = []
+    first_started = threading.Event()
+
+    class _FailOnceWorkerApp:
+        def run_worker(self, callable_, **_kwargs):
+            registration_attempts.append(callable_)
+            if len(registration_attempts) == 1:
+
+                def _start_first() -> None:
+                    first_started.set()
+                    callable_()
+
+                first = threading.Thread(target=_start_first, daemon=True)
+                first.start()
+                assert first_started.wait(timeout=2)
+                raise RuntimeError("simulated worker registration failure")
+
+        def finalize_run_screen(self, _screen):
+            pass
+
+    shutdown_calls = {"n": 0}
+
+    def _count_shutdown() -> None:
+        shutdown_calls["n"] += 1
+
+    monkeypatch.setattr(screen, "_app_ref", _FailOnceWorkerApp())
+    monkeypatch.setattr(screen, "_do_shutdown", _count_shutdown)
+
+    with pytest.raises(RuntimeError, match="simulated worker registration failure"):
+        screen.action_request_shutdown()
+
+    assert screen._shutdown_attempt is None
+    assert screen._shutdown_in_progress is False
+    assert shutdown_calls["n"] == 0
+
+    retry = screen.action_request_shutdown()
+    assert retry is not None
+    assert retry.generation == 2
+    assert len(registration_attempts) == 2
+
+    registration_attempts[1]()
+
+    assert retry.completion.is_set()
+    assert screen._shutdown_attempt is None
+    assert screen._shutdown_in_progress is False
+    assert shutdown_calls["n"] == 1
 
 
 @pytest.mark.asyncio
