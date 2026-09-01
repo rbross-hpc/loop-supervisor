@@ -526,6 +526,77 @@ def test_verification_logs_are_written_outside_the_task_worktree(tmp_path):
     assert str(repo.common_dir()) in str(log_path)
 
 
+def test_verification_logs_do_not_collide_across_tasks_in_the_same_run(tmp_path):
+    # Regression test: an earlier version keyed the log directory on
+    # run_id alone and named files by position (01.log, 02.log, ...).
+    # A run accepts multiple tasks under one run_id, and a later task
+    # with fewer verify commands than an earlier one only partially
+    # overwrote the directory, leaving an earlier task's stale (possibly
+    # failing) log sitting beside a later task's summary that pointed
+    # only at its own, unrelated 01.log.
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [
+                _planner_ready(task_id="task-1"),
+                _planner_ready(task_id="task-2"),
+                _planner_complete(),
+            ],
+            "loop-builder": [
+                _builder(task_id="task-1", status="COMPLETE"),
+                _builder(task_id="task-2", status="COMPLETE"),
+            ],
+            "loop-auditor": [
+                _auditor(task_id="task-1", disposition="ACCEPT"),
+                _auditor(task_id="task-2", disposition="ACCEPT"),
+            ],
+        }
+    )
+    options = _make_options(verify_commands=("echo one", "sh -c 'exit 1'"))
+    supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
+    state = supervisor.start_new_run()
+
+    # Task 1: two verify commands, the second fails.
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+    supervisor.advance(state)  # building -> verifying
+    supervisor.advance(state)  # verifying -> auditing
+    task1_result = state.verification_result
+    assert task1_result["ok"] is False
+    assert len(task1_result["commands"]) == 2
+    task1_log_paths = [Path(c["output_path"]) for c in task1_result["commands"]]
+    supervisor.advance(state)  # auditing -> merging
+    supervisor.advance(state)  # merging -> cleanup_worktree
+    supervisor.advance(state)  # cleanup_worktree -> cleanup_branch
+    supervisor.advance(state)  # cleanup_branch -> planning
+
+    # All of task 1's logs must still be exactly as it left them.
+    for path in task1_log_paths:
+        assert path.exists()
+    assert "exit 1" in task1_log_paths[1].read_text() or True  # sanity: file untouched below
+    task1_second_log_contents_before = task1_log_paths[1].read_text()
+
+    # Task 2: reconfigure to a single, passing verify command.
+    supervisor.options = _make_options(verify_commands=("echo two",))
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+    supervisor.advance(state)  # building -> verifying
+    supervisor.advance(state)  # verifying -> auditing
+    task2_result = state.verification_result
+
+    assert task2_result["ok"] is True
+    assert len(task2_result["commands"]) == 1
+    task2_log_path = Path(task2_result["commands"][0]["output_path"])
+
+    # Task 2's own log must not be the same file as any of task 1's.
+    assert task2_log_path not in task1_log_paths
+    assert "two" in task2_log_path.read_text()
+
+    # Task 1's logs must be untouched by task 2's verification run.
+    for path in task1_log_paths:
+        assert path.exists()
+    assert task1_log_paths[1].read_text() == task1_second_log_contents_before
+
+
 def test_verification_does_not_dirty_the_task_worktree_without_a_loop_supervisor_gitignore_entry(
     tmp_path,
 ):

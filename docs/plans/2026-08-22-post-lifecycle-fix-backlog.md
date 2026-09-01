@@ -1355,12 +1355,14 @@ after the fact get written down.
     `verifying` phase between `building` and `auditing` (only entered
     when `verify_commands` is non-empty; otherwise `building` routes
     straight to `auditing`, unchanged). Full output is written under
-    git-common-dir (`docs/decisions/0027-verification-logs-live-
-    under-git-common-dir-not-the-worktree.md`; an initial version
-    wrote under the worktree instead and was corrected by that ADR
-    after a post-merge audit), and a compact summary (per-command
-    ok/timeout/exit-code/output-path, truncated stdout+stderr) is
-    persisted to
+    `<git_common_dir>/loop-supervisor/verification/<run_id>/<commit>/`
+    (`docs/decisions/0027-verification-logs-live-under-git-common-
+    dir-not-the-worktree.md`, `docs/decisions/0028-verification-log-
+    directory-is-keyed-by-commit-not-run-id-alone.md`; an initial
+    version wrote under the worktree, then under `<run_id>/` alone --
+    both corrected across two rounds of post-merge audit), and a
+    compact summary (per-command ok/timeout/exit-code/output-path,
+    truncated stdout+stderr) is persisted to
     `RunState.verification_result` and rendered into the auditor's
     prompt alongside the builder's own self-reported `tests_run`/
     `test_results` claims for comparison. A failing verification
@@ -1379,10 +1381,14 @@ after the fact get written down.
     a schema change would have required.
 
 47. **Verification logs accumulate under git-common-dir with no
-    pruning.** Since ADR 0027, `<git_common_dir>/loop-supervisor/
-    verification/<run_id>/` is written once per `verifying` phase
+    pruning.** Since ADR 0027 (directory keyed further by commit in
+    ADR 0028), `<git_common_dir>/loop-supervisor/verification/
+    <run_id>/<commit>/` is written once per `verifying` phase
     execution and never deleted -- not by `cleanup_worktree`, not at
-    task-boundary cleanup, not anywhere. For a project that runs
+    task-boundary cleanup, not anywhere. Every distinct commit
+    verified (including each `REVISE` re-attempt) now gets its own
+    directory rather than reusing one per run, so this grows somewhat
+    faster than originally estimated. For a project that runs
     verification often, this grows unbounded. Parallel to item 43's
     opt-in `opencode.db` pruning discussion (deferred there for the
     same reason: no evidence yet of it mattering in practice, and a
