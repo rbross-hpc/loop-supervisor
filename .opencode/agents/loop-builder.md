@@ -37,6 +37,11 @@ additive only; `monkeypatch.setattr`, not direct attribute
 assignment; and the other rules there) — these are standing
 conventions for this project, not suggestions.
 
+Follow the "Commit messages" section of README.md for your commit:
+a subject line alone is not enough. Cover what changed and why, the
+failing-first verification evidence for any new test, and any known
+limitations or deviations from the task's original scope.
+
 After implementation:
 - write or extend tests covering the task's acceptance criteria
 - run the project's tests

@@ -72,6 +72,25 @@ asking a human when an agent can't proceed on its own.
   Git state (branch, clean working tree, `HEAD`, and that new commits
   actually exist).
 
+## Commit messages
+
+A subject line alone (e.g. `fix: reject symlinked lock and state
+storage`) is not enough — `git log`/`git blame` should be able to
+answer "why was it done this way" without also opening the backlog
+entry written about it afterward. Every commit's body should cover:
+
+- **What changed and why**, in enough detail that the reasoning
+  survives independently of any planning document that motivated it.
+- **The failing-first verification evidence** for any new test: which
+  prior commit it was verified against, what it failed with there, and
+  why that failure is the right one (see "Testing discipline" below).
+- **Any known limitations or deviations** from the task's original
+  scope — do not let these surface for the first time in the diff.
+
+Never amend a commit to fix a mistake found later; make a new,
+corrective commit instead (see this project's own git-workflow
+convention for the reasoning).
+
 ## Sibling task worktrees
 
 Each task gets its own Git worktree, created one directory level above

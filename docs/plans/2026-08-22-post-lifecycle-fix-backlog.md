@@ -1808,6 +1808,68 @@ after the fact get written down.
     provisioning-isolation claim (see item 48's "Setup" section
     addition) was scoped to `run` explicitly once this was found.
 
+53. ~~**Builder commits carry no message body.**~~ **Resolved.** (Tier
+    5 — documentation/testing debt)
+    All 12 builder commits from the overnight run (`5611ee6e8e66`)
+    were subject-line only -- e.g. `fix: reject symlinked lock and
+    state storage` with zero body lines. The rationale for each (why
+    the directory-fd design, what attack it closes, which exact
+    pre-fix commit the new tests were verified against) existed only
+    in the backlog entry written afterward, not in the commit itself,
+    so `git log`/`git blame` on the affected files gives no indication
+    of intent. `loop-builder.md` said only "commit the completed
+    implementation," with no message-quality expectation, and
+    `README.md` documented the convention this project's own human/
+    audit commits already follow (a body covering what changed, why,
+    and the failing-first evidence) nowhere a builder would find it.
+
+    Fixed by adding a "Commit messages" subsection to `README.md`
+    stating the convention explicitly -- subject line plus a body
+    describing what changed and why, the failing-first verification
+    evidence (prior commit, what failed and why), and any known
+    limitations or deviations -- and pointing `loop-builder.md` at it
+    alongside the existing "Follow the Testing discipline section"
+    line. Does not retroactively rewrite the twelve existing commits
+    (never amend; see this project's own git-workflow convention) --
+    only prevents recurrence on the next run.
+
+54. **Supervisor merge commits read `Merge commit '<sha>'`, not `Merge
+    branch '<name>'`.** (Tier 5 — documentation/testing debt,
+    informational; no change proposed)
+    `_do_merging` (`src/loop_supervisor/supervisor.py:1401-1404`)
+    merges `state.merge_task_head` -- an immutable commit SHA captured
+    at ACCEPT time -- rather than the task branch name, deliberately:
+    `merge_pre_head`/`merge_task_head` are persisted immutable intent,
+    so a crash after Git commits the merge but before state saves is
+    safely reconciled rather than re-merged (see that function's own
+    docstring). The unavoidable cosmetic consequence is that every
+    overnight merge commit's subject reads `Merge commit '<full-sha>'`
+    instead of the `Merge branch 'name'` form this project's own
+    hand-merges use, so `git log --oneline` reads differently across
+    the two provenances. Filed only so a future pass does not "fix"
+    this by switching to merging the mutable branch name, which would
+    reintroduce exactly the re-merge-on-crash hazard the current
+    behavior avoids.
+
+55. **`_launcher.py`'s `FAKE_LAUNCHER_*` fault-injection hooks are
+    undocumented as a group.** (Tier 5 — documentation/testing debt)
+    `src/loop_supervisor/_launcher.py` carries four env-gated test
+    seams in shipped production code: `FAKE_LAUNCHER_IDENTITY`,
+    `FAKE_LAUNCHER_TERM_ERROR_ONCE`, `FAKE_LAUNCHER_TERM_BLOCK_FILE`
+    (added by the overnight run's `a6df8db`), and
+    `FAKE_LAUNCHER_KILL_ERROR_ONCE`. Each is individually justified
+    (env-gated, default-off, exercises a real process-boundary fault
+    seam rather than monkeypatching `OpenCodeServer`/`RunSession`
+    directly) and the pattern predates this backlog, but there is no
+    single comment or docstring stating the convention as a whole, so
+    a reader encountering the fourth one has to reconstruct the
+    pattern's safety argument from scratch. Fixed with a module-
+    docstring paragraph in `_launcher.py` naming the convention (env-
+    gated fault injection, inert unless a test explicitly sets the
+    variable, used only where a real process-boundary fault cannot be
+    exercised by monkeypatching the calling code) rather than a
+    behavior change.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in
