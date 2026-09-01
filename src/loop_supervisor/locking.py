@@ -27,7 +27,6 @@ import os
 import re
 import socket
 import stat
-import tempfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -81,8 +80,48 @@ def _guard_path(git_common_dir: Path) -> Path:
     return git_common_dir / "loop-supervisor" / "supervisor.lock.guard"
 
 
+def _required_open_flag(name: str) -> int:
+    """Return a required secure-open flag, or fail closed if unavailable."""
+    value = getattr(os, name, None)
+    if not isinstance(value, int):
+        raise LockError(f"secure lock storage requires os.{name}; this platform is unsupported")
+    return value
+
+
+def _open_lock_directory(git_common_dir: Path) -> int:
+    """Open the lock storage directory without following its leaf.
+
+    All subsequent lock and guard operations are relative to this descriptor,
+    so replacing or redirecting the pathname cannot move an in-progress
+    critical section outside Git metadata.
+    """
+    directory_flag = _required_open_flag("O_DIRECTORY")
+    nofollow_flag = _required_open_flag("O_NOFOLLOW")
+    directory = git_common_dir / "loop-supervisor"
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise LockError(f"cannot use lock directory {directory}: {exc}") from exc
+    flags = os.O_RDONLY | directory_flag | nofollow_flag
+    try:
+        fd = os.open(directory, flags)
+    except OSError as exc:
+        raise LockError(
+            f"cannot use lock directory {directory}; refusing symbolic link or unsafe path: {exc}"
+        ) from exc
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise LockError(f"lock directory {directory} is not a directory")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 @contextlib.contextmanager
-def _guarded(git_common_dir: Path) -> Iterator[None]:
+def _guarded(git_common_dir: Path) -> Iterator[int]:
     """Serialize lock create/recover/release critical sections.
 
     Uses a persistent mode-0600 guard file with an exclusive ``flock(2)``
@@ -98,20 +137,25 @@ def _guarded(git_common_dir: Path) -> Iterator[None]:
     this process's synchronization primitive.
     """
     guard_path = _guard_path(git_common_dir)
-    guard_path.parent.mkdir(parents=True, exist_ok=True)
+    directory_fd = _open_lock_directory(git_common_dir)
     try:
-        fd = _open_no_follow(guard_path, os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError as exc:
-        raise LockError(f"cannot open lock guard file {guard_path}: {exc}") from exc
-    try:
-        os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
         try:
-            yield
+            fd = _open_no_follow(
+                Path(guard_path.name), os.O_CREAT | os.O_RDWR, 0o600, dir_fd=directory_fd
+            )
+        except OSError as exc:
+            raise LockError(f"cannot open lock guard file {guard_path}: {exc}") from exc
+        try:
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield directory_fd
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(directory_fd)
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -125,15 +169,16 @@ def _pid_is_alive(pid: int) -> bool:
         return True
 
 
-def _open_no_follow(path: Path, flags: int, mode: int = 0o600) -> int:
-    """Open a path with symlink-following refused where the platform
-    supports O_NOFOLLOW, and verify the resulting descriptor refers to a
-    regular file. Used for both the guard file and the lock file itself:
+def _open_no_follow(path: Path, flags: int, mode: int = 0o600, *, dir_fd: int | None = None) -> int:
+    """Open a path with mandatory symlink-following refusal and verify the
+    resulting descriptor refers to a regular file. Platforms without
+    ``O_NOFOLLOW`` are rejected rather than silently weakening this contract.
+    Used for both the guard file and the lock file itself:
     neither acquisition, inspection, nor release must ever be tricked into
     operating on an arbitrary attacker-controlled target reached via a
     symlink placed at the expected path."""
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(str(path), flags | nofollow, mode)
+    nofollow = _required_open_flag("O_NOFOLLOW")
+    fd = os.open(str(path), flags | nofollow, mode, dir_fd=dir_fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -212,7 +257,7 @@ def _validate_lock_record(data: Any) -> dict[str, Any]:
     return data
 
 
-def _read_lock(path: Path) -> dict[str, Any]:
+def _read_lock(path: Path, *, directory_fd: int | None = None) -> dict[str, Any]:
     """Read, parse, and strictly validate the lock file.
 
     Raises MalformedLockError on any problem: missing/unknown fields,
@@ -223,7 +268,11 @@ def _read_lock(path: Path) -> dict[str, Any]:
     like invalid JSON or a non-object body already did.
     """
     try:
-        fd = _open_no_follow(path, os.O_RDONLY)
+        fd = _open_no_follow(
+            Path(path.name) if directory_fd is not None else path,
+            os.O_RDONLY,
+            dir_fd=directory_fd,
+        )
     except FileNotFoundError:
         raise
     except OSError as exc:
@@ -243,20 +292,36 @@ def _read_lock(path: Path) -> dict[str, Any]:
     return _validate_lock_record(data)
 
 
-def _write_lock_file(path: Path, record: dict[str, Any]) -> None:
+def _write_lock_file(path: Path, record: dict[str, Any], *, directory_fd: int) -> None:
     """Atomically write the lock record, enforcing mode 0600."""
-    parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(parent), prefix=".tmp-lock-", suffix=".json")
+    tmp_name = f".tmp-lock-{uuid.uuid4().hex}.json"
+    fd = _open_no_follow(
+        Path(tmp_name), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=directory_fd
+    )
+    fd_owned = True
     try:
-        with os.fdopen(fd, "w") as handle:
+        os.fchmod(fd, 0o600)
+        handle = os.fdopen(fd, "w")
+        fd_owned = False
+        with handle:
             json.dump(record, handle, indent=2)
             handle.write("\n")
-        os.chmod(tmp_name, 0o600)
-        os.link(tmp_name, str(path))
+        os.link(
+            tmp_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
     finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+        try:
+            if fd_owned:
+                os.close(fd)
+        finally:
+            try:
+                os.unlink(tmp_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
 
 
 class SupervisorLock:
@@ -340,23 +405,30 @@ class SupervisorLock:
             self._token = None
             raise LockError(f"refusing to acquire lock with invalid metadata: {exc}") from exc
 
-        with _guarded(self._path.parent.parent):
-            while True:
-                try:
-                    _write_lock_file(self._path, record)
-                    self._token = token
-                    return
-                except FileExistsError:
-                    pass
+        try:
+            with _guarded(self._path.parent.parent) as directory_fd:
+                while True:
+                    try:
+                        _write_lock_file(self._path, record, directory_fd=directory_fd)
+                        self._token = token
+                        return
+                    except FileExistsError:
+                        pass
 
-                existing = self._inspect_existing_lock()
-                if existing is None:
-                    continue
+                    existing = self._inspect_existing_lock(directory_fd=directory_fd)
+                    if existing is None:
+                        continue
 
-                self._token = None
-                raise existing
+                    self._token = None
+                    raise existing
+        except LockError:
+            self._token = None
+            raise
+        except OSError as exc:
+            self._token = None
+            raise LockError(f"cannot acquire lock {self._path}: {exc}") from exc
 
-    def _inspect_existing_lock(self) -> LockError | None:
+    def _inspect_existing_lock(self, *, directory_fd: int) -> LockError | None:
         """Inspect the existing lock and decide what to do.
 
         Returns None if the lock disappeared (retry), or a LockError
@@ -373,11 +445,13 @@ class SupervisorLock:
         it falls through to _read_lock below, whose _open_no_follow
         raises OSError("too many levels of symbolic links"), which is
         already wrapped as a MalformedLockError."""
-        if not os.path.lexists(self._path):
+        try:
+            os.stat(self._path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
             return None
 
         try:
-            data = _read_lock(self._path)
+            data = _read_lock(self._path, directory_fd=directory_fd)
         except MalformedLockError as exc:
             return MalformedLockError(
                 f"lock file at {self._path} is malformed and cannot be auto-recovered: {exc}"
@@ -414,14 +488,14 @@ class SupervisorLock:
             )
 
         try:
-            current_data = _read_lock(self._path)
+            current_data = _read_lock(self._path, directory_fd=directory_fd)
             if current_data.get("token") != holder_token:
                 return None
         except MalformedLockError:
             return None
 
         try:
-            os.unlink(str(self._path))
+            os.unlink(self._path.name, dir_fd=directory_fd)
         except FileNotFoundError:
             pass
 
@@ -454,17 +528,19 @@ class SupervisorLock:
         token = self._token
 
         try:
-            with _guarded(self._path.parent.parent):
+            with _guarded(self._path.parent.parent) as directory_fd:
                 # lexists, not exists: see _inspect_existing_lock's
                 # docstring. A dangling symlink at the lock path is not
                 # "already gone" and must not make this instance silently
                 # discard its ownership token.
-                if not os.path.lexists(self._path):
+                try:
+                    os.stat(self._path.name, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
                     self._token = None
                     return
 
                 try:
-                    data = _read_lock(self._path)
+                    data = _read_lock(self._path, directory_fd=directory_fd)
                 except MalformedLockError as exc:
                     raise LockError(
                         f"cannot verify ownership of {self._path} before release: "
@@ -482,7 +558,7 @@ class SupervisorLock:
                     return
 
                 try:
-                    os.unlink(str(self._path))
+                    os.unlink(self._path.name, dir_fd=directory_fd)
                 except FileNotFoundError:
                     pass
                 except OSError as exc:

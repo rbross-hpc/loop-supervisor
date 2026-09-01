@@ -1,8 +1,10 @@
 import json
+import os
 from typing import Any
 
 import pytest
 
+import loop_supervisor.state as state_mod
 from loop_supervisor.state import (
     STATE_SCHEMA_VERSION,
     DecisionRequest,
@@ -71,6 +73,18 @@ def test_save_sets_permissions(tmp_path):
     path = state_path(tmp_path, state.run_id)
     mode = path.stat().st_mode & 0o777
     assert mode == 0o600
+
+
+def test_save_sets_permissions_under_restrictive_umask(tmp_path):
+    state = _make_state(new_run_id())
+    (tmp_path / "loop-supervisor" / "runs").mkdir(parents=True, mode=0o700)
+    previous_umask = os.umask(0o777)
+    try:
+        save_state(tmp_path, state)
+    finally:
+        os.umask(previous_umask)
+
+    assert state_path(tmp_path, state.run_id).stat().st_mode & 0o777 == 0o600
 
 
 def test_load_missing_run_raises(tmp_path):
@@ -428,6 +442,170 @@ def test_list_runs_skips_unsafe_filenames(tmp_path):
     (runs_dir / ".hidden.json").write_text("{}")
     result = list_runs(tmp_path)
     assert result == [state.run_id]
+
+
+# -- state storage symlink safety ---------------------------------------------
+
+
+@pytest.mark.parametrize("capability", ["O_NOFOLLOW", "O_DIRECTORY"])
+def test_state_storage_fails_closed_without_required_open_capability(
+    tmp_path, monkeypatch, capability
+):
+    monkeypatch.delattr(state_mod.os, capability)
+    state = _make_state("unsupported-platform")
+
+    with pytest.raises(StateError, match=rf"requires os\.{capability}"):
+        save_state(tmp_path, state)
+    with pytest.raises(StateError, match=rf"requires os\.{capability}"):
+        load_state(tmp_path, state.run_id)
+
+    assert not (tmp_path / "loop-supervisor").exists()
+
+
+def test_missing_no_follow_capability_cannot_read_or_modify_symlink_target(tmp_path, monkeypatch):
+    outside = tmp_path.parent / "outside-unsupported-state"
+    outside.mkdir()
+    outside_runs = outside / "runs"
+    outside_runs.mkdir()
+    run_id = "unsupported-symlink"
+    target = outside_runs / f"{run_id}.json"
+    target.write_text("outside secret\n")
+    storage = tmp_path / "loop-supervisor"
+    storage.symlink_to(outside, target_is_directory=True)
+    monkeypatch.delattr(state_mod.os, "O_NOFOLLOW")
+
+    with pytest.raises(StateError, match=r"requires os\.O_NOFOLLOW"):
+        save_state(tmp_path, _make_state(run_id))
+    with pytest.raises(StateError, match=r"requires os\.O_NOFOLLOW"):
+        load_state(tmp_path, run_id)
+
+    assert storage.is_symlink()
+    assert target.read_text() == "outside secret\n"
+    assert sorted(path.name for path in outside_runs.iterdir()) == [target.name]
+
+
+@pytest.mark.parametrize("failure_stage", ["fchmod", "fdopen"])
+def test_save_closes_temporary_fd_on_setup_failure(tmp_path, monkeypatch, failure_stage):
+    original_open = os.open
+    original_close = os.close
+    original_fchmod = os.fchmod
+    original_fdopen = os.fdopen
+    temporary_fd: list[int] = []
+    close_count = 0
+
+    def _recording_open(path, *args, **kwargs):
+        fd = original_open(path, *args, **kwargs)
+        if str(path).startswith(".tmp-"):
+            temporary_fd.append(fd)
+        return fd
+
+    def _fchmod(fd, mode):
+        if failure_stage == "fchmod" and temporary_fd == [fd]:
+            raise OSError("simulated state temporary fchmod failure")
+        return original_fchmod(fd, mode)
+
+    def _fdopen(fd, *args, **kwargs):
+        if failure_stage == "fdopen" and temporary_fd == [fd]:
+            raise OSError("simulated state temporary fdopen failure")
+        return original_fdopen(fd, *args, **kwargs)
+
+    def _recording_close(fd):
+        nonlocal close_count
+        if temporary_fd == [fd]:
+            close_count += 1
+        return original_close(fd)
+
+    monkeypatch.setattr(state_mod.os, "open", _recording_open)
+    monkeypatch.setattr(state_mod.os, "fchmod", _fchmod)
+    monkeypatch.setattr(state_mod.os, "fdopen", _fdopen)
+    monkeypatch.setattr(state_mod.os, "close", _recording_close)
+    state = _make_state("temporary-setup-failure")
+
+    with pytest.raises(StateError, match="could not be saved") as caught:
+        save_state(tmp_path, state)
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert len(temporary_fd) == 1
+    assert close_count == 1
+    assert not state_path(tmp_path, state.run_id).exists()
+    assert not list((tmp_path / "loop-supervisor" / "runs").glob(".tmp-*"))
+
+
+@pytest.mark.parametrize("component", ["loop-supervisor", "runs"])
+def test_save_rejects_symlinked_state_directory_and_leaves_target_untouched(tmp_path, component):
+    outside = tmp_path.parent / f"outside-save-{component}"
+    outside.mkdir()
+    marker = outside / "marker.txt"
+    marker.write_text("outside\n")
+
+    if component == "loop-supervisor":
+        (tmp_path / "loop-supervisor").symlink_to(outside, target_is_directory=True)
+    else:
+        parent = tmp_path / "loop-supervisor"
+        parent.mkdir()
+        (parent / "runs").symlink_to(outside, target_is_directory=True)
+
+    state = _make_state("symlink-save")
+    with pytest.raises(StateError, match="symbolic link"):
+        save_state(tmp_path, state)
+
+    assert marker.read_text() == "outside\n"
+    assert sorted(path.name for path in outside.iterdir()) == ["marker.txt"]
+
+
+@pytest.mark.parametrize("component", ["loop-supervisor", "runs"])
+def test_load_rejects_symlinked_state_directory_without_reading_target(tmp_path, component):
+    outside = tmp_path.parent / f"outside-load-{component}"
+    outside.mkdir()
+    run_id = "symlink-load"
+    target_parent = outside / "runs" if component == "loop-supervisor" else outside
+    target_parent.mkdir(exist_ok=True)
+    target = target_parent / f"{run_id}.json"
+    target.write_text("outside secret that is not JSON")
+
+    if component == "loop-supervisor":
+        (tmp_path / "loop-supervisor").symlink_to(outside, target_is_directory=True)
+    else:
+        parent = tmp_path / "loop-supervisor"
+        parent.mkdir()
+        (parent / "runs").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(StateError, match="symbolic link"):
+        load_state(tmp_path, run_id)
+
+    assert target.read_text() == "outside secret that is not JSON"
+
+
+def test_save_rejects_state_file_symlink_and_leaves_target_untouched(tmp_path):
+    run_id = "symlink-save-leaf"
+    runs = tmp_path / "loop-supervisor" / "runs"
+    runs.mkdir(parents=True)
+    outside = tmp_path.parent / "outside-save-state.json"
+    outside.write_text("outside state\n")
+    target = runs / f"{run_id}.json"
+    target.symlink_to(outside)
+
+    with pytest.raises(StateError, match="symbolic link"):
+        save_state(tmp_path, _make_state(run_id))
+
+    assert target.is_symlink()
+    assert outside.read_text() == "outside state\n"
+
+
+def test_load_rejects_state_file_symlink_without_reading_target(tmp_path):
+    run_id = "symlink-load-leaf"
+    runs = tmp_path / "loop-supervisor" / "runs"
+    runs.mkdir(parents=True)
+    outside = tmp_path.parent / "outside-load-state.json"
+    outside.write_text("outside secret that is not JSON")
+    target = runs / f"{run_id}.json"
+    target.symlink_to(outside)
+
+    with pytest.raises(StateError, match="symbolic link"):
+        load_state(tmp_path, run_id)
+
+    assert target.is_symlink()
+    assert outside.read_text() == "outside secret that is not JSON"
 
 
 # -- strict phase / error-record validation ----------------------------------

@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+import loop_supervisor.locking as locking_mod
 from loop_supervisor.locking import (
     LockError,
     MalformedLockError,
@@ -54,6 +55,18 @@ def test_lock_file_mode_is_0600(tmp_path):
         mode = oct(_lock_path(tmp_path).stat().st_mode)[-3:]
         assert mode == "600"
     finally:
+        lock.release()
+
+
+def test_lock_file_mode_is_0600_under_restrictive_umask(tmp_path):
+    (tmp_path / "loop-supervisor").mkdir(mode=0o700)
+    previous_umask = os.umask(0o777)
+    lock = _make_lock(tmp_path)
+    try:
+        lock.acquire()
+        assert _lock_path(tmp_path).stat().st_mode & 0o777 == 0o600
+    finally:
+        os.umask(previous_umask)
         lock.release()
 
 
@@ -617,6 +630,218 @@ def test_dangling_lock_symlink_at_release_time_is_not_treated_as_absent(tmp_path
     assert lock_path.is_symlink()
 
 
+@pytest.mark.parametrize("capability", ["O_NOFOLLOW", "O_DIRECTORY"])
+def test_acquire_fails_closed_without_required_open_capability(tmp_path, monkeypatch, capability):
+    monkeypatch.delattr(locking_mod.os, capability)
+
+    with pytest.raises(LockError, match=rf"requires os\.{capability}"):
+        _make_lock(tmp_path).acquire()
+
+    assert not (tmp_path / "loop-supervisor").exists()
+
+
+def test_missing_no_follow_capability_cannot_modify_symlink_target(tmp_path, monkeypatch):
+    outside = tmp_path.parent / "outside-unsupported-lock"
+    outside.mkdir()
+    outside_guard = outside / "supervisor.lock.guard"
+    outside_guard.write_text("outside guard\n")
+    outside_guard.chmod(0o644)
+    storage = tmp_path / "loop-supervisor"
+    storage.symlink_to(outside, target_is_directory=True)
+    monkeypatch.delattr(locking_mod.os, "O_NOFOLLOW")
+
+    with pytest.raises(LockError, match=r"requires os\.O_NOFOLLOW"):
+        _make_lock(tmp_path).acquire()
+
+    assert storage.is_symlink()
+    assert outside_guard.read_text() == "outside guard\n"
+    assert outside_guard.stat().st_mode & 0o777 == 0o644
+    assert not (outside / "supervisor.lock").exists()
+
+
+def test_acquire_normalizes_lock_directory_creation_failure(tmp_path, monkeypatch):
+    original_mkdir = os.mkdir
+
+    def _fail_lock_directory(path, *args, **kwargs):
+        if Path(path) == tmp_path / "loop-supervisor":
+            raise PermissionError("simulated lock directory denial")
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(locking_mod.os, "mkdir", _fail_lock_directory)
+    lock = _make_lock(tmp_path)
+
+    with pytest.raises(LockError, match="cannot use lock directory") as caught:
+        lock.acquire()
+
+    assert isinstance(caught.value.__cause__, PermissionError)
+    assert lock._token is None
+
+
+@pytest.mark.parametrize("failure_stage", ["fchmod", "fdopen"])
+def test_acquire_closes_temporary_fd_and_normalizes_setup_failure(
+    tmp_path, monkeypatch, failure_stage
+):
+    original_open = os.open
+    original_close = os.close
+    original_fchmod = os.fchmod
+    original_fdopen = os.fdopen
+    temporary_fd: list[int] = []
+    close_count = 0
+
+    def _recording_open(path, *args, **kwargs):
+        fd = original_open(path, *args, **kwargs)
+        if str(path).startswith(".tmp-lock-"):
+            temporary_fd.append(fd)
+        return fd
+
+    def _fchmod(fd, mode):
+        if failure_stage == "fchmod" and temporary_fd == [fd]:
+            raise OSError("simulated lock temporary fchmod failure")
+        return original_fchmod(fd, mode)
+
+    def _fdopen(fd, *args, **kwargs):
+        if failure_stage == "fdopen" and temporary_fd == [fd]:
+            raise OSError("simulated lock temporary fdopen failure")
+        return original_fdopen(fd, *args, **kwargs)
+
+    def _recording_close(fd):
+        nonlocal close_count
+        if temporary_fd == [fd]:
+            close_count += 1
+        return original_close(fd)
+
+    monkeypatch.setattr(locking_mod.os, "open", _recording_open)
+    monkeypatch.setattr(locking_mod.os, "fchmod", _fchmod)
+    monkeypatch.setattr(locking_mod.os, "fdopen", _fdopen)
+    monkeypatch.setattr(locking_mod.os, "close", _recording_close)
+    lock = _make_lock(tmp_path)
+
+    with pytest.raises(LockError, match="cannot acquire lock") as caught:
+        lock.acquire()
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert len(temporary_fd) == 1
+    assert close_count == 1
+    assert lock._token is None
+    assert not _lock_path(tmp_path).exists()
+    assert not list((tmp_path / "loop-supervisor").glob(".tmp-lock-*"))
+
+    monkeypatch.setattr(locking_mod.os, "fchmod", original_fchmod)
+    monkeypatch.setattr(locking_mod.os, "fdopen", original_fdopen)
+    lock.acquire()
+    lock.release()
+    assert lock._token is None
+
+
+@pytest.mark.parametrize("failure_stage", ["write", "link"])
+def test_acquire_normalizes_lock_temporary_publication_failure(
+    tmp_path, monkeypatch, failure_stage
+):
+    if failure_stage == "write":
+
+        def _fail_write(*args, **kwargs):
+            raise OSError("simulated lock temporary write failure")
+
+        monkeypatch.setattr(locking_mod.json, "dump", _fail_write)
+    else:
+
+        def _fail_link(*args, **kwargs):
+            raise OSError("simulated lock temporary link failure")
+
+        monkeypatch.setattr(locking_mod.os, "link", _fail_link)
+
+    lock = _make_lock(tmp_path)
+    with pytest.raises(LockError, match="cannot acquire lock") as caught:
+        lock.acquire()
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert lock._token is None
+    assert not _lock_path(tmp_path).exists()
+    assert not list((tmp_path / "loop-supervisor").glob(".tmp-lock-*"))
+
+
+def test_acquire_rejects_symlinked_lock_directory_without_touching_target(tmp_path):
+    outside = tmp_path.parent / "outside-lock-acquire"
+    outside.mkdir()
+    outside_guard = outside / "supervisor.lock.guard"
+    outside_guard.write_text("outside guard\n")
+    outside_guard.chmod(0o644)
+
+    storage = tmp_path / "loop-supervisor"
+    storage.symlink_to(outside, target_is_directory=True)
+
+    lock = _make_lock(tmp_path)
+    with pytest.raises(LockError, match="symbolic link"):
+        lock.acquire()
+
+    assert storage.is_symlink()
+    assert outside_guard.read_text() == "outside guard\n"
+    assert outside_guard.stat().st_mode & 0o777 == 0o644
+    assert not (outside / "supervisor.lock").exists()
+
+
+def test_inspection_and_recovery_reject_symlinked_lock_directory_without_touching_target(
+    tmp_path,
+):
+    outside = tmp_path.parent / "outside-lock-recovery"
+    outside.mkdir()
+    dead_pid = _get_dead_pid()
+    outside_lock = outside / "supervisor.lock"
+    outside_lock.write_text(
+        json.dumps(
+            dict(
+                _VALID_RECORD,
+                pid=dead_pid,
+                hostname=socket.gethostname(),
+                token="outside-token",
+                integration_path=str(tmp_path),
+            )
+        )
+    )
+    outside_lock.chmod(0o640)
+    original = outside_lock.read_bytes()
+
+    storage = tmp_path / "loop-supervisor"
+    storage.symlink_to(outside, target_is_directory=True)
+
+    lock = _make_lock(tmp_path, recover_stale=True)
+    with pytest.raises(LockError, match="symbolic link"):
+        lock.acquire()
+
+    assert storage.is_symlink()
+    assert outside_lock.read_bytes() == original
+    assert outside_lock.stat().st_mode & 0o777 == 0o640
+    assert not (outside / "supervisor.lock.guard").exists()
+
+
+def test_release_rejects_symlinked_lock_directory_without_touching_target(tmp_path):
+    lock = _make_lock(tmp_path)
+    lock.acquire()
+    storage = tmp_path / "loop-supervisor"
+    displaced = tmp_path / "real-loop-supervisor"
+    storage.rename(displaced)
+
+    outside = tmp_path.parent / "outside-lock-release"
+    outside.mkdir()
+    outside_guard = outside / "supervisor.lock.guard"
+    outside_guard.write_text("outside guard\n")
+    outside_guard.chmod(0o644)
+    outside_lock = outside / "supervisor.lock"
+    outside_lock.write_text("outside lock\n")
+    outside_lock.chmod(0o640)
+    storage.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(LockError, match="symbolic link"):
+        lock.release()
+
+    assert lock._token is not None
+    assert storage.is_symlink()
+    assert outside_guard.read_text() == "outside guard\n"
+    assert outside_guard.stat().st_mode & 0o777 == 0o644
+    assert outside_lock.read_text() == "outside lock\n"
+    assert outside_lock.stat().st_mode & 0o777 == 0o640
+
+
 # -- retryable release --------------------------------------------------------
 
 
@@ -656,11 +881,11 @@ def test_release_retries_after_transient_read_failure(tmp_path, monkeypatch):
     original_read_lock = locking_mod._read_lock
     call_count = [0]
 
-    def _flaky_read_lock(path):
+    def _flaky_read_lock(path, *, directory_fd=None):
         call_count[0] += 1
         if call_count[0] == 1:
             raise MalformedLockError("simulated transient read failure")
-        return original_read_lock(path)
+        return original_read_lock(path, directory_fd=directory_fd)
 
     monkeypatch.setattr(locking_mod, "_read_lock", _flaky_read_lock)
 

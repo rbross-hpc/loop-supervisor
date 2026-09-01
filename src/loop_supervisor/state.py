@@ -6,11 +6,12 @@ while remaining local to the clone and shared across linked worktrees.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
 import re
-import tempfile
+import stat
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
@@ -619,26 +620,108 @@ def state_path(git_common_dir: Path, run_id: str) -> Path:
     return state_dir(git_common_dir) / f"{validated}.json"
 
 
+def _required_open_flag(name: str) -> int:
+    """Return a required secure-open flag, or fail closed if unavailable."""
+    value = getattr(os, name, None)
+    if not isinstance(value, int):
+        raise StateError(f"secure state storage requires os.{name}; this platform is unsupported")
+    return value
+
+
+@contextlib.contextmanager
+def _open_state_directory(git_common_dir: Path, *, create: bool):
+    """Yield the runs directory descriptor without following storage symlinks."""
+    directory_flag = _required_open_flag("O_DIRECTORY")
+    nofollow_flag = _required_open_flag("O_NOFOLLOW")
+    supervisor = git_common_dir / "loop-supervisor"
+    runs = supervisor / "runs"
+    try:
+        if create:
+            try:
+                os.mkdir(supervisor, 0o700)
+            except FileExistsError:
+                pass
+        supervisor_fd = os.open(
+            supervisor,
+            os.O_RDONLY | directory_flag | nofollow_flag,
+        )
+    except OSError as exc:
+        raise StateError(
+            f"cannot use state directory {supervisor}; refusing symbolic link or unsafe path: {exc}"
+        ) from exc
+    try:
+        try:
+            if create:
+                try:
+                    os.mkdir("runs", 0o700, dir_fd=supervisor_fd)
+                except FileExistsError:
+                    pass
+            runs_fd = os.open(
+                "runs",
+                os.O_RDONLY | directory_flag | nofollow_flag,
+                dir_fd=supervisor_fd,
+            )
+        except OSError as exc:
+            raise StateError(
+                f"cannot use state directory {runs}; refusing symbolic link or unsafe path: {exc}"
+            ) from exc
+        try:
+            if not stat.S_ISDIR(os.fstat(runs_fd).st_mode):
+                raise StateError(f"state directory {runs} is not a directory")
+            yield runs_fd
+        finally:
+            os.close(runs_fd)
+    finally:
+        os.close(supervisor_fd)
+
+
+def _reject_state_symlink(directory_fd: int, name: str, path: Path) -> None:
+    try:
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(metadata.st_mode):
+        raise StateError(f"state file {path} is a symbolic link; refusing to use it")
+
+
 def save_state(git_common_dir: Path, state: RunState) -> None:
     state.updated_at = _now()
-    directory = state_dir(git_common_dir)
-    directory.mkdir(parents=True, exist_ok=True)
     # Validates state.run_id, so a state object whose run_id was tampered
     # with after construction (or a caller-crafted RunState) can never be
     # saved outside the runs directory or under an unsafe filename.
     target = state_path(git_common_dir, state.run_id)
-
-    fd, tmp_name = tempfile.mkstemp(dir=str(directory), prefix=".tmp-", suffix=".json")
+    tmp_name = f".tmp-{uuid.uuid4().hex}.json"
     try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(state.to_dict(), handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, target)
-    except BaseException:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+        with _open_state_directory(git_common_dir, create=True) as directory_fd:
+            _reject_state_symlink(directory_fd, target.name, target)
+            fd = os.open(
+                tmp_name,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | _required_open_flag("O_NOFOLLOW"),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            fd_owned = True
+            try:
+                os.fchmod(fd, 0o600)
+                handle = os.fdopen(fd, "w")
+                fd_owned = False
+                with handle:
+                    json.dump(state.to_dict(), handle, indent=2, sort_keys=True)
+                    handle.write("\n")
+                os.replace(tmp_name, target.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+                raise
+            finally:
+                if fd_owned:
+                    os.close(fd)
+    except StateError:
         raise
+    except OSError as exc:
+        raise StateError(f"state file for run {state.run_id!r} could not be saved: {exc}") from exc
 
 
 def load_state(git_common_dir: Path, run_id: str) -> RunState:
@@ -653,13 +736,23 @@ def load_state(git_common_dir: Path, run_id: str) -> RunState:
     """
     validated_id = validate_run_id(run_id)
     path = state_path(git_common_dir, validated_id)
-    if not path.exists():
-        raise StateError(f"no saved state for run {validated_id!r} at {path}")
     try:
-        with path.open() as handle:
-            data = json.load(handle)
+        with _open_state_directory(git_common_dir, create=False) as directory_fd:
+            _reject_state_symlink(directory_fd, path.name, path)
+            try:
+                fd = os.open(
+                    path.name,
+                    os.O_RDONLY | _required_open_flag("O_NOFOLLOW"),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                raise StateError(f"no saved state for run {validated_id!r} at {path}") from None
+            with os.fdopen(fd) as handle:
+                data = json.load(handle)
     except json.JSONDecodeError as exc:
         raise StateError(f"state file for run {validated_id!r} is not valid JSON: {exc}") from exc
+    except StateError:
+        raise
     except OSError as exc:
         raise StateError(f"state file for run {validated_id!r} could not be read: {exc}") from exc
     if not isinstance(data, dict):
