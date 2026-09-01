@@ -820,6 +820,70 @@ def test_run_agent_session_creation_consumes_invocation_budget(tmp_path):
             server.run_agent(agent="loop-planner", directory=tmp_path, prompt="go", timeout=0.8)
 
 
+def test_run_agent_absolute_deadline_interrupts_trickling_session_creation(tmp_path):
+    completion_marker = tmp_path / "session-complete"
+    config = _argv_config(
+        FAKE_OPENCODE_MODE="normal",
+        FAKE_OPENCODE_SESSION_TRICKLE_INTERVAL="0.05",
+        FAKE_OPENCODE_SESSION_COMPLETION_MARKER=str(completion_marker),
+    )
+    with _FakeServer(tmp_path, config) as server:
+        with pytest.raises(PhaseTimeoutError, match="creating session.*absolute deadline"):
+            server.run_agent(agent="loop-planner", directory=tmp_path, prompt="go", timeout=0.2)
+        assert not completion_marker.exists()
+        assert server.active_invocations() == []
+
+
+def test_run_agent_absolute_deadline_interrupts_trickling_prompt(tmp_path, monkeypatch):
+    completion_marker = tmp_path / "message-complete"
+    aborted: list[str] = []
+    finished_errors: list[BaseException | None] = []
+    close_calls = 0
+    real_close = httpx.Client.close
+
+    def _fail_prompt_close(client):
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 2:
+            raise RuntimeError("simulated prompt client close failure")
+        return real_close(client)
+
+    _patch_close_for_finite_timeout_clients(monkeypatch, _fail_prompt_close)
+
+    class _Observer:
+        def invocation_started(self, invocation) -> None:
+            pass
+
+        def invocation_finished(self, invocation, error) -> None:
+            finished_errors.append(error)
+
+    config = _argv_config(
+        FAKE_OPENCODE_MODE="normal",
+        FAKE_OPENCODE_MESSAGE_TRICKLE_INTERVAL="0.05",
+        FAKE_OPENCODE_MESSAGE_COMPLETION_MARKER=str(completion_marker),
+    )
+    with _FakeServer(tmp_path, config) as server:
+        server.add_observer(_Observer())
+        monkeypatch.setattr(
+            server,
+            "_abort_session_best_effort",
+            lambda session_id: aborted.append(session_id),
+        )
+        caught: PhaseTimeoutError | None = None
+        try:
+            server.run_agent(agent="loop-planner", directory=tmp_path, prompt="go", timeout=0.2)
+        except PhaseTimeoutError as exc:
+            assert "absolute deadline" in str(exc)
+            caught = exc
+
+        assert caught is not None
+        assert not completion_marker.exists()
+        assert aborted == ["ses_fake123"]
+        assert finished_errors == [caught]
+        assert any("simulated prompt client close failure" in note for note in caught.__notes__)
+        assert server.active_invocations() == []
+
+
 # -- malformed JSON classification -------------------------------------------
 
 

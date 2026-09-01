@@ -423,13 +423,22 @@ after the fact get written down.
 
 ## Tier 3 — reliability
 
-11. **`httpx` inactivity timeouts are not absolute wall-clock
-    deadlines.**
-    A trickling response (bytes arriving just often enough to reset the
-    read-inactivity timer) could exceed `role_timeout` in wall-clock time
-    without httpx ever raising `TimeoutException`. Needs an explicit
-    monotonic deadline check independent of httpx's own timeout
-    semantics.
+11. ~~**`httpx` inactivity timeouts are not absolute wall-clock
+    deadlines.**~~ **Resolved.**
+    `OpenCodeServer.run_agent()` now passes one monotonic deadline through
+    both session creation and prompt processing. Each blocking synchronous
+    request runs on a daemon worker while the caller waits only for the
+    remaining absolute budget, so intermittent response bytes cannot reset
+    the role's wall-clock limit. Deadline expiration is normalized to
+    `PhaseTimeoutError`; prompt expiration retains the existing best-effort
+    abort, active-invocation cleanup, observer notification, and primary-error
+    precedence when request-local client cleanup also fails. Regression tests
+    use the fake server to trickle both `/session` and `/message` bodies and
+    assert the call returns before the server can finish either response;
+    they were verified failing against pre-fix commit `ee846a7` with an
+    explicit `_run_with_deadline` absence self-check, then passing after the
+    fix. Full `pytest`, `ruff check .`, `ruff format --check .`, and
+    `mypy src tests` gates pass.
 
 12. ~~Define cleanup/error precedence for startup failures where server
     ownership remains unresolved, beyond what blocker-1/blocker-4 fixes
