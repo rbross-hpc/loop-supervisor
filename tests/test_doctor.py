@@ -163,12 +163,54 @@ def test_check_external_directory_permission_fails_when_only_root_allowed(tmp_pa
     assert result.ok is False
 
 
-def test_check_external_directory_permission_passes_when_parent_allowed(tmp_path):
-    parent = tmp_path.parent
-    config = {"permission": {"external_directory": {"*": "deny", str(parent): "allow"}}}
+def test_check_external_directory_permission_fails_when_only_exact_parent_allowed(tmp_path):
+    parent = str(tmp_path.parent)
+    config = {"permission": {"external_directory": {"*": "deny", parent: "allow"}}}
+    (tmp_path / "opencode.json").write_text(json.dumps(config))
+    result = _check_external_directory_permission(tmp_path)
+    assert result.ok is False
+    assert "descendants" in result.detail
+
+
+def test_check_external_directory_permission_fails_when_only_parent_descendants_allowed(tmp_path):
+    parent = str(tmp_path.parent)
+    config = {"permission": {"external_directory": {"*": "deny", f"{parent}/**": "allow"}}}
+    (tmp_path / "opencode.json").write_text(json.dumps(config))
+    result = _check_external_directory_permission(tmp_path)
+    assert result.ok is False
+    assert "parent itself" in result.detail
+
+
+def test_check_external_directory_permission_passes_when_parent_and_descendants_allowed(tmp_path):
+    parent = str(tmp_path.parent)
+    config = {
+        "permission": {
+            "external_directory": {
+                "*": "deny",
+                parent: "allow",
+                f"{parent}/**": "allow",
+            }
+        }
+    }
     (tmp_path / "opencode.json").write_text(json.dumps(config))
     result = _check_external_directory_permission(tmp_path)
     assert result.ok is True
+
+
+def test_check_external_directory_permission_last_match_wins(tmp_path):
+    parent = str(tmp_path.parent)
+    config = {
+        "permission": {
+            "external_directory": {
+                parent: "allow",
+                f"{parent}/**": "allow",
+                "*": "deny",
+            }
+        }
+    }
+    (tmp_path / "opencode.json").write_text(json.dumps(config))
+    result = _check_external_directory_permission(tmp_path)
+    assert result.ok is False
 
 
 def test_check_external_directory_permission_passes_on_blanket_allow(tmp_path):
@@ -299,8 +341,16 @@ def test_validate_report_ok_false_when_any_check_fails(tmp_path):
 def test_validate_report_ok_true_when_every_check_passes(tmp_path):
     _init_repo(tmp_path)
     (tmp_path / ".env").write_text("ARGO_API_KEY=x\n")
-    parent = tmp_path.parent
-    config = {"permission": {"external_directory": {"*": "deny", str(parent): "allow"}}}
+    parent = str(tmp_path.parent)
+    config = {
+        "permission": {
+            "external_directory": {
+                "*": "deny",
+                parent: "allow",
+                f"{parent}/**": "allow",
+            }
+        }
+    }
     (tmp_path / "opencode.json").write_text(json.dumps(config))
     agents_dir = tmp_path / ".opencode" / "agents"
     agents_dir.mkdir(parents=True)

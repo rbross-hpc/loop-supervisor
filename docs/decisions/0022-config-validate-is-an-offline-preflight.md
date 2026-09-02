@@ -23,8 +23,8 @@ startup.
 presence/version (`git`, the configured `--opencode-executable`),
 Python version, git repository/clean-worktree/attached-HEAD state,
 `opencode.json` parses as JSON, `permission.external_directory` covers
-the sibling task-worktree parent directory, all four agent definition
-files are present, `.env` exists, and which of a known set of
+the sibling task-worktree parent and descendants under it, all four
+agent definition files are present, `.env` exists, and which of a known set of
 provider-related environment variables are set (values are never
 included in the report — only whether each is set).
 

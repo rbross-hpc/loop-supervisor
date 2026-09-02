@@ -1,5 +1,9 @@
 # loop-supervisor
 
+```bash
+pip install "loop-supervisor @ git+https://github.com/rbross-hpc/loop-supervisor.git"
+```
+
 A headless supervisor that drives an [OpenCode](https://opencode.ai) agent
 loop — planner, optional architect, builder, auditor — over Git worktrees,
 so an LLM coding agent can incrementally implement a project one bounded

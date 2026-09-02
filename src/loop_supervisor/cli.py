@@ -43,7 +43,7 @@ _EXPECTED_CLI_ERRORS: tuple[type[Exception], ...] = (
 # dependency. This is this project's own origin, which is also the only
 # fork this tool currently knows how to point a new project at; see ADR
 # 0018. Override with `init --loop-supervisor-git-url`.
-_DEFAULT_LOOP_SUPERVISOR_GIT_URL = "https://github.com/rbross-hpc/loop-tui-experiment.git"
+_DEFAULT_LOOP_SUPERVISOR_GIT_URL = "https://github.com/rbross-hpc/loop-supervisor.git"
 
 _PROJECT_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 

@@ -1965,6 +1965,41 @@ after the fact get written down.
     exercised by monkeypatching the calling code) rather than a
     behavior change.
 
+56. ~~**Exact-parent `external_directory` allows do not cover files
+    inside sibling task worktrees.**~~ **Resolved.** (Tier 1 —
+    correctness/security)
+    After moving this repository to `/workspaces/loop-supervisor`, its
+    tracked `opencode.json` allowed the exact parent directory but an
+    OpenCode tool touching a file below a sibling task worktree still
+    prompted for `external_directory`. OpenCode path patterns match
+    strings and use the last matching rule: `/workspaces/loop-supervisor`
+    does not match `/workspaces/loop-supervisor/<worktree>/file`.
+
+    The same defect existed in `init`'s skeleton template and in
+    `config validate`: generated projects received only the exact parent
+    rule, while the validator incorrectly reported that configuration
+    as sufficient. Fixed by emitting separate exact-parent and `/**`
+    subtree allows after the broad deny, and by making the validator
+    resolve both a parent path and a representative descendant using
+    OpenCode's last-match-wins semantics. Regression tests cover exact-
+    parent-only and subtree-only failures, successful paired rules, and
+    a trailing broad deny overriding earlier allows.
+
+57. **`config validate` reports dotenv-backed credentials as unset.**
+    (Tier 2 — validation/startup)
+    `cmd_run`, `cmd_resume`, and `cmd_tui` call
+    `load_dotenv(project_root / ".env")` before constructing the runtime,
+    but `cmd_config_validate` calls `validate_report` without loading the
+    same file. The preflight therefore reports `ARGO_API_KEY.set = false`
+    even when the required key exists in the `.env` whose presence it
+    separately reports as valid. This does not currently make the
+    aggregate report fail (the environment summary is informational),
+    but it gives the exact opposite answer from the environment a real
+    run will use. Observed while validating item 56 after the repository
+    rename. Fix by loading dotenv with the same non-overriding semantics
+    as the run entry points before collecting the report, with a test
+    proving process-environment values still win over file values.
+
 ## Out of scope for this backlog
 
 Explicitly excluded from this list because they were already fixed in

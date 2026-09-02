@@ -19,6 +19,7 @@ or hand to an LLM without leaking secrets.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import shutil
@@ -157,12 +158,13 @@ def _check_opencode_json(project_root: Path) -> CheckResult:
 
 
 def _check_external_directory_permission(project_root: Path) -> CheckResult:
-    """The supervisor creates task worktrees as siblings one directory
-    above the project root by default, so an agent that reads outside
-    its own worktree (e.g. the auditor reading a sibling task's diff,
-    or reading logs under the project's parent) needs
-    `external_directory` to allow that parent path -- not just the
-    project root itself. See `cli.py`'s `cmd_init_copy` and ADR 0014.
+    """Require access to the task-worktree parent and its descendants.
+
+    OpenCode's permission patterns match path strings and use the last
+    matching rule. Allowing only the exact parent does not allow files
+    inside sibling task worktrees below that parent; both the parent and
+    its ``/**`` subtree therefore need to resolve to ``allow``. See
+    `cli.py`'s `cmd_init_copy` and ADR 0014.
     """
     config_path = project_root / "opencode.json"
     if not config_path.exists():
@@ -195,21 +197,34 @@ def _check_external_directory_permission(project_root: Path) -> CheckResult:
             f"created under {parent}, which will be denied by default",
         )
 
-    matched_allow = any(
-        pattern in (parent, "*") and action == "allow" for pattern, action in external.items()
-    )
-    if matched_allow:
+    def _resolved_action(path: str) -> object | None:
+        action: object | None = None
+        for pattern, candidate in external.items():
+            expanded = os.path.expanduser(os.path.expandvars(pattern))
+            if fnmatch.fnmatchcase(path, expanded):
+                action = candidate
+        return action
+
+    representative_descendant = f"{parent}/loop-supervisor-task-worktree/file"
+    parent_allowed = _resolved_action(parent) == "allow"
+    descendants_allowed = _resolved_action(representative_descendant) == "allow"
+    if parent_allowed and descendants_allowed:
         return CheckResult(
             "external_directory_permission",
             True,
-            f"permission.external_directory allows {parent}",
+            f"permission.external_directory allows {parent} and its descendants",
         )
+
+    missing = []
+    if not parent_allowed:
+        missing.append("the parent itself")
+    if not descendants_allowed:
+        missing.append("its descendants")
     return CheckResult(
         "external_directory_permission",
         False,
-        f"permission.external_directory does not appear to allow {parent} "
-        "(the sibling task-worktree parent directory); agents that read "
-        "outside their own worktree will be denied",
+        f"permission.external_directory does not allow {' or '.join(missing)} under {parent}; "
+        "agents that access sibling task worktrees will be denied",
     )
 
 

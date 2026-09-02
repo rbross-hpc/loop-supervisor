@@ -85,7 +85,9 @@ config and every project the supervisor drives): explicitly set
 `"*": "deny"` is placed before the specific `allow` entries so that,
 under OpenCode's last-match-wins rule evaluation, the already-allowed
 paths remain allowed and only the previously-`ask` fallback becomes a
-`deny`. No other permission key needs an entry: every one of them
+`deny`. Directory permissions require separate entries for an exact
+parent and its `/**` subtree: the exact path does not match files below
+it. No other permission key needs an entry: every one of them
 already defaults to `"allow"`, and a literal blanket `"*"` at the top
 level of `permission` (as opposed to scoped to `external_directory`)
 was considered and rejected, since the four loop agents' own

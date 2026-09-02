@@ -7,7 +7,7 @@ description: Use ONLY when bringing the loop-supervisor planner/architect/builde
 
 ## Purpose
 
-`loop-supervisor` (https://github.com/rbross-hpc/loop-tui-experiment) is
+`loop-supervisor` (https://github.com/rbross-hpc/loop-supervisor) is
 a headless supervisor that drives an OpenCode planner/architect/builder/
 auditor loop over Git worktrees. `loop-supervisor init` is the supported
 way to start a brand-new project, but it requires an **empty**
@@ -39,7 +39,7 @@ human "please install loop-supervisor" if you don't have shell access
 to do so yourself, or run:
 
 ```bash
-pip install "loop-supervisor @ git+https://github.com/rbross-hpc/loop-tui-experiment.git"
+pip install "loop-supervisor @ git+https://github.com/rbross-hpc/loop-supervisor.git"
 ```
 
 Read the JSON report. If `"ok": false`, **stop** and read
@@ -92,8 +92,8 @@ in full before editing anything** — it documents two specific mistakes
 that produce a run that hangs or silently fails with no clear error,
 neither of which is obvious from the file contents alone:
 
-1. `external_directory` must allow the *parent* of the project root,
-   not just the project root itself.
+1. `external_directory` must allow the *parent* of the project root
+   and that parent's `/**` subtree, not just either exact directory.
 2. Config changes must be committed **before** any task worktree is
    created, not after — OpenCode resolves `opencode.json` from each
    invocation's own working directory, which for a task is its own
