@@ -42,8 +42,12 @@ Check the same permission configuration first.
 Something modified the task worktree outside of loop-supervisor's own
 control after it was created — most likely a manual config fix applied
 directly to the worktree (see `config-and-permissions.md`'s second
-gotcha). There is no supported way to reconcile this after the fact;
-avoid needing to by getting config right before starting.
+gotcha), or a process interrupted mid-edit. If the worktree's `HEAD`
+moved (e.g. a manual commit), there is no supported way to reconcile
+this; avoid needing to by getting config right before starting. If
+`HEAD` did not move and the worktree is merely dirty (e.g. a killed
+builder invocation), this is recoverable — see the `use-loop-supervisor`
+skill's `recovering-an-interrupted-run.md`.
 
 **The planner or auditor requests a design decision
 (`decision_required: true`) and the architect responds `NEEDS_INPUT`.**
