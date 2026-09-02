@@ -26,14 +26,14 @@ tells you exactly which is missing — see
 There is no PyPI release yet — install directly from Git:
 
 ```bash
-pip install "loop-supervisor @ git+https://github.com/rbross-hpc/loop-tui-experiment.git"
+pip install "loop-supervisor @ git+https://github.com/rbross-hpc/loop-supervisor.git"
 ```
 
 or with [pipx](https://pipx.pypa.io/) if you want it isolated from any
 particular project's own virtual environment:
 
 ```bash
-pipx install "git+https://github.com/rbross-hpc/loop-tui-experiment.git"
+pipx install "git+https://github.com/rbross-hpc/loop-supervisor.git"
 ```
 
 Confirm it's on `PATH`:
@@ -125,7 +125,7 @@ loop-supervisor config validate --project . --json
 This runs nine independent, offline checks — executables on `PATH`,
 Python version, git repository/clean-worktree state, `opencode.json`
 parses, `external_directory` permission covers the sibling
-task-worktree parent directory, all four agent definitions present,
+task-worktree parent and its descendants, all four agent definitions present,
 `.env` exists — and reports each one by name so you can fix the
 specific thing that's wrong. It does **not** confirm your model
 provider actually responds (see [ADR
@@ -165,8 +165,8 @@ Most early failures are one of:
   check named — don't guess past it. See step 4 above.
 - **A permission denial appears in agent output** (e.g. `denied
   permission request ... ('external_directory')`). The task worktree's
-  own `opencode.json` is stale, or `external_directory` only allows the
-  project root and not its parent. See [ADR
+  own `opencode.json` is stale, or `external_directory` does not allow
+  both the task-worktree parent and its `/**` subtree. See [ADR
   0014](decisions/0014-server-mode-permission-defaults-and-venv-path.md)
   and, if adopting into an existing project,
   `docs/ADOPTING.md`'s linked skill reference on this exact gotcha.

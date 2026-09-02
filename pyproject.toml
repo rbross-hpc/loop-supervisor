@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/rbross-hpc/loop-tui-experiment"
+Repository = "https://github.com/rbross-hpc/loop-supervisor"
 
 [project.scripts]
 loop-supervisor = "loop_supervisor.cli:main"

@@ -31,7 +31,8 @@
   "permission": {
     "external_directory": {
       "*": "deny",
-      "/workspaces/loop-tui-experiment": "allow"
+      "/workspaces/loop-supervisor": "allow",
+      "/workspaces/loop-supervisor/**": "allow"
     },
     "doom_loop": "deny"
   },

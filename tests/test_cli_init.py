@@ -203,20 +203,21 @@ def test_init_rejects_invalid_project_name(tmp_path):
     assert not destination.exists()
 
 
-def test_init_parameterizes_external_directory_to_the_destination_s_parent(tmp_path):
-    """`external_directory` must allow the destination's *parent*, not
-    the destination itself: task worktrees are created as siblings one
-    directory above the project root by default (see README's "Sibling
-    task worktrees"), so that is the path OpenCode actually needs
-    permission to reach."""
+def test_init_parameterizes_external_directory_to_parent_and_descendants(tmp_path):
+    """`external_directory` must allow both the destination's parent
+    itself and descendants beneath it. Task worktrees are siblings one
+    directory above the project root, so allowing only the exact parent
+    does not match paths inside those worktrees."""
     rc, destination = _run_init(tmp_path)
     assert rc == 0
     import json
 
+    parent = str(destination.parent)
     config = json.loads((destination / "opencode.json").read_text())
     assert config["permission"]["external_directory"] == {
         "*": "deny",
-        str(destination.parent): "allow",
+        parent: "allow",
+        f"{parent}/**": "allow",
     }
 
 
@@ -256,6 +257,7 @@ def test_init_architect_model_flag_pins_the_given_model(tmp_path):
 
 
 def test_init_pins_loop_supervisor_dependency_to_default_git_url(tmp_path):
+    assert _DEFAULT_LOOP_SUPERVISOR_GIT_URL == ("https://github.com/rbross-hpc/loop-supervisor.git")
     rc, destination = _run_init(tmp_path)
     assert rc == 0
     with (destination / "pyproject.toml").open("rb") as f:

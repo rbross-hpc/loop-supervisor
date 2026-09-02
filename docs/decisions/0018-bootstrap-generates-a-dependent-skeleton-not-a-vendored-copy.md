@@ -77,12 +77,13 @@ matching that shape for a new project to strip `.git` from.
      the destination directory's name) and the `loop-supervisor`
      dependency's Git URL (`--loop-supervisor-git-url`, default: this
      project's own origin).
-   - `opencode.json.tmpl`: `external_directory`'s allow-path is set to
-     the **destination's parent**, not the destination itself — task
-     worktrees are created as siblings one directory above the
-     project root by default (see README's "Sibling task
-     worktrees"), so that is the path OpenCode actually needs
-     permission to reach, matching this project's own
+   - `opencode.json.tmpl`: `external_directory` allows both the
+     **destination's parent** and its `/**` subtree, not the
+     destination itself — task worktrees are created as siblings one
+     directory above the project root by default (see README's
+     "Sibling task worktrees"). OpenCode's exact-parent path pattern
+     does not cover files inside those sibling worktrees, so both
+     entries are required, matching this project's own
      `opencode.json`.
    - The hardcoded `X-Falda-Tenant: "lte-project"` literal that this
      project's own `opencode.json` carries is **not** parameterized at

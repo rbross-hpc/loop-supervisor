@@ -5,34 +5,36 @@ obvious cause, or resumes into an error that looks unrelated to its
 actual cause. Neither is obvious from reading `opencode.json` in
 isolation, and both have been hit in practice.
 
-## 1. `external_directory` must allow the parent, not just the project root
+## 1. `external_directory` must allow the parent and its subtree
 
 `loop-supervisor` creates task worktrees as **siblings** of the
 integration project root by default — one directory level up, not
 nested inside it. An agent working inside a task worktree that needs
 to read anything outside its own worktree (a sibling task's diff, a
 file under the integration root, a log file elsewhere on disk) needs
-`external_directory` to allow the **parent** directory of the project
-root, not the project root itself.
+`external_directory` to allow both the **parent** directory itself and
+paths below it. OpenCode path patterns match strings: allowing only the
+exact parent does not match files inside sibling task worktrees.
 
 Given a project at `/home/user/my-project`, the permission block
-should allow `/home/user`, not (only) `/home/user/my-project`:
+should allow both `/home/user` and `/home/user/**`, not only the project
+root or only the exact parent:
 
 ```json
 "permission": {
   "external_directory": {
     "*": "deny",
-    "/home/user": "allow"
+    "/home/user": "allow",
+    "/home/user/**": "allow"
   }
 }
 ```
 
-`loop-supervisor init` computes this correctly automatically (it
-allows the destination's parent); the mistake happens when someone
-edits this block by hand afterward and narrows it back down to "just
-the project itself" because that looks more locked-down. Run
-`loop-supervisor config validate` after any manual edit to this block
-— it specifically checks for this.
+Order matters: OpenCode uses the **last matching rule**, so the broad
+`"*": "deny"` must precede both specific allows. `loop-supervisor init`
+computes these entries automatically. Run `loop-supervisor config
+validate` after any manual edit — it checks both the parent itself and
+a representative descendant path.
 
 ## 2. Config changes must be committed before a worktree exists
 
