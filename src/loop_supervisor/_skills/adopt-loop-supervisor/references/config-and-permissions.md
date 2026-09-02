@@ -63,9 +63,12 @@ config mid-run because a task worktree already exists:
    with "resume task worktree has changed since it was paused" —
    this is loop-supervisor correctly detecting the worktree changed
    out from under the recorded run state, not a bug. There is no
-   supported "reconcile expected head" command; treat step 2 above as
-   something you should avoid needing by getting config right at
-   adoption time in the first place.
+   supported "reconcile expected head" command for a moved `HEAD`
+   specifically (see the `use-loop-supervisor` skill's
+   `recovering-an-interrupted-run.md` for the one case that *is*
+   recoverable — uncommitted edits with `HEAD` unchanged, which this
+   is not); treat step 2 above as something you should avoid needing
+   by getting config right at adoption time in the first place.
 
 Checking `loop-supervisor config validate` at both step 0 and step 5
 of the main workflow — before and after writing config — is what

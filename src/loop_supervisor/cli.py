@@ -623,13 +623,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_parser.set_defaults(func=cmd_config_validate)
 
-    skill_parser = sub.add_parser(
-        "skill", help="Show or export the bundled adopt-loop-supervisor Agent Skill"
-    )
+    skill_parser = sub.add_parser("skill", help="List, show, or export the bundled Agent Skills")
     skill_sub = skill_parser.add_subparsers(dest="skill_action", required=True)
-    skill_sub.add_parser("show", help="Print the bundled SKILL.md to stdout")
-    skill_export_parser = skill_sub.add_parser("export", help="Copy the skill directory to PATH")
+    skill_sub.add_parser("list", help="List the names of the bundled Agent Skills")
+    skill_show_parser = skill_sub.add_parser(
+        "show", help="Print a bundled SKILL.md to stdout (default: adopt-loop-supervisor)"
+    )
+    skill_show_parser.add_argument("--name", help="Skill name (default: adopt-loop-supervisor)")
+    skill_export_parser = skill_sub.add_parser(
+        "export",
+        help="Copy a bundled skill directory to PATH (default skill: adopt-loop-supervisor)",
+    )
     skill_export_parser.add_argument("path", metavar="PATH", help="Destination directory")
+    skill_export_parser.add_argument("--name", help="Skill name (default: adopt-loop-supervisor)")
     skill_export_parser.add_argument(
         "--force", action="store_true", help="Overwrite the destination if non-empty"
     )
