@@ -3,9 +3,10 @@
 All models are immutable. The reducer returns a new snapshot on every
 update. Unknown event and part types increment counters but do not fail.
 
-Session-bearing events are accepted only when both the session ID is
-registered AND the event envelope directory exactly matches the directory
-registered for that session. No prefix or child-path matching.
+Session-bearing events are accepted only when both the session ID is active
+or retained in the bounded recently-finished set AND the event envelope
+directory exactly matches the directory registered for that session. No
+prefix or child-path matching.
 
 Directory-only events (``file.edited``) are accepted only when the
 directory exactly matches one of the active invocation directories.
@@ -25,6 +26,8 @@ from ..opencode import InvocationRef
 from ..opencode_events import OpenCodeEvent
 
 _MAX_INVOCATIONS = 4
+_MAX_FINISHED_INVOCATIONS = 4
+_MAX_FINISHED_SESSION_TOMBSTONES = 4
 _MAX_FEED_RECORDS = 200
 _MAX_TEXT_TAIL = 16 * 1024
 _MAX_TOOLS = 100
@@ -125,6 +128,10 @@ class LiveActivityReducer:
         self._unknown_event_count = 0
         self._notices: collections.deque[str] = collections.deque(maxlen=_MAX_NOTICES)
         self._active_invocations: dict[str, str] = {}
+        self._finished_invocations: collections.OrderedDict[str, str] = collections.OrderedDict()
+        self._finished_session_tombstones: collections.deque[str] = collections.deque(
+            maxlen=_MAX_FINISHED_SESSION_TOMBSTONES
+        )
         self._seen_event_ids: collections.deque[str] = collections.deque(maxlen=_MAX_EVENT_IDS)
         self._pending_events: collections.deque[OpenCodeEvent] = collections.deque(
             maxlen=_MAX_PENDING_EVENTS
@@ -147,6 +154,11 @@ class LiveActivityReducer:
 
     def register_invocation(self, ref: InvocationRef) -> None:
         self._assert_owner()
+        self._finished_invocations.pop(ref.session_id, None)
+        try:
+            self._finished_session_tombstones.remove(ref.session_id)
+        except ValueError:
+            pass
         self._active_invocations[ref.session_id] = str(ref.directory)
         inv = LiveInvocation(
             session_id=ref.session_id,
@@ -171,7 +183,13 @@ class LiveActivityReducer:
 
     def unregister_invocation(self, ref: InvocationRef) -> None:
         self._assert_owner()
-        self._active_invocations.pop(ref.session_id, None)
+        active_directory = self._active_invocations.pop(ref.session_id, None)
+        if active_directory is not None and active_directory == str(ref.directory):
+            self._finished_invocations[ref.session_id] = active_directory
+            self._finished_invocations.move_to_end(ref.session_id)
+            while len(self._finished_invocations) > _MAX_FINISHED_INVOCATIONS:
+                evicted_session_id, _ = self._finished_invocations.popitem(last=False)
+                self._finished_session_tombstones.append(evicted_session_id)
         if ref.session_id in self._invocations:
             inv = self._invocations[ref.session_id]
             self._invocations[ref.session_id] = replace(inv, status="done")
@@ -208,7 +226,7 @@ class LiveActivityReducer:
             status = status_map[event_type]
             if status == "busy":
                 status = "running"
-            if session_id in self._invocations:
+            if session_id in self._active_invocations and session_id in self._invocations:
                 self._invocations[session_id] = replace(
                     self._invocations[session_id], status=status
                 )
@@ -249,6 +267,8 @@ class LiveActivityReducer:
         return (
             event.session_id is not None
             and event.session_id not in self._active_invocations
+            and event.session_id not in self._finished_invocations
+            and event.session_id not in self._finished_session_tombstones
             and event.type
             in {
                 "session.status",
@@ -263,11 +283,13 @@ class LiveActivityReducer:
         )
 
     def _is_attributed(self, event: OpenCodeEvent) -> bool:
-        """Accept iff session is registered AND directory exactly matches."""
+        """Accept iff an active or retained session's directory exactly matches."""
         session_id = event.session_id
         if not session_id:
             return False
         expected_dir = self._active_invocations.get(session_id)
+        if expected_dir is None:
+            expected_dir = self._finished_invocations.get(session_id)
         if expected_dir is None:
             return False
         return event.directory == expected_dir

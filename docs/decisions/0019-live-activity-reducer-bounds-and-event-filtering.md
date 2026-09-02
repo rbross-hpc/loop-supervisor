@@ -44,7 +44,9 @@ corresponding `test_*_bounded` test in `tests/test_live_reducer.py`):
 
 | Constant | Value | Bounds |
 |---|---|---|
-| `_MAX_INVOCATIONS` | 4 | Concurrently tracked invocations (oldest evicted first) |
+| `_MAX_INVOCATIONS` | 4 | Concurrently displayed invocations (oldest evicted first) |
+| `_MAX_FINISHED_INVOCATIONS` | 4 | Finished session-ID/directory attributions retained for trailing events (oldest evicted first) |
+| `_MAX_FINISHED_SESSION_TOMBSTONES` | 4 | Evicted finished session IDs remembered so their events are dropped rather than buffered (oldest evicted first) |
 | `_MAX_FEED_RECORDS` | 200 | Status/feed event history (`collections.deque(maxlen=...)`) |
 | `_MAX_TEXT_TAIL` | 16 KiB | Each message's text and reasoning tail, independently |
 | `_MAX_TOOLS` | 100 | Tool calls retained per message (oldest evicted first) |
@@ -63,8 +65,11 @@ byte ceiling, not an approximate one.
 - `_is_attributed()` (session-bearing events: `session.status`,
   `session.idle`, `session.error`, `message.*`, `todo.updated`,
   `session.diff`) accepts an event only if its `session_id` is a
-  currently registered invocation **and** its `directory` is exactly
-  equal (`==`) to that invocation's registered directory.
+  currently active invocation or one of the four most recently finished
+  invocations **and** its `directory` is exactly equal (`==`) to that
+  invocation's registered directory. Finished attribution retains only
+  session-ID/directory metadata, never event payloads; fifth and later
+  finishes evict the oldest retained attribution.
 - `_is_directory_attributed()` (`file.edited`, which carries no
   session ID) accepts an event only if its `directory` is exactly
   equal to one of the currently active invocations' directories.
@@ -80,6 +85,20 @@ byte ceiling, not an approximate one.
   eviction. Once a session is registered, mismatched-directory events are
   dropped immediately. This closes the observer-to-Textual-message race without
   weakening exact attribution or allowing unbounded state.
+- Unregistration removes an invocation from active tracking immediately, marks
+  its displayed record `done`, and retains its exact session-ID/directory pair
+  in a separate oldest-first four-entry map. Matching trailing session-bearing
+  events can still update that displayed record, but status events cannot
+  resurrect it from `done`; directory-only `file.edited` events still require
+  an   an active invocation. An unknown session remains pending only for possible
+  future registration. Eviction moves the finished session ID into a separate
+  oldest-first four-entry tombstone queue, so its later events are dropped
+  rather than entering the pending-registration queue and cannot be replayed
+  into a reused registration. Registering that session ID explicitly clears
+  its tombstone. Once both bounded windows have evicted a session ID it is
+  indistinguishable from a genuinely unknown pre-registration session. This is
+  a bounded attribution grace based on finish count, not a timer or an SSE
+  drain barrier; see ADR 0031.
 - Reconnect reconciliation is attempted only for the server's currently active,
   supervisor-owned `InvocationRef` values. Both status and message requests use
   each reference's exact directory, and the message request uses its exact
@@ -104,8 +123,10 @@ directly.
   should be escalated to the architect rather than made silently.
 - The original bounds and filtering rules were already true when this ADR was
   accepted. Task 048 extends the same invariants to pending registration events,
-  visible notices, and reconnect reconciliation. Backlog item 20 remains closed;
-  backlog item 14 is resolved without widening the attribution boundary.
+  visible notices, and reconnect reconciliation. Task 049 adds the bounded
+  recently-finished lifecycle from ADR 0031 without widening how events match.
+  Backlog item 20 remains closed; backlog items 14 and 15 are resolved without
+  weakening the attribution boundary or making SSE gate durable progress.
 - The bounds are fixed constants, not configurable. If a future need
   arises for a longer-lived TUI session to retain more history (or a
   memory-constrained environment to retain less), that would be a new
