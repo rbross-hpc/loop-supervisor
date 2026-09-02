@@ -1769,6 +1769,21 @@ after the fact get written down.
     deleted as part of this change rather than left to fail confusingly
     on the next load attempt.
 
+    **Post-merge audit found and fixed one defect:** the first landed
+    version never reset `builder_guidance_count` on a `COMPLETE` result,
+    only at task boundaries -- making it a cumulative per-task total
+    rather than the consecutive-failure count the escalation message and
+    README both claimed ("reported ... N times in a row" /
+    "N consecutive non-COMPLETE results"). A task that made genuine
+    progress (every `INCOMPLETE` followed by a real verified commit and
+    an auditor `REVISE`, no two `INCOMPLETE`s ever adjacent) would still
+    eventually trip the limit purely from accumulating total rounds.
+    Fixed by resetting the counter in `_do_building`'s `COMPLETE` branch,
+    alongside the existing task-boundary resets; a regression test
+    (`test_builder_guidance_count_is_consecutive_not_cumulative`) pins
+    the corrected semantics, verified failing-first against the
+    originally merged commit (`cb9b4c8`).
+
 50. ~~**Agent-created worktrees outside the supervisor's own bookkeeping
     survive task cleanup.**~~ **Resolved as a documentation fix, not a
     supervisor-side sweep.** (Tier 5 — documentation/testing debt;

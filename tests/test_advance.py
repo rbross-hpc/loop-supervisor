@@ -2149,6 +2149,55 @@ def test_builder_guidance_count_resets_at_task_boundary(tmp_path):
     assert state.pending_question["kind"] == "builder_guidance"
 
 
+def test_builder_guidance_count_is_consecutive_not_cumulative(tmp_path):
+    """A COMPLETE result resets builder_guidance_count, so a task that
+    keeps making genuine progress -- every INCOMPLETE followed by a real
+    verified commit and an auditor REVISE, never two INCOMPLETEs back to
+    back -- must never trip the guidance limit, no matter how many
+    INCOMPLETE/REVISE rounds it goes through in total. A cumulative (not
+    consecutive) counter would eventually escalate this healthy task."""
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [
+                _builder(status="INCOMPLETE", open_concerns=["stuck"]),
+                _builder(status="COMPLETE"),
+                _builder(status="INCOMPLETE", open_concerns=["stuck"]),
+                _builder(status="COMPLETE"),
+                _builder(status="INCOMPLETE", open_concerns=["stuck"]),
+                _builder(status="COMPLETE"),
+                _builder(status="INCOMPLETE", open_concerns=["stuck"]),
+            ],
+            "loop-auditor": [_auditor(disposition="REVISE") for _ in range(3)],
+        }
+    )
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        input_provider=ScriptedInput(["keep going", "keep going", "keep going"]),
+        options=_make_options(max_revisions_per_task=10, max_builder_guidance_attempts=1),
+    )
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+
+    for _ in range(3):
+        supervisor.advance(state)  # building (INCOMPLETE) -> awaiting_input
+        assert state.pending_question["kind"] == "builder_guidance"
+        assert state.builder_guidance_count == 1
+        supervisor.advance(state)  # awaiting_input -> building
+        supervisor.advance(state)  # building (COMPLETE) -> auditing
+        assert state.builder_guidance_count == 0
+        supervisor.advance(state)  # auditing (REVISE) -> building
+
+    outcome = supervisor.advance(state)  # building (4th INCOMPLETE) -> awaiting_input
+
+    assert outcome.status == AdvanceStatus.INPUT_REQUIRED
+    assert state.phase == PHASE_AWAITING_INPUT
+    assert state.pending_question["kind"] == "builder_guidance"
+    assert state.builder_guidance_count == 1
+
+
 def test_operator_replan_from_builder_guidance_is_bounded_by_max_replans(tmp_path):
     runner = ScriptedRunner(
         {

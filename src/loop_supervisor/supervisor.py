@@ -1226,6 +1226,15 @@ class Supervisor:
             # if verify_builder_commit had raised instead, retrying
             # building still needs guidance above.
             state.pending_question = None
+            # builder_guidance_count bounds *consecutive* non-COMPLETE
+            # results, not a task's lifetime total: a builder that just
+            # produced a verified commit has demonstrably not exhausted
+            # its ability to make progress, however many REVISE cycles or
+            # guidance rounds came before it. Resetting here (rather than
+            # only at task boundaries) means a long task that legitimately
+            # needs several builder rounds, each of which lands a real
+            # commit, never gets circuit-broken for making progress.
+            state.builder_guidance_count = 0
             state.phase = PHASE_VERIFYING if self.options.verify_commands else PHASE_AUDITING
             return
 
