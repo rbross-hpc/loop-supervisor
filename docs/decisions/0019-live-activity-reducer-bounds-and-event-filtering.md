@@ -46,6 +46,7 @@ corresponding `test_*_bounded` test in `tests/test_live_reducer.py`):
 |---|---|---|
 | `_MAX_INVOCATIONS` | 4 | Concurrently displayed invocations (oldest evicted first) |
 | `_MAX_FINISHED_INVOCATIONS` | 4 | Finished session-ID/directory attributions retained for trailing events (oldest evicted first) |
+| `_MAX_FINISHED_SESSION_TOMBSTONES` | 4 | Evicted finished session IDs remembered so their events are dropped rather than buffered (oldest evicted first) |
 | `_MAX_FEED_RECORDS` | 200 | Status/feed event history (`collections.deque(maxlen=...)`) |
 | `_MAX_TEXT_TAIL` | 16 KiB | Each message's text and reasoning tail, independently |
 | `_MAX_TOOLS` | 100 | Tool calls retained per message (oldest evicted first) |
@@ -89,10 +90,15 @@ byte ceiling, not an approximate one.
   in a separate oldest-first four-entry map. Matching trailing session-bearing
   events can still update that displayed record, but status events cannot
   resurrect it from `done`; directory-only `file.edited` events still require
-  an active invocation. An unknown session remains pending only for possible
-  future registration, while an evicted finished session can no longer affect
-  any invocation. This is a bounded attribution grace based on finish count,
-  not a timer or an SSE drain barrier; see ADR 0031.
+  an   an active invocation. An unknown session remains pending only for possible
+  future registration. Eviction moves the finished session ID into a separate
+  oldest-first four-entry tombstone queue, so its later events are dropped
+  rather than entering the pending-registration queue and cannot be replayed
+  into a reused registration. Registering that session ID explicitly clears
+  its tombstone. Once both bounded windows have evicted a session ID it is
+  indistinguishable from a genuinely unknown pre-registration session. This is
+  a bounded attribution grace based on finish count, not a timer or an SSE
+  drain barrier; see ADR 0031.
 - Reconnect reconciliation is attempted only for the server's currently active,
   supervisor-owned `InvocationRef` values. Both status and message requests use
   each reference's exact directory, and the message request uses its exact

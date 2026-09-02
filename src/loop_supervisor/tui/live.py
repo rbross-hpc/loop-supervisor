@@ -27,6 +27,7 @@ from ..opencode_events import OpenCodeEvent
 
 _MAX_INVOCATIONS = 4
 _MAX_FINISHED_INVOCATIONS = 4
+_MAX_FINISHED_SESSION_TOMBSTONES = 4
 _MAX_FEED_RECORDS = 200
 _MAX_TEXT_TAIL = 16 * 1024
 _MAX_TOOLS = 100
@@ -128,6 +129,9 @@ class LiveActivityReducer:
         self._notices: collections.deque[str] = collections.deque(maxlen=_MAX_NOTICES)
         self._active_invocations: dict[str, str] = {}
         self._finished_invocations: collections.OrderedDict[str, str] = collections.OrderedDict()
+        self._finished_session_tombstones: collections.deque[str] = collections.deque(
+            maxlen=_MAX_FINISHED_SESSION_TOMBSTONES
+        )
         self._seen_event_ids: collections.deque[str] = collections.deque(maxlen=_MAX_EVENT_IDS)
         self._pending_events: collections.deque[OpenCodeEvent] = collections.deque(
             maxlen=_MAX_PENDING_EVENTS
@@ -151,6 +155,10 @@ class LiveActivityReducer:
     def register_invocation(self, ref: InvocationRef) -> None:
         self._assert_owner()
         self._finished_invocations.pop(ref.session_id, None)
+        try:
+            self._finished_session_tombstones.remove(ref.session_id)
+        except ValueError:
+            pass
         self._active_invocations[ref.session_id] = str(ref.directory)
         inv = LiveInvocation(
             session_id=ref.session_id,
@@ -180,7 +188,8 @@ class LiveActivityReducer:
             self._finished_invocations[ref.session_id] = active_directory
             self._finished_invocations.move_to_end(ref.session_id)
             while len(self._finished_invocations) > _MAX_FINISHED_INVOCATIONS:
-                self._finished_invocations.popitem(last=False)
+                evicted_session_id, _ = self._finished_invocations.popitem(last=False)
+                self._finished_session_tombstones.append(evicted_session_id)
         if ref.session_id in self._invocations:
             inv = self._invocations[ref.session_id]
             self._invocations[ref.session_id] = replace(inv, status="done")
@@ -259,6 +268,7 @@ class LiveActivityReducer:
             event.session_id is not None
             and event.session_id not in self._active_invocations
             and event.session_id not in self._finished_invocations
+            and event.session_id not in self._finished_session_tombstones
             and event.type
             in {
                 "session.status",

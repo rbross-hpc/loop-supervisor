@@ -534,6 +534,40 @@ def test_finished_session_attribution_is_bounded_oldest_first():
     assert all(inv.status == "done" for inv in snap.invocations)
 
 
+def test_event_for_evicted_finished_session_is_not_replayed_on_reuse():
+    reducer = LiveActivityReducer()
+    refs = [
+        _ref(f"s{index}", directory=f"/repo/{index}")
+        for index in range(live_mod._MAX_FINISHED_INVOCATIONS + 1)
+    ]
+    for ref in refs:
+        reducer.register_invocation(ref)
+        reducer.unregister_invocation(ref)
+
+    evicted = refs[0]
+    reducer.on_event(
+        _ev("session.idle", session_id=evicted.session_id, directory=str(evicted.directory))
+    )
+    reducer.register_invocation(evicted)
+
+    invocation = reducer.snapshot().invocations[-1]
+    assert invocation.session_id == evicted.session_id
+    assert invocation.status == "running"
+
+
+def test_finished_session_tombstones_are_bounded():
+    reducer = LiveActivityReducer()
+    finish_count = (
+        live_mod._MAX_FINISHED_INVOCATIONS + live_mod._MAX_FINISHED_SESSION_TOMBSTONES + 2
+    )
+    for index in range(finish_count):
+        ref = _ref(f"s{index}", directory=f"/repo/{index}")
+        reducer.register_invocation(ref)
+        reducer.unregister_invocation(ref)
+
+    assert len(reducer._finished_session_tombstones) == live_mod._MAX_FINISHED_SESSION_TOMBSTONES
+
+
 def test_stale_session_different_directory_rejected():
     reducer = LiveActivityReducer()
     ref_a = _ref("s1", directory="/repo/task-a")
@@ -761,7 +795,6 @@ def test_integration_delta_before_message_updated_still_attributes_correctly():
 
 
 def test_integration_delta_arriving_after_invocation_finished_is_applied():
-    assert hasattr(live_mod, "_MAX_FINISHED_INVOCATIONS")
     reducer = LiveActivityReducer()
     ref = _ref("s1", directory="/repo")
     reducer.register_invocation(ref)
