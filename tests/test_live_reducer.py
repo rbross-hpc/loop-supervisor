@@ -4,6 +4,7 @@ import threading
 import time
 from pathlib import Path
 
+import loop_supervisor.tui.live as live_mod
 from loop_supervisor.opencode import InvocationRef
 from loop_supervisor.opencode_events import (
     OpenCodeEvent,
@@ -484,14 +485,53 @@ def test_server_connected_sets_live():
     assert snap.connection.state == "live"
 
 
-def test_unregistered_session_events_after_finish_ignored():
+def test_matching_session_event_after_finish_is_applied_without_reactivation():
     reducer = LiveActivityReducer()
     ref = _ref("s1", directory="/repo")
     reducer.register_invocation(ref)
     reducer.unregister_invocation(ref)
+
     reducer.on_event(_ev("session.idle", session_id="s1", directory="/repo"))
+
+    snap = reducer.snapshot()
+    assert len(snap.feed) == 1
+    assert snap.invocations[0].status == "done"
+    reducer.on_event(_ev("file.edited", directory="/repo", file="/repo/late.py"))
+    assert reducer.snapshot().touched_files == ()
+
+
+def test_finished_session_event_with_wrong_directory_is_rejected():
+    reducer = LiveActivityReducer()
+    ref = _ref("s1", directory="/repo/task-a")
+    reducer.register_invocation(ref)
+    reducer.unregister_invocation(ref)
+
+    reducer.on_event(_ev("session.idle", session_id="s1", directory="/repo/task-b"))
+
     snap = reducer.snapshot()
     assert snap.feed == ()
+    assert snap.invocations[0].status == "done"
+
+
+def test_finished_session_attribution_is_bounded_oldest_first():
+    reducer = LiveActivityReducer()
+    refs = [
+        _ref(f"s{index}", directory=f"/repo/{index}")
+        for index in range(live_mod._MAX_FINISHED_INVOCATIONS + 1)
+    ]
+    for ref in refs:
+        reducer.register_invocation(ref)
+        reducer.unregister_invocation(ref)
+
+    reducer.on_event(_ev("session.idle", session_id="s0", directory="/repo/0"))
+    newest = refs[-1]
+    reducer.on_event(
+        _ev("session.idle", session_id=newest.session_id, directory=str(newest.directory))
+    )
+
+    snap = reducer.snapshot()
+    assert [item.session_id for item in snap.feed] == [newest.session_id]
+    assert all(inv.status == "done" for inv in snap.invocations)
 
 
 def test_stale_session_different_directory_rejected():
@@ -720,13 +760,18 @@ def test_integration_delta_before_message_updated_still_attributes_correctly():
     assert msg.text_tail == "hi"
 
 
-def test_integration_delta_after_invocation_finished_ignored():
+def test_integration_delta_arriving_after_invocation_finished_is_applied():
+    assert hasattr(live_mod, "_MAX_FINISHED_INVOCATIONS")
     reducer = LiveActivityReducer()
     ref = _ref("s1", directory="/repo")
     reducer.register_invocation(ref)
     reducer.unregister_invocation(ref)
     raw = _raw_part_delta(session_id="s1", message_id="m1", part_id="p1", field="text", delta="x")
+
     reducer.on_event(normalize_global_event(raw))
+
     snap = reducer.snapshot()
     msg = snap.invocations[0].latest_message
-    assert msg is None
+    assert msg is not None
+    assert msg.text_tail == "x"
+    assert snap.invocations[0].status == "done"

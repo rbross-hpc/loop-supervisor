@@ -333,6 +333,50 @@ async def test_reconnect_reconciles_active_invocation_state(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_trailing_sse_message_after_invocation_finished_updates_done_invocation(
+    tmp_path, monkeypatch
+):
+    repo = _init_repo(tmp_path / "repo")
+    _patch_server(monkeypatch)
+    app = LoopSupervisorApp(tmp_path / "repo")
+    async with app.run_test() as pilot:
+        screen = RunScreen(tmp_path / "repo", run_id=None)
+        app.push_screen(screen)
+        await pilot.pause()
+        ref = InvocationRef("session-trailing", "loop-builder", tmp_path / "repo", time.monotonic())
+        screen.on_invocation_started(app_mod.InvocationStarted(ref))
+        screen.on_invocation_finished(app_mod.InvocationFinished(ref, None))
+        event = app_mod.normalize_global_event(
+            {
+                "directory": str(tmp_path / "repo"),
+                "payload": {
+                    "type": "message.part.delta",
+                    "properties": {
+                        "sessionID": ref.session_id,
+                        "messageID": "message-trailing",
+                        "partID": "part-trailing",
+                        "field": "text",
+                        "delta": "arrived after finish",
+                    },
+                },
+            }
+        )
+
+        screen.on_opencode_event_received(app_mod.OpenCodeEventReceived(event))
+
+        invocation = screen._reducer.snapshot().invocations[0]
+        assert invocation.status == "done"
+        assert invocation.latest_message is not None
+        assert invocation.latest_message.text_tail == "arrived after finish"
+
+        screen.action_request_shutdown()
+        for _ in range(50):
+            if not _lock_path(repo.common_dir()).exists():
+                break
+            await pilot.pause(0.05)
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_failure_is_visible_and_nonfatal(tmp_path, monkeypatch):
     repo = _init_repo(tmp_path / "repo")
 

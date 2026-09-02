@@ -529,8 +529,19 @@ after the fact get written down.
     Item 15's trailing-event behavior and item 19's general parser/reconnect-
     backoff acceptance coverage remain explicitly out of scope.
 
-15. **Trailing-event attribution loss.**
-    `src/loop_supervisor/tui/live.py:224-236`.
+15. ~~**Trailing-event attribution loss.**~~ **Resolved.**
+    `LiveActivityReducer` now moves an unregistered invocation's exact session
+    ID/directory attribution into a separate four-entry oldest-first retention
+    map. Session-bearing SSE events already in transit can therefore update the
+    completed invocation, while status events cannot resurrect it from `done`,
+    directory-only events still require an active invocation, and unknown or
+    wrong-directory events remain unable to affect another invocation. The
+    invocation is removed from active tracking immediately; this fixed count
+    bound is an ephemeral display-side grace, not an ordering barrier or timer,
+    so SSE never delays agent completion or durable supervisor progress. See ADR
+    0031 and ADR 0019. Reducer integration coverage reproduces a normalized text
+    delta arriving after `InvocationFinished`, plus wrong-directory rejection,
+    no-reactivation, and oldest-first bound eviction.
 
 16. **DEFERRED. Browser, durable-state, and live rendering remain
     behind README/plan claims.**
