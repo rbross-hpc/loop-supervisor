@@ -16,13 +16,15 @@ tracked and addressed in follow-up work rather than dropped.
 The repository owner wants the TUI eventually, primarily for
 monitoring an in-progress run, but it is not a current priority and
 should not be picked up as planner-selected work right now. Items
-marked **DEFERRED** below (16, 17, 18, 31, 40) are open, substantiated
+marked **DEFERRED** below (16, 17, 18, 40, 52) are open, substantiated
 findings that remain genuinely unresolved -- they are not being
 closed or judged unimportant -- but must not be selected as the next
 unit of work until this note is removed or a specific item is
 explicitly reopened. This is distinct from items resolved, struck, or
 closed with a documented alternative elsewhere in this file, all of
 which are settled and will not be revisited absent new information.
+Item 31 was previously listed here but has since been closed (see its
+entry below) and was removed from this list accordingly.
 
 Items 14, 15, 19, and 42 also touch TUI/SSE code but are left in
 normal rotation: they are correctness or test-coverage gaps in
@@ -1722,6 +1724,11 @@ after the fact get written down.
     (struck) for the disproportionate-cost reasoning against a
     config-level command allowlist/denylist as defence-in-depth here.
 
+    The remaining gap -- this mitigation protects only
+    `loop-supervisor run`, not `resume` or `tui` -- is tracked as item
+    52 (DEFERRED: the TUI half needs the standing TUI-work deferral
+    lifted before it can be closed).
+
 49. ~~**Repeated builder `INCOMPLETE`/`BLOCKED` results have no circuit
     breaker.**~~ **Resolved.** (Tier 3 — reliability)
     `src/loop_supervisor/supervisor.py:1227-1236` (the non-`COMPLETE`
@@ -1854,9 +1861,10 @@ after the fact get written down.
     process group and releases the lock -- printing a clean message
     and re-raising (rather than swallowing) is the likely shape.
 
-52. **`[provision]`/`[verify]` config from `loop-supervisor.toml` only
-    applies to `loop-supervisor run`; `resume` and `tui` bypass it
-    entirely.** (Tier 2 — validation/startup)
+52. **DEFERRED. `[provision]`/`[verify]` config from
+    `loop-supervisor.toml` only applies to `loop-supervisor run`;
+    `resume` and `tui` bypass it entirely.** (Tier 2 —
+    validation/startup)
     `_resolve_project_config` (`cli.py:152-182`) is called only from
     `cmd_run` (`cli.py:212`); `cmd_resume` never calls it and instead
     reloads `provision_commands`/`verify_commands` from the run's own
@@ -1926,8 +1934,9 @@ after the fact get written down.
     reintroduce exactly the re-merge-on-crash hazard the current
     behavior avoids.
 
-55. **`_launcher.py`'s `FAKE_LAUNCHER_*` fault-injection hooks are
-    undocumented as a group.** (Tier 5 — documentation/testing debt)
+55. ~~**`_launcher.py`'s `FAKE_LAUNCHER_*` fault-injection hooks are
+    undocumented as a group.**~~ **Resolved.** (Tier
+    5 — documentation/testing debt)
     `src/loop_supervisor/_launcher.py` carries four env-gated test
     seams in shipped production code: `FAKE_LAUNCHER_IDENTITY`,
     `FAKE_LAUNCHER_TERM_ERROR_ONCE`, `FAKE_LAUNCHER_TERM_BLOCK_FILE`
