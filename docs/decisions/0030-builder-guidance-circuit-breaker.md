@@ -41,10 +41,21 @@ situation (a task whose scope turned out to be wrong, not a broken run).
 ## Decision
 
 A new `builder_guidance_count` on `RunState`, bounded by
-`RunOptions.max_builder_guidance_attempts` (default 3), counts every
-non-`COMPLETE` builder result -- `BLOCKED` and `INCOMPLETE` share one
-counter, since both represent the same underlying "the builder cannot
-finish as directed" outcome.
+`RunOptions.max_builder_guidance_attempts` (default 3), counts
+*consecutive* non-`COMPLETE` builder results -- `BLOCKED` and
+`INCOMPLETE` share one counter, since both represent the same
+underlying "the builder cannot finish as directed" outcome. It is reset
+to zero the moment the builder produces a verified `COMPLETE` commit
+(`_do_building`'s `COMPLETE` branch), not only at task boundaries: a
+builder that just landed a real commit has demonstrably not exhausted
+its ability to make progress, however many `INCOMPLETE`/`BLOCKED`
+rounds preceded it earlier in the same task. Without this reset, a
+long task that legitimately needs several builder rounds -- each
+producing a genuine commit, with an auditor `REVISE` in between --
+would eventually be circuit-broken purely for taking many rounds to
+finish, exactly the healthy-but-long case this feature must not
+penalize. Only an unbroken run of `max_builder_guidance_attempts`
+non-`COMPLETE` results with no intervening `COMPLETE` trips the limit.
 
 Below the limit, behavior is unchanged: `_do_building` parks a
 `builder_guidance` question and, on any answer other than `replan`,
@@ -77,14 +88,18 @@ closes the operator-replan bypass described above: an operator answering
 reached, now counts against the same `max_replans_per_task` limit an
 auditor-driven replan does.
 
-`builder_guidance_count` resets at the same two points
+`builder_guidance_count` also resets at the same two points
 `revision_count` already resets when a task's builder-attempt cycle
 restarts (`_do_planning`'s existing-worktree branch, taken on an
 auditor `REPLAN`; and `_do_creating_worktree`'s worktree-creation
 branch, taken when a brand-new task starts), plus
-`_finish_task_cleanup` when a task is fully accepted. Each represents a
-fresh attempt cycle for which the previous cycle's guidance history is
-no longer relevant.
+`_finish_task_cleanup` when a task is fully accepted. These are
+redundant with the `COMPLETE`-branch reset for the ordinary REPLAN
+path (a REPLAN is always preceded by a `COMPLETE` verification, which
+already zeroed the counter) but are kept anyway, both for the
+brand-new-task case (where there is no preceding `COMPLETE` to reset
+from) and as defense in depth against a future code path reaching
+`PHASE_BUILDING` some other way.
 
 Adding `builder_escalation` to the `pending_question` vocabulary
 required touching all three of `state.py`'s strict validators (recorded
@@ -123,9 +138,15 @@ migration machinery this project has explicitly chosen not to carry.
 
 - An unattended or careless operator can no longer loop the builder
   indefinitely on a task it cannot complete: after
-  `max_builder_guidance_attempts` non-`COMPLETE` results, the supervisor
-  refuses to re-invoke the builder and forces an explicit `replan` or
-  `abandon` decision instead.
+  `max_builder_guidance_attempts` *consecutive* non-`COMPLETE` results,
+  the supervisor refuses to re-invoke the builder and forces an
+  explicit `replan` or `abandon` decision instead.
+- A task that keeps making genuine progress -- every `INCOMPLETE`/
+  `BLOCKED` round followed by a real verified commit, however many such
+  rounds the task needs in total -- never trips the limit, because each
+  `COMPLETE` resets the counter. The circuit breaker fires only on an
+  unbroken run of failures, matching what the escalation's own message
+  ("reported ... N times in a row") tells the operator.
 - `replan`, from either path, now correctly costs one unit of
   `max_replans_per_task` budget, closing the bypass an operator
   previously had around that limit.
