@@ -48,3 +48,8 @@ text into the active task worktree as the next available
 superseding/deprecation workflow yet. If a later decision reverses an
 earlier one, note that in the newer ADR's `Context` section and reference
 the older ADR by number.
+
+Wrap prose (titles, `Context`/`Decision` paragraphs, and `Consequences`
+bullets) at 90 columns, matching every other Markdown file in this
+project. A fenced code block or a Markdown table row is exempt where
+wrapping would break its structure.
