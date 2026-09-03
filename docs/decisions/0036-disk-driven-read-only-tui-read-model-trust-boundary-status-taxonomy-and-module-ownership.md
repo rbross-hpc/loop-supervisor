@@ -116,19 +116,26 @@ isolation, with no reuse of prior artifact values. Once the scan finishes, the U
 replaces the prior snapshot as one unit and reconciles selection by run ID. Thus an
 added run appears, a removed run disappears, changed state/history/verification or
 lock data replaces its old value, and a newly malformed artifact replaces its old
-valid value with a degraded value and diagnostic. A selected run that disappears
-returns the user to an explicit removed/unavailable state rather than retaining
-stale details. Open log content is closed or replaced; it is never silently carried
-across refresh as though still current.
+valid value with a degraded value and diagnostic. A selected run absent from the new
+scan's candidate enumeration returns the user to an explicit removed state rather
+than retaining stale details; an enumerated candidate lost during loading instead
+remains selected as the degraded row specified below. Open log content is closed or
+replaced; it is never silently carried across refresh as though still current.
 
 This is a bounded best-effort scan, not a transaction across files. Every operation
-handles `ENOENT` after enumeration as concurrent disappearance. A disappearing run
-candidate is omitted with a scan diagnostic; a disappearing history or verification
-artifact is marked unavailable on its run. A project-level failure that prevents a
-safe scan leaves the already displayed snapshot intact and reports refresh failure;
-a completed scan, including degraded rows, replaces it. The observation time is UI
-metadata only. The reader never retries until files become consistent and never
-turns timestamps into phase starts, durations, heartbeat, stall, or workflow claims.
+handles `ENOENT` after enumeration as concurrent disappearance. Once a valid run
+candidate has been enumerated, it remains in that scan's result: if its current-state
+leaf disappears before or during loading, the result contains an `unloadable`
+`RunSummary` with a disappearance diagnostic. On refresh this degraded summary
+replaces any previously loaded value for that run, and a selected run remains
+selected but shows unavailable details. A run is omitted as removed only when no
+candidate for it was present during that refresh's enumeration. A disappearing
+history or verification artifact is marked unavailable on its run. A project-level
+failure that prevents a safe scan leaves the already displayed snapshot intact and
+reports refresh failure; a completed scan, including degraded rows, replaces it. The
+observation time is UI metadata only. The reader never retries until files become
+consistent and never turns timestamps into phase starts, durations, heartbeat,
+stall, or workflow claims.
 
 ### Structured-input and rendered-output bounds
 
