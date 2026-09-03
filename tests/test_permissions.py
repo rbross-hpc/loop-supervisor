@@ -417,6 +417,43 @@ def test_consumer_that_raises_does_not_break_other_consumers(capsys):
     assert "boom" in stderr
 
 
+def test_add_consumer_during_dispatch_does_not_raise():
+    """add_consumer() may be called from a consumer's on_event() (e.g. an
+    observer wiring up a second consumer lazily); _on_event() iterates a
+    snapshot of _consumers, so mutating the list mid-dispatch must not
+    raise RuntimeError and the newly attached consumer must simply not
+    see the in-flight event, per the class docstring's documented
+    subscribe-after-publish gap."""
+
+    seen: list[str] = []
+
+    class _RecordingConsumer:
+        def on_event(self, raw_event, event):
+            seen.append(event.type)
+
+    late_consumer = _RecordingConsumer()
+
+    class _AttachingConsumer:
+        def on_event(self, raw_event, event):
+            monitor.add_consumer(late_consumer)
+
+    monitor = SessionMonitor("http://127.0.0.1:1", consumers=[_AttachingConsumer()])
+    monitor._on_event(
+        {
+            "directory": "/repo",
+            "payload": {"type": "session.idle", "properties": {"sessionID": "ses1"}},
+        }
+    )
+    assert seen == []
+    monitor._on_event(
+        {
+            "directory": "/repo",
+            "payload": {"type": "session.idle", "properties": {"sessionID": "ses1"}},
+        }
+    )
+    assert seen == ["session.idle"]
+
+
 def test_malformed_envelope_reaches_no_consumer():
     """An envelope normalize_global_event rejects must not reach any
     consumer at all -- the monitor's own normalization failure, not a

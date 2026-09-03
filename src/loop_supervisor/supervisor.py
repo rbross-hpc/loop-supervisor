@@ -806,13 +806,13 @@ class Supervisor:
         ``on_advance``, if given, is called with every ``AdvanceOutcome``
         immediately after each ``advance()`` call, before this method
         acts on its status -- purely an observation hook (e.g. for
-        headless `-v` phase-transition reporting); it must not raise, and
-        it has no influence on the loop's own control flow. A raising
-        callback is not caught here deliberately: an observer that cannot
-        be trusted not to raise should not be installed, the same
-        contract ``InvocationObserver`` callers already rely on
+        headless `-v` phase-transition reporting); it has no influence on
+        the loop's own control flow. Exceptions raised by the callback
+        are caught and discarded here, the same non-fatal contract
+        ``InvocationObserver`` callers already rely on
         (``OpenCodeServer._notify_started``/``_notify_finished`` catch
-        observer exceptions at that layer instead).
+        observer exceptions at that layer too), so a misbehaving
+        ``on_advance`` can never abort a run.
         """
         steps_taken = 0
         while state.phase not in _TERMINAL_PHASES:
@@ -820,7 +820,10 @@ class Supervisor:
                 return state
             outcome = self.advance(state)
             if on_advance is not None:
-                on_advance(outcome)
+                try:
+                    on_advance(outcome)
+                except Exception:
+                    pass
             state = outcome.state
             steps_taken += 1
             if outcome.status == AdvanceStatus.INPUT_UNAVAILABLE:
