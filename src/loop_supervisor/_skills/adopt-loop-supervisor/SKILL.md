@@ -88,18 +88,31 @@ on a specific model rather than the project's default.
 
 ### 4. Configure `opencode.json` and permissions
 
-Copy the generated `opencode.json`, `.gitignore`, and `.env.example`
-into the target repo, then read **`references/config-and-permissions.md`
-in full before editing anything** — it documents two specific mistakes
-that produce a run that hangs or silently fails with no clear error,
-neither of which is obvious from the file contents alone:
+The supervisor points every agent invocation at the integration root's
+`opencode.json` via `OPENCODE_CONFIG` (ADR 0032), so there is one file
+to get right and it applies to task worktrees too. Read
+**`references/config-and-permissions.md` in full before editing
+anything** — it documents two specific mistakes that produce a run that
+hangs or silently fails with no clear error.
 
-1. `external_directory` must allow the *parent* of the project root
-   and that parent's `/**` subtree, not just either exact directory.
-2. Config changes must be committed **before** any task worktree is
-   created, not after — OpenCode resolves `opencode.json` from each
-   invocation's own working directory, which for a task is its own
-   worktree, not the integration root.
+Look at the target repo's existing `opencode.json` if it has one:
+
+- **If it exists**, read it and propose the edits it needs — most
+  importantly an `external_directory` block allowing the *parent* of
+  the project root and that parent's `/**` subtree (not just either
+  exact directory), plus `doom_loop: deny`. Preserve whatever provider,
+  model, and MCP settings the project already has. **Checkpoint:** show
+  the human the proposed edits and apply them only once they approve.
+- **If it does not exist**, create one — the quickest source is the
+  `opencode.json` in the skeleton you generated in step 1, whose
+  `external_directory` is already scoped to the skeleton's parent;
+  adjust the paths to the target repo's actual parent directory.
+
+Whether the resulting `opencode.json` is committed is the project
+owner's call. If they prefer not to track it (e.g. it carries
+credentials-adjacent provider config), add it to `.gitignore` rather
+than leaving it untracked — see `references/config-and-permissions.md`
+for why an untracked-but-unignored file breaks the run.
 
 ### 5. Commit and re-validate
 

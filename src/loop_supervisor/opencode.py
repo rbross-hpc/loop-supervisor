@@ -539,6 +539,15 @@ def build_agent_env(
        existence, since `project_root` is a real, known path at the time
        this function runs.
 
+    `OPENCODE_CONFIG` is set to `<project_root>/opencode.json` when that
+    file exists, so every invocation — including a builder or auditor
+    whose `directory` is its own task worktree — resolves the same config
+    by absolute path, independent of what (if anything) the worktree has
+    checked out and of whether the file is git-tracked (see ADR 0032).
+    When no such file exists it is left unset, so OpenCode falls back to
+    its normal resolution and a project relying only on global config is
+    unaffected.
+
     Returns a new dict; never mutates `base_env`.
     """
     env = dict(base_env if base_env is not None else os.environ)
@@ -555,6 +564,11 @@ def build_agent_env(
     prefix = [entry for entry in prefix if entry not in existing_entries]
 
     env["PATH"] = os.pathsep.join([*prefix, *existing_entries])
+
+    opencode_config = project_root / "opencode.json"
+    if opencode_config.is_file():
+        env["OPENCODE_CONFIG"] = str(opencode_config)
+
     return env
 
 

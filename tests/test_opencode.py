@@ -211,6 +211,31 @@ def test_build_agent_env_defaults_to_os_environ(monkeypatch, tmp_path):
     assert "/usr/bin" in entries
 
 
+def test_build_agent_env_sets_opencode_config_when_file_present(tmp_path):
+    # With an opencode.json at the project root, every invocation --
+    # including a builder/auditor whose cwd is its own task worktree --
+    # must resolve that one file by absolute path (ADR 0032).
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text("{}", encoding="utf-8")
+    env = build_agent_env(tmp_path, base_env={"PATH": "/usr/bin"})
+    assert env["OPENCODE_CONFIG"] == str(config_path)
+
+
+def test_build_agent_env_omits_opencode_config_when_file_absent(tmp_path):
+    # No project opencode.json: leave OPENCODE_CONFIG unset so OpenCode
+    # falls back to its normal resolution (e.g. global config only).
+    env = build_agent_env(tmp_path, base_env={"PATH": "/usr/bin"})
+    assert "OPENCODE_CONFIG" not in env
+
+
+def test_build_agent_env_ignores_opencode_config_directory(tmp_path):
+    # A directory named opencode.json is not a config file; do not point
+    # OPENCODE_CONFIG at it.
+    (tmp_path / "opencode.json").mkdir()
+    env = build_agent_env(tmp_path, base_env={"PATH": "/usr/bin"})
+    assert "OPENCODE_CONFIG" not in env
+
+
 def test_server_starts_and_health_check(tmp_path):
     config = _argv_config(FAKE_OPENCODE_MODE="normal")
     with _FakeServer(tmp_path, config) as server:
