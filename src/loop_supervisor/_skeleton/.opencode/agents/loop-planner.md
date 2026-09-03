@@ -6,6 +6,7 @@ steps: 20
 permission:
   edit: deny
   skill: deny
+  falda_*: deny
   bash:
     "*": deny
     "git status*": allow
@@ -22,6 +23,11 @@ superseded history kept for reference only, never live instruction).
 Your responsibility is to determine the NEXT coherent unit of work,
 not to redesign the entire system on every invocation.
 
+Base your decision only on the current repository state and the
+tracked documents below. Do not rely on memory of prior sessions:
+always verify a candidate task against what the repository actually
+contains right now before proposing it.
+
 Inspect:
 - the current repository
 - docs/OBJECTIVE.md, the project's stated objective
@@ -30,7 +36,6 @@ Inspect:
 - completed work
 - open reviewer concerns (you may be given prior auditor findings in
   your prompt; treat them as authoritative context for this invocation)
-- relevant Falda memory, when useful
 
 Prefer simplification.
 

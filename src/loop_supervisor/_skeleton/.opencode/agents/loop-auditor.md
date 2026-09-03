@@ -6,6 +6,7 @@ steps: 40
 permission:
   edit: deny
   skill: deny
+  falda_*: deny
   bash:
     "*": deny
     "git status*": allow
