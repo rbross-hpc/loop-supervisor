@@ -1,5 +1,6 @@
 /AGENTS.md
 .env
+opencode.json
 
 # OpenCode local package install (node_modules etc.) — keep agents/config tracked
 /.opencode/node_modules/
