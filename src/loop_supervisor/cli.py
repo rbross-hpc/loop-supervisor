@@ -18,7 +18,8 @@ from dotenv import load_dotenv
 
 from .config import ConfigError, ProjectConfig, load_project_config
 from .doctor import validate_report
-from .git import GitError
+from .git import GitError, GitRepo
+from .history import PhaseHistoryRecorder, PruneError, prune_runs, select_prune_candidates
 from .input_providers import StdinInputProvider
 from .locking import LockError
 from .opencode import InvocationObserver
@@ -190,6 +191,31 @@ def _build_verbosity_hooks(verbosity: int) -> tuple[
     return observer, consumers, reporter.on_advance
 
 
+def _build_on_advance(
+    verbosity: int,
+) -> tuple[InvocationObserver | None, list[SessionEventConsumer], Callable[[AdvanceOutcome], None]]:
+    """Compose the always-on `PhaseHistoryRecorder` (ADR 0034) with
+    `-v`/`-vv`'s optional phase-transition reporter, one level below it:
+    history capture runs at every verbosity level, including 0 (the
+    default), independent of whether `-v` is passed.
+
+    Both callbacks are independently exception-safe
+    (`PhaseHistoryRecorder.on_advance` never raises; `Supervisor.run`
+    additionally catches whatever a callback raises anyway), so calling
+    both unconditionally here cannot let one silently mask the other's
+    failure to run.
+    """
+    verbosity_observer, consumers, verbosity_on_advance = _build_verbosity_hooks(verbosity)
+    recorder_on_advance = PhaseHistoryRecorder().on_advance
+
+    def on_advance(outcome: AdvanceOutcome) -> None:
+        recorder_on_advance(outcome)
+        if verbosity_on_advance is not None:
+            verbosity_on_advance(outcome)
+
+    return verbosity_observer, consumers, on_advance
+
+
 def _resolve_max_steps(args: argparse.Namespace) -> int | None:
     if getattr(args, "step", False):
         return 1
@@ -309,7 +335,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    observer, consumers, on_advance = _build_verbosity_hooks(getattr(args, "verbose", 0))
+    observer, consumers, on_advance = _build_on_advance(getattr(args, "verbose", 0))
 
     try:
         with _bridge_sigterm_to_keyboard_interrupt():
@@ -384,7 +410,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         )
         return 1
 
-    observer, consumers, on_advance = _build_verbosity_hooks(getattr(args, "verbose", 0))
+    observer, consumers, on_advance = _build_on_advance(getattr(args, "verbose", 0))
 
     try:
         with _bridge_sigterm_to_keyboard_interrupt():
@@ -407,6 +433,77 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if paused is not None:
         print(paused)
     return 0 if final.phase == "done" else 1
+
+
+def cmd_runs_prune(args: argparse.Namespace) -> int:
+    """Delete saved run state, phase history, and (optionally)
+    verification logs for old or explicitly named runs (ADR 0034).
+
+    Selection is `--run <id>...` (exact runs, ignoring
+    `--keep-last`/`--older-than`) or `--keep-last`/`--older-than` (either
+    or both, applied together, over every saved run). Always dry-run
+    unless `--yes` is passed, so an operator sees exactly what would be
+    removed before committing to it. Refuses outright while any
+    supervisor lock is present (see `locking.lock_is_present`).
+    """
+    if args.run and (args.keep_last is not None or args.older_than is not None):
+        print(
+            "error: --run is mutually exclusive with --keep-last/--older-than",
+            file=sys.stderr,
+        )
+        return 1
+
+    project_root = _project_root(args.project)
+
+    try:
+        repo = GitRepo(project_root)
+    except GitError as exc:
+        print(f"error: cannot open repository: {exc}", file=sys.stderr)
+        return 1
+    git_common_dir = repo.common_dir()
+
+    try:
+        candidates = select_prune_candidates(
+            git_common_dir,
+            keep_last=args.keep_last,
+            older_than_days=args.older_than,
+            run_ids=args.run if args.run else None,
+        )
+    except StateError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if not candidates:
+        print("no runs selected for pruning")
+        return 0
+
+    action = "would remove" if not args.yes else "removing"
+    for candidate in candidates:
+        extras = []
+        if candidate.has_history:
+            extras.append("history")
+        if candidate.has_verification:
+            extras.append("verification" if args.include_verification else "verification(kept)")
+        suffix = f" [{', '.join(extras)}]" if extras else ""
+        print(
+            f"{action}: {candidate.run_id} (phase={candidate.phase}, "
+            f"updated_at={candidate.updated_at}){suffix}"
+        )
+
+    if not args.yes:
+        print(f"\n{len(candidates)} run(s) selected; re-run with --yes to actually delete")
+        return 0
+
+    try:
+        removed = prune_runs(
+            git_common_dir, candidates, include_verification=args.include_verification
+        )
+    except PruneError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"removed {len(removed)} run(s)")
+    return 0
 
 
 def _skeleton_root() -> importlib.resources.abc.Traversable:
@@ -648,6 +745,46 @@ def build_parser() -> argparse.ArgumentParser:
     _add_step_control_arguments(resume_parser)
     _add_verbosity_arguments(resume_parser)
     resume_parser.set_defaults(func=cmd_resume)
+
+    runs_parser = sub.add_parser("runs", help="Inspect or clean up saved run state")
+    runs_sub = runs_parser.add_subparsers(dest="runs_command", required=True)
+    prune_parser = runs_sub.add_parser(
+        "prune", help="Delete saved state/history for old or named runs (ADR 0034)"
+    )
+    prune_parser.add_argument("--project", default=None, help="Path to the integration repo")
+    prune_parser.add_argument(
+        "--run",
+        action="append",
+        default=None,
+        metavar="RUN_ID",
+        help="Prune exactly these run IDs (repeatable); mutually exclusive with "
+        "--keep-last/--older-than",
+    )
+    prune_parser.add_argument(
+        "--keep-last",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Keep the N most recently updated runs, select the rest",
+    )
+    prune_parser.add_argument(
+        "--older-than",
+        type=float,
+        default=None,
+        metavar="DAYS",
+        help="Select only runs last updated more than DAYS days ago",
+    )
+    prune_parser.add_argument(
+        "--include-verification",
+        action="store_true",
+        help="Also delete verification/<run_id>/ logs (kept by default)",
+    )
+    prune_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually delete (default is a dry run that only prints what would be removed)",
+    )
+    prune_parser.set_defaults(func=cmd_runs_prune)
 
     tui_parser = sub.add_parser("tui", help="Open the Textual TUI")
     tui_parser.add_argument("--project", default=None, help="Path to the integration repo")

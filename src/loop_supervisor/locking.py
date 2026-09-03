@@ -80,6 +80,19 @@ def _guard_path(git_common_dir: Path) -> Path:
     return git_common_dir / "loop-supervisor" / "supervisor.lock.guard"
 
 
+def lock_is_present(git_common_dir: Path) -> bool:
+    """True if a lock file exists at all, valid or not, live or stale.
+
+    Deliberately coarser than `SupervisorLock.acquire`'s stale/dead-pid
+    recovery logic: a caller that only wants to know "is it safe to
+    delete run history right now" (e.g. `loop-supervisor runs prune`)
+    should refuse whenever *any* lock record is present, rather than
+    attempt to classify it as live/stale/remote/malformed itself and
+    risk deleting history for a run whose lock this check misjudged.
+    """
+    return _lock_path(git_common_dir).exists()
+
+
 def _required_open_flag(name: str) -> int:
     """Return a required secure-open flag, or fail closed if unavailable."""
     value = getattr(os, name, None)
