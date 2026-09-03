@@ -86,7 +86,13 @@ class _FakeSupervisor:
         self._log.append("resume")
         return state
 
-    def run(self, state: _FakeState, *, max_steps: int | None = None) -> _FakeState:
+    def run(
+        self,
+        state: _FakeState,
+        *,
+        max_steps: int | None = None,
+        on_advance: object = None,
+    ) -> _FakeState:
         self._log.append("run")
         state.phase = self._final_phase
         return state
@@ -163,7 +169,7 @@ def _patch_runtime(repo: GitRepo, *, call_log: list[str], final_phase: str = "do
             call_log.append("resume")
             return state
 
-        def run(self, state, *, max_steps=None):
+        def run(self, state, *, max_steps=None, on_advance=None):
             call_log.append("run")
             state.phase = final_phase
             return state
@@ -311,7 +317,7 @@ def test_run_new_uses_runtime_not_supervisor_directly(tmp_path):
             state.options = _make_options()
             return state
 
-        def run(self, state, *, max_steps=None):
+        def run(self, state, *, max_steps=None, on_advance=None):
             called.append("run")
             return state
 
@@ -568,7 +574,7 @@ def test_run_new_reports_denied_permissions_even_on_operational_failure(tmp_path
             state.options = _make_options()
             return state
 
-        def run(self, state, *, max_steps=None):
+        def run(self, state, *, max_steps=None, on_advance=None):
             raise LoopError("simulated operational failure")
 
         @property
@@ -579,15 +585,15 @@ def test_run_new_reports_denied_permissions_even_on_operational_failure(tmp_path
         def runner(self, value):
             pass
 
+    fake_monitor_cls, fake_policy_cls = _fake_monitor_and_policy_classes(
+        call_log, denied_count=3, denied_summary=["external_directory"]
+    )
     mp = pytest.MonkeyPatch()
     mp.setattr(rt, "GitRepo", FakeGitRepo)
     mp.setattr(rt, "OpenCodeServer", FakeOCServer)
     mp.setattr(rt, "Supervisor", FakeSupervisor)
-    mp.setattr(
-        rt,
-        "PermissionDenier",
-        _fake_denier_class(call_log, denied_count=3, denied_summary=["external_directory"]),
-    )
+    mp.setattr(rt, "SessionMonitor", fake_monitor_cls)
+    mp.setattr(rt, "PermissionPolicy", fake_policy_cls)
     try:
         with pytest.raises(LoopError):
             run_new(tmp_path / "repo", _make_options())
@@ -638,7 +644,7 @@ def test_run_resume_reports_denied_permissions_even_on_operational_failure(tmp_p
         def resume(self, state):
             return state
 
-        def run(self, state, *, max_steps=None):
+        def run(self, state, *, max_steps=None, on_advance=None):
             raise LoopError("simulated operational failure")
 
         @property
@@ -649,16 +655,16 @@ def test_run_resume_reports_denied_permissions_even_on_operational_failure(tmp_p
         def runner(self, value):
             pass
 
+    fake_monitor_cls, fake_policy_cls = _fake_monitor_and_policy_classes(
+        call_log, denied_count=1, denied_summary=["bash"]
+    )
     mp = pytest.MonkeyPatch()
     mp.setattr(rt, "GitRepo", FakeGitRepo)
     mp.setattr(rt, "OpenCodeServer", FakeOCServer)
     mp.setattr(rt, "Supervisor", FakeSupervisor)
     mp.setattr(rt, "load_state", lambda *a, **k: fake_state)
-    mp.setattr(
-        rt,
-        "PermissionDenier",
-        _fake_denier_class(call_log, denied_count=1, denied_summary=["bash"]),
-    )
+    mp.setattr(rt, "SessionMonitor", fake_monitor_cls)
+    mp.setattr(rt, "PermissionPolicy", fake_policy_cls)
     try:
         with pytest.raises(LoopError):
             run_resume(tmp_path / "repo", "fake-run")
@@ -833,7 +839,7 @@ def test_run_new_supervisor_failure_takes_precedence_over_server_stop_failure(tm
         def add_observer(self, obs):
             pass
 
-    def _boom_run(self, state, *, max_steps=None):
+    def _boom_run(self, state, *, max_steps=None, on_advance=None):
         raise LoopError("simulated supervisor failure")
 
     mp = pytest.MonkeyPatch()
@@ -902,7 +908,7 @@ def test_run_new_successful_run_failed_stop_retains_lock(tmp_path):
         def add_observer(self, obs):
             pass
 
-    def _fake_run(self, state, *, max_steps=None):
+    def _fake_run(self, state, *, max_steps=None, on_advance=None):
         state.phase = "done"
         return state
 
@@ -952,7 +958,7 @@ def test_run_new_successful_run_failed_stop_with_unprintable_str_retains_lock(tm
         def add_observer(self, obs):
             pass
 
-    def _fake_run(self, state, *, max_steps=None):
+    def _fake_run(self, state, *, max_steps=None, on_advance=None):
         state.phase = "done"
         return state
 
@@ -996,7 +1002,7 @@ def test_run_new_failed_run_and_failed_stop_preserves_run_exception_and_retains_
         def add_observer(self, obs):
             pass
 
-    def _boom_run(self, state, *, max_steps=None):
+    def _boom_run(self, state, *, max_steps=None, on_advance=None):
         raise LoopError("simulated supervisor failure")
 
     mp = pytest.MonkeyPatch()
@@ -1104,7 +1110,7 @@ def test_run_resume_successful_run_failed_stop_retains_lock(tmp_path):
         def add_observer(self, obs):
             pass
 
-    def _fake_run(self, state, *, max_steps=None):
+    def _fake_run(self, state, *, max_steps=None, on_advance=None):
         state.phase = "done"
         return state
 
@@ -1204,9 +1210,9 @@ def test_run_new_relative_project_path_uses_canonical_lock_metadata(tmp_path, mo
 
     original_run_to_completion = rt.RunSession.run_to_completion
 
-    def _capture(self, *, max_steps=None):
+    def _capture(self, *, max_steps=None, on_advance=None):
         captured["record"] = json.loads(_lock_path(repo.common_dir()).read_text())
-        return original_run_to_completion(self, max_steps=max_steps)
+        return original_run_to_completion(self, max_steps=max_steps, on_advance=on_advance)
 
     monkeypatch.setattr(rt.RunSession, "run_to_completion", _capture)
 
@@ -1926,7 +1932,7 @@ def test_run_new_successful_run_transient_cleanup_failure_then_success(tmp_path,
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     Server = _flaky_stop_server(fail_times=1)
 
-    def _fake_run(self, state, *, max_steps=None):
+    def _fake_run(self, state, *, max_steps=None, on_advance=None):
         state.phase = "done"
         return state
 
@@ -1952,7 +1958,7 @@ def test_run_new_successful_run_cleanup_exhaustion_retains_lock(tmp_path, monkey
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     Server = _flaky_stop_server(fail_times=999)
 
-    def _fake_run(self, state, *, max_steps=None):
+    def _fake_run(self, state, *, max_steps=None, on_advance=None):
         state.phase = "done"
         return state
 
@@ -1984,7 +1990,7 @@ def test_run_new_failed_run_transient_cleanup_failure_then_success(tmp_path, mon
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     Server = _flaky_stop_server(fail_times=1)
 
-    def _boom_run(self, state, *, max_steps=None):
+    def _boom_run(self, state, *, max_steps=None, on_advance=None):
         raise LoopError("simulated supervisor failure")
 
     mp = pytest.MonkeyPatch()
@@ -2020,7 +2026,7 @@ def test_run_new_failed_run_cleanup_exhaustion_retains_exact_primary_with_notes(
 
     the_failure = LoopError("simulated supervisor failure")
 
-    def _boom_run(self, state, *, max_steps=None):
+    def _boom_run(self, state, *, max_steps=None, on_advance=None):
         raise the_failure
 
     mp = pytest.MonkeyPatch()
@@ -2063,7 +2069,7 @@ def test_run_new_run_time_keyboard_interrupt_preserves_identity(tmp_path):
 
     the_interrupt = KeyboardInterrupt()
 
-    def _boom_run(self, state, *, max_steps=None):
+    def _boom_run(self, state, *, max_steps=None, on_advance=None):
         raise the_interrupt
 
     mp = pytest.MonkeyPatch()
@@ -2103,7 +2109,7 @@ def test_run_new_cleanup_time_keyboard_interrupt_does_not_replace_primary(tmp_pa
 
     the_failure = LoopError("simulated supervisor failure")
 
-    def _boom_run(self, state, *, max_steps=None):
+    def _boom_run(self, state, *, max_steps=None, on_advance=None):
         raise the_failure
 
     mp = pytest.MonkeyPatch()
@@ -2191,7 +2197,7 @@ def test_run_new_lock_release_failure_with_existing_primary_attaches_note(tmp_pa
 
     the_failure = LoopError("simulated supervisor failure")
 
-    def _boom_run(self, state, *, max_steps=None):
+    def _boom_run(self, state, *, max_steps=None, on_advance=None):
         raise the_failure
 
     def _boom_release(self):
@@ -2242,7 +2248,7 @@ def test_run_new_lock_release_failure_with_unprintable_str_attaches_safe_note(
 
     the_failure = LoopError("simulated supervisor failure")
 
-    def _boom_run(self, state, *, max_steps=None):
+    def _boom_run(self, state, *, max_steps=None, on_advance=None):
         raise the_failure
 
     class _UnprintableLockError(LockError):
@@ -2301,7 +2307,7 @@ def test_lock_file_released_only_after_confirmed_cleanup(tmp_path, monkeypatch):
         def add_observer(self, obs) -> None:
             pass
 
-    def _fake_run(self, state, *, max_steps=None):
+    def _fake_run(self, state, *, max_steps=None, on_advance=None):
         state.phase = "done"
         return state
 
@@ -2383,7 +2389,7 @@ def test_run_new_uses_supplied_input_provider(tmp_path):
             state.options = _make_options()
             return state
 
-        def run(self, state, *, max_steps=None):
+        def run(self, state, *, max_steps=None, on_advance=None):
             return state
 
         @property
@@ -2451,7 +2457,7 @@ def test_run_new_defaults_to_stdin_input_provider_when_not_supplied(tmp_path):
             state.options = _make_options()
             return state
 
-        def run(self, state, *, max_steps=None):
+        def run(self, state, *, max_steps=None, on_advance=None):
             return state
 
         @property
@@ -2565,7 +2571,7 @@ def test_characterize_run_failure_stop_attempts_are_bounded(tmp_path, monkeypatc
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     counter = [0]
 
-    def _boom_run(self, state, *, max_steps=None):
+    def _boom_run(self, state, *, max_steps=None, on_advance=None):
         raise LoopError("simulated supervisor failure")
 
     mp = pytest.MonkeyPatch()
@@ -2594,7 +2600,7 @@ def test_characterize_successful_run_stop_attempts_are_bounded(tmp_path, monkeyp
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     counter = [0]
 
-    def _ok_run(self, state, *, max_steps=None):
+    def _ok_run(self, state, *, max_steps=None, on_advance=None):
         state.phase = "done"
         return state
 
@@ -2630,7 +2636,7 @@ def test_characterize_run_failure_unresolved_cleanup_note_exact_wording(tmp_path
     counter = [0]
     the_failure = LoopError("simulated supervisor failure")
 
-    def _boom_run(self, state, *, max_steps=None):
+    def _boom_run(self, state, *, max_steps=None, on_advance=None):
         raise the_failure
 
     mp = pytest.MonkeyPatch()
@@ -2702,7 +2708,7 @@ def test_characterize_successful_run_unresolved_cleanup_message_exact_wording(
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     counter = [0]
 
-    def _ok_run(self, state, *, max_steps=None):
+    def _ok_run(self, state, *, max_steps=None, on_advance=None):
         state.phase = "done"
         return state
 
@@ -2936,7 +2942,7 @@ def _patched_session_env(repo, *, server_cls=None, supervisor_cls=None, call_log
                 phase_after="done",
             )
 
-        def run(self, state, *, max_steps=None):
+        def run(self, state, *, max_steps=None, on_advance=None):
             call_log.append("run")
             state.phase = "done"
             return state
@@ -3094,7 +3100,7 @@ def test_run_session_run_to_completion_passes_max_steps_through(tmp_path):
             state.options = _make_options()
             return state
 
-        def run(self, state, *, max_steps=None):
+        def run(self, state, *, max_steps=None, on_advance=None):
             received.append(max_steps)
             state.phase = "done"
             return state
@@ -3134,7 +3140,7 @@ def test_run_new_passes_max_steps_through_to_supervisor_run(tmp_path):
             state.options = _make_options()
             return state
 
-        def run(self, state, *, max_steps=None):
+        def run(self, state, *, max_steps=None, on_advance=None):
             received.append(max_steps)
             state.phase = "done"
             return state
@@ -3174,7 +3180,7 @@ def test_run_session_run_to_completion_stops_early_without_error_and_cleans_up(t
             state.options = _make_options()
             return state
 
-        def run(self, state, *, max_steps=None):
+        def run(self, state, *, max_steps=None, on_advance=None):
             call_log.append(f"run:max_steps={max_steps}")
             # Simulate stopping one step short of a terminal phase.
             state.phase = "building"
@@ -4336,7 +4342,7 @@ def test_resume_run_session_full_lifecycle(tmp_path):
 
     original_resume = Supervisor.resume
 
-    def _ok_run(self, state, *, max_steps=None):
+    def _ok_run(self, state, *, max_steps=None, on_advance=None):
         state.phase = "done"
         return state
 
@@ -4620,7 +4626,7 @@ def test_close_exit_success_path_wording_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(rt.time, "sleep", lambda s: None)
     counter = [0]
 
-    def _ok_run(self, state, *, max_steps=None):
+    def _ok_run(self, state, *, max_steps=None, on_advance=None):
         state.phase = "done"
         return state
 
@@ -4653,7 +4659,7 @@ def test_close_exit_failure_path_wording_unchanged(tmp_path, monkeypatch):
     counter = [0]
     the_failure = LoopError("simulated supervisor failure")
 
-    def _boom_run(self, state, *, max_steps=None):
+    def _boom_run(self, state, *, max_steps=None, on_advance=None):
         raise the_failure
 
     mp = pytest.MonkeyPatch()
@@ -5659,7 +5665,7 @@ def _blocking_run_supervisor_cls(release_event, entered_run_event):
             state.options = _make_options()
             return state
 
-        def run(self, state, *, max_steps=None):
+        def run(self, state, *, max_steps=None, on_advance=None):
             entered_run_event.set()
             release_event.wait(timeout=5)
             state.phase = "done"
@@ -5738,7 +5744,7 @@ def test_raising_run_to_completion_still_releases_the_quiescence_barrier(tmp_pat
             state.options = _make_options()
             return state
 
-        def run(self, state, *, max_steps=None):
+        def run(self, state, *, max_steps=None, on_advance=None):
             raise RuntimeError("run boom")
 
         @property
@@ -5932,24 +5938,23 @@ def test_stop_server_during_blocked_run_to_completion_does_not_deadlock(tmp_path
             assert not run_thread.is_alive()
 
 
-# --- PermissionDenier wiring (headless permission-ask hang, backlog #27) ---
+# --- SessionMonitor/PermissionPolicy wiring (headless permission-ask hang, backlog #27) ---
 
 
-def _fake_denier_class(call_log: list[str], *, denied_count: int = 0, denied_summary=None):
-    """A stand-in for permissions.PermissionDenier that records its own
-    lifecycle calls in `call_log` without any real HTTP/SSE activity."""
+def _fake_monitor_and_policy_classes(
+    call_log: list[str], *, denied_count: int = 0, denied_summary=None
+):
+    """Stand-ins for permissions.SessionMonitor/PermissionPolicy that
+    record their own lifecycle calls in `call_log` without any real
+    HTTP/SSE activity. Returns (FakeSessionMonitor, FakePermissionPolicy)
+    for use with two separate monkeypatch.setattr calls, mirroring how
+    start_server() constructs both independently."""
 
-    class FakeDenier:
+    class FakePermissionPolicy:
         def __init__(self, base_url: str) -> None:
-            call_log.append(f"denier_init:{base_url}")
+            call_log.append(f"policy_init:{base_url}")
             self._denied_count = denied_count
             self._denied_summary = list(denied_summary or [])
-
-        def start(self) -> None:
-            call_log.append("denier_start")
-
-        def stop(self) -> None:
-            call_log.append("denier_stop")
 
         @property
         def denied_count(self) -> int:
@@ -5959,11 +5964,21 @@ def _fake_denier_class(call_log: list[str], *, denied_count: int = 0, denied_sum
         def denied_summary(self) -> list[str]:
             return list(self._denied_summary)
 
-    return FakeDenier
+    class FakeSessionMonitor:
+        def __init__(self, base_url: str, *, consumers=None) -> None:
+            call_log.append(f"monitor_init:{base_url}")
+
+        def start(self) -> None:
+            call_log.append("monitor_start")
+
+        def stop(self) -> None:
+            call_log.append("monitor_stop")
+
+    return FakeSessionMonitor, FakePermissionPolicy
 
 
-def test_start_server_starts_permission_denier_with_server_base_url(tmp_path):
-    """start_server() must construct and start a PermissionDenier against
+def test_start_server_starts_session_monitor_with_server_base_url(tmp_path):
+    """start_server() must construct and start a SessionMonitor against
     the server's own base_url once it is known -- this is the sole seam
     that closes the headless permission.asked hang (backlog #27); SSE is
     otherwise TUI-only."""
@@ -5972,6 +5987,7 @@ def test_start_server_starts_permission_denier_with_server_base_url(tmp_path):
 
     call_log: list[str] = []
     fake_server = _FakeServer(call_log)
+    fake_monitor_cls, fake_policy_cls = _fake_monitor_and_policy_classes(call_log)
 
     class FakeOCServer:
         def __init__(self, *a, **kw):
@@ -5982,30 +5998,32 @@ def test_start_server_starts_permission_denier_with_server_base_url(tmp_path):
 
     mp = pytest.MonkeyPatch()
     mp.setattr(rt, "OpenCodeServer", FakeOCServer)
-    mp.setattr(rt, "PermissionDenier", _fake_denier_class(call_log))
+    mp.setattr(rt, "SessionMonitor", fake_monitor_cls)
+    mp.setattr(rt, "PermissionPolicy", fake_policy_cls)
     try:
         session = rt.new_run_session(tmp_path / "repo", _make_options())
         with session:
             session.start_server()
-            assert f"denier_init:{fake_server.base_url}" in call_log
-            assert "denier_start" in call_log
+            assert f"monitor_init:{fake_server.base_url}" in call_log
+            assert "monitor_start" in call_log
     finally:
         mp.undo()
 
-    assert "denier_stop" in call_log
-    assert call_log.index("denier_start") < call_log.index("denier_stop")
+    assert "monitor_stop" in call_log
+    assert call_log.index("monitor_start") < call_log.index("monitor_stop")
 
 
-def test_close_stops_permission_denier_before_server(tmp_path):
-    """The denier's SSE subscription must be torn down before the
+def test_close_stops_session_monitor_before_server(tmp_path):
+    """The monitor's SSE subscription must be torn down before the
     server itself is stopped, not after: stopping the server first
-    would leave the denier's SSE client trying to read from a socket
+    would leave the monitor's SSE client trying to read from a socket
     the server has already closed."""
     _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
     call_log: list[str] = []
     fake_server = _FakeServer(call_log)
+    fake_monitor_cls, fake_policy_cls = _fake_monitor_and_policy_classes(call_log)
 
     class FakeOCServer:
         def __init__(self, *a, **kw):
@@ -6016,7 +6034,8 @@ def test_close_stops_permission_denier_before_server(tmp_path):
 
     mp = pytest.MonkeyPatch()
     mp.setattr(rt, "OpenCodeServer", FakeOCServer)
-    mp.setattr(rt, "PermissionDenier", _fake_denier_class(call_log))
+    mp.setattr(rt, "SessionMonitor", fake_monitor_cls)
+    mp.setattr(rt, "PermissionPolicy", fake_policy_cls)
     try:
         session = rt.new_run_session(tmp_path / "repo", _make_options())
         with session:
@@ -6024,20 +6043,23 @@ def test_close_stops_permission_denier_before_server(tmp_path):
     finally:
         mp.undo()
 
-    assert call_log.index("denier_stop") < call_log.index("server_stop")
+    assert call_log.index("monitor_stop") < call_log.index("server_stop")
 
 
 def test_denied_permission_count_and_summary_readable_after_close(tmp_path):
     """denied_permission_count/_summary must remain readable from the
     session after the `with` block (and thus close()) has already run,
     since callers inspect them after run_to_completion() returns and
-    the `with` exits -- close() must snapshot before tearing the denier
-    down."""
+    the `with` exits -- close() must snapshot before tearing the session
+    monitor down."""
     _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
     call_log: list[str] = []
     fake_server = _FakeServer(call_log)
+    fake_monitor_cls, fake_policy_cls = _fake_monitor_and_policy_classes(
+        call_log, denied_count=2, denied_summary=["bash", "edit"]
+    )
 
     class FakeOCServer:
         def __init__(self, *a, **kw):
@@ -6048,11 +6070,8 @@ def test_denied_permission_count_and_summary_readable_after_close(tmp_path):
 
     mp = pytest.MonkeyPatch()
     mp.setattr(rt, "OpenCodeServer", FakeOCServer)
-    mp.setattr(
-        rt,
-        "PermissionDenier",
-        _fake_denier_class(call_log, denied_count=2, denied_summary=["bash", "edit"]),
-    )
+    mp.setattr(rt, "SessionMonitor", fake_monitor_cls)
+    mp.setattr(rt, "PermissionPolicy", fake_policy_cls)
     session = rt.new_run_session(tmp_path / "repo", _make_options())
     try:
         with session:
@@ -6067,7 +6086,7 @@ def test_denied_permission_count_and_summary_readable_after_close(tmp_path):
 
 
 def test_denied_permission_count_zero_before_start_server(tmp_path):
-    """Before start_server() has ever run (no denier constructed yet),
+    """Before start_server() has ever run (no monitor constructed yet),
     denied_permission_count/_summary must report empty defaults rather
     than raising."""
     import loop_supervisor.runtime as rt
@@ -6087,6 +6106,9 @@ def test_run_new_prints_denial_diagnostic_to_stderr(tmp_path, capsys):
     import loop_supervisor.runtime as rt
 
     call_log: list[str] = []
+    fake_monitor_cls, fake_policy_cls = _fake_monitor_and_policy_classes(
+        call_log, denied_count=3, denied_summary=["bash"]
+    )
 
     class FakeOCServer:
         def __init__(self, *a, **kw):
@@ -6103,11 +6125,8 @@ def test_run_new_prints_denial_diagnostic_to_stderr(tmp_path, capsys):
 
     mp = pytest.MonkeyPatch()
     mp.setattr(rt, "OpenCodeServer", FakeOCServer)
-    mp.setattr(
-        rt,
-        "PermissionDenier",
-        _fake_denier_class(call_log, denied_count=3, denied_summary=["bash"]),
-    )
+    mp.setattr(rt, "SessionMonitor", fake_monitor_cls)
+    mp.setattr(rt, "PermissionPolicy", fake_policy_cls)
     try:
         run_new(tmp_path / "repo", _make_options(max_accepted_tasks=0), max_steps=1)
     finally:
@@ -6119,12 +6138,13 @@ def test_run_new_prints_denial_diagnostic_to_stderr(tmp_path, capsys):
 
 
 def test_run_new_prints_nothing_when_no_permissions_were_denied(tmp_path, capsys):
-    """When the denier never sees a permission.asked event, run_new()
+    """When the policy never sees a permission.asked event, run_new()
     must not print a denial line at all."""
     _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
     call_log: list[str] = []
+    fake_monitor_cls, fake_policy_cls = _fake_monitor_and_policy_classes(call_log)
 
     class FakeOCServer:
         def __init__(self, *a, **kw):
@@ -6141,7 +6161,8 @@ def test_run_new_prints_nothing_when_no_permissions_were_denied(tmp_path, capsys
 
     mp = pytest.MonkeyPatch()
     mp.setattr(rt, "OpenCodeServer", FakeOCServer)
-    mp.setattr(rt, "PermissionDenier", _fake_denier_class(call_log))
+    mp.setattr(rt, "SessionMonitor", fake_monitor_cls)
+    mp.setattr(rt, "PermissionPolicy", fake_policy_cls)
     try:
         run_new(tmp_path / "repo", _make_options(max_accepted_tasks=0), max_steps=1)
     finally:
@@ -6151,14 +6172,14 @@ def test_run_new_prints_nothing_when_no_permissions_were_denied(tmp_path, capsys
     assert "denied" not in captured.err
 
 
-def test_denier_start_failure_does_not_fail_start_server(tmp_path, capsys):
-    """A PermissionDenier that raises from start() must not prevent
-    start_server() from succeeding -- a denier fault must never fail an
+def test_monitor_start_failure_does_not_fail_start_server(tmp_path, capsys):
+    """A SessionMonitor that raises from start() must not prevent
+    start_server() from succeeding -- a monitor fault must never fail an
     otherwise-healthy run, matching sse.py's own non-fatal contract. But
     the failure must still be visible on stderr: a silently-swallowed
-    denier-start failure is indistinguishable from a healthy denier that
-    simply saw no asks, which is precisely the ambiguity that made an
-    early live verification run inconclusive."""
+    monitor-start failure is indistinguishable from a healthy monitor
+    that simply saw no asks, which is precisely the ambiguity that made
+    an early live verification run inconclusive."""
     _init_repo(tmp_path / "repo")
     import loop_supervisor.runtime as rt
 
@@ -6172,19 +6193,19 @@ def test_denier_start_failure_does_not_fail_start_server(tmp_path, capsys):
         def __new__(cls, *a, **kw):
             return fake_server
 
-    class BoomDenier:
-        def __init__(self, base_url: str) -> None:
+    class BoomMonitor:
+        def __init__(self, base_url: str, *, consumers=None) -> None:
             pass
 
         def start(self) -> None:
-            raise RuntimeError("denier boom")
+            raise RuntimeError("monitor boom")
 
         def stop(self) -> None:
             pass
 
     mp = pytest.MonkeyPatch()
     mp.setattr(rt, "OpenCodeServer", FakeOCServer)
-    mp.setattr(rt, "PermissionDenier", BoomDenier)
+    mp.setattr(rt, "SessionMonitor", BoomMonitor)
     try:
         session = rt.new_run_session(tmp_path / "repo", _make_options())
         with session:
@@ -6195,5 +6216,5 @@ def test_denier_start_failure_does_not_fail_start_server(tmp_path, capsys):
         mp.undo()
 
     captured = capsys.readouterr()
-    assert "permission denier failed to start" in captured.err
-    assert "denier boom" in captured.err
+    assert "session monitor failed to start" in captured.err
+    assert "monitor boom" in captured.err

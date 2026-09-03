@@ -42,10 +42,10 @@ def render_durable_summary(
     """`denied_permission_count`/`denied_permission_summary` come from
     `RunSession.denied_permission_count`/`denied_permission_summary`
     (`runtime.py`), not from `RunState` -- the headless permission
-    denier's tally is an in-memory diagnostic, never persisted. See
-    backlog item 31 and ADR 0021 for why the TUI runs this same denier
-    (via `RunSession.start_server()`) without previously surfacing what
-    it denied."""
+    policy's tally is an in-memory diagnostic, never persisted. See
+    backlog item 31 and ADR 0021 for why the TUI runs this same session
+    monitor (via `RunSession.start_server()`) without previously
+    surfacing what it denied."""
     grid = Table.grid(padding=(0, 1))
     grid.add_column(style="dim", min_width=18)
     grid.add_column()

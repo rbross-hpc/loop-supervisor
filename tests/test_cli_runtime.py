@@ -624,6 +624,111 @@ def test_build_parser_accepts_max_steps_on_resume():
     assert args.max_steps == 5
 
 
+def test_build_parser_verbose_defaults_to_zero_for_run():
+    parser = cli_mod.build_parser()
+    args = parser.parse_args(["run"])
+    assert args.verbose == 0
+
+
+def test_build_parser_counts_repeated_v_for_run():
+    parser = cli_mod.build_parser()
+    assert parser.parse_args(["run", "-v"]).verbose == 1
+    assert parser.parse_args(["run", "-vv"]).verbose == 2
+    assert parser.parse_args(["run", "-v", "-v"]).verbose == 2
+    assert parser.parse_args(["run", "--verbose", "--verbose"]).verbose == 2
+
+
+def test_build_parser_counts_repeated_v_for_resume():
+    parser = cli_mod.build_parser()
+    assert parser.parse_args(["resume", "run-1", "-vv"]).verbose == 2
+
+
+def test_build_verbosity_hooks_returns_all_none_at_zero():
+    observer, consumers, on_advance = cli_mod._build_verbosity_hooks(0)
+    assert observer is None
+    assert consumers == []
+    assert on_advance is None
+
+
+def test_build_verbosity_hooks_at_one_returns_reporter_only():
+    observer, consumers, on_advance = cli_mod._build_verbosity_hooks(1)
+    assert isinstance(observer, cli_mod.VerboseReporter)
+    assert consumers == []
+    assert on_advance is not None
+
+
+def test_build_verbosity_hooks_at_two_adds_stats_consumer_and_composite_observer():
+    observer, consumers, on_advance = cli_mod._build_verbosity_hooks(2)
+    assert isinstance(observer, cli_mod.CompositeInvocationObserver)
+    assert len(consumers) == 1
+    assert isinstance(consumers[0], cli_mod.StatsConsumer)
+    assert on_advance is not None
+
+
+def test_cmd_run_passes_verbosity_hooks_to_run_new(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeState:
+        run_id = "run-1"
+        phase = "done"
+
+    def fake_run_new(*args, **kwargs):
+        captured.update(kwargs)
+        return FakeState()
+
+    monkeypatch.setattr(cli_mod, "run_new", fake_run_new)
+    rc = cli_mod.cmd_run(_run_args(tmp_path, verbose=1))
+
+    assert rc == 0
+    assert isinstance(captured["server_observer"], cli_mod.VerboseReporter)
+    assert captured["session_event_consumers"] == []
+    assert captured["on_advance"] is not None
+
+
+def test_cmd_run_omits_verbosity_hooks_when_not_requested(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeState:
+        run_id = "run-1"
+        phase = "done"
+
+    def fake_run_new(*args, **kwargs):
+        captured.update(kwargs)
+        return FakeState()
+
+    monkeypatch.setattr(cli_mod, "run_new", fake_run_new)
+    rc = cli_mod.cmd_run(_run_args(tmp_path, verbose=0))
+
+    assert rc == 0
+    assert captured["server_observer"] is None
+    assert captured["session_event_consumers"] == []
+    assert captured["on_advance"] is None
+
+
+def test_cmd_resume_passes_verbosity_hooks_to_run_resume(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeState:
+        run_id = "run-1"
+        phase = "done"
+
+    _stub_load_run(monkeypatch)
+
+    def fake_run_resume(*args, **kwargs):
+        captured.update(kwargs)
+        return FakeState()
+
+    monkeypatch.setattr(cli_mod, "run_resume", fake_run_resume)
+    rc = cli_mod.cmd_resume(_resume_args(tmp_path, verbose=2))
+
+    assert rc == 0
+    assert isinstance(captured["server_observer"], cli_mod.CompositeInvocationObserver)
+    consumers = captured["session_event_consumers"]
+    assert isinstance(consumers, list)
+    assert len(consumers) == 1
+    assert captured["on_advance"] is not None
+
+
 def test_cmd_tui_normalizes_prelaunch_errors(tmp_path, monkeypatch, capsys):
     import loop_supervisor.tui.app as app_mod
 
