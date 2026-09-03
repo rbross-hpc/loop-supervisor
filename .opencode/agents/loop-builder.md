@@ -6,6 +6,7 @@ steps: 80
 permission:
   edit: allow
   skill: deny
+  falda_*: deny
   bash:
     "*": allow
     "git merge*": deny
@@ -28,7 +29,6 @@ Before modifying code:
 - inspect the relevant existing code
 - understand the acceptance criteria
 - read applicable design documentation, including docs/decisions/
-- retrieve relevant Falda memory when necessary
 
 Follow the "Testing discipline" section of README.md for every test
 you write or extend (failing-first verification against the actual
