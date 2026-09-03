@@ -44,6 +44,54 @@ skeleton's own README template flags this exact spot. Search both
 `.md` files for those three tool names and update any prose mentions
 alongside the permission entries so the two stay consistent.
 
+## Optional: pin a per-role model
+
+Each `.opencode/agents/loop-*.md` file carries a YAML frontmatter block,
+and any role may pin the model it runs on with an optional `model:` line
+alongside the other frontmatter keys:
+
+```yaml
+---
+description: Resolves an escalated design decision. Read-only.
+mode: primary
+model: anthropic/claude-opus-4
+temperature: 0.1
+steps: 30
+permission:
+  edit: deny
+  skill: deny
+  bash:
+    "*": deny
+    "git status*": allow
+    "git log*": allow
+    "git diff*": allow
+    "git show*": allow
+---
+```
+
+The value is a `provider/model-id` string, and it must name a model that
+the **adopted project's own** OpenCode config resolves — the provider in
+it has to be one that project actually has configured (globally in
+`~/.config/opencode/opencode.json` or in its own `opencode.json`), not
+necessarily the Argo provider this repository develops against.
+
+When a role has **no** `model:` line it inherits whatever the project's
+OpenCode config resolves as its default — this is the intended default
+(see ADR 0023, "Generated projects ship no provider configuration"), so
+leave all four unpinned unless you have a specific reason to pin one. In
+the generated skeleton the planner, builder, and auditor ship unpinned
+for exactly this reason; only the architect is pinnable out of the box
+(via `loop-supervisor init --architect-model provider/model-id`, which
+writes the same `model:` line the example above shows).
+
+Pin a role's model when you want it to differ from the default — most
+commonly giving the architect and auditor a stronger reasoning model
+than the planner and builder, since those two roles make the judgment
+calls (design decisions and accept/revise/replan verdicts) where model
+quality matters most. There is no supervisor-side model configuration:
+the agent frontmatter is the only place a role's model is set, so this
+edit is the whole mechanism.
+
 ## Optional: let `loop-supervisor` provision the task worktree itself
 
 Each task worktree needs its own environment (e.g. a Python `.venv`,

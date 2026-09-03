@@ -82,7 +82,9 @@ repo unchanged as a starting point, then retarget the builder's and
 auditor's tool-specific permissions (the skeleton defaults assume
 `pytest`/`ruff`/`mypy`, which is almost certainly wrong for a non-Python
 project). See `references/toolchain.md` for exactly which lines to
-change and how to identify the target project's real toolchain.
+change and how to identify the target project's real toolchain — it also
+covers the optional `model:` frontmatter line if you want a role to run
+on a specific model rather than the project's default.
 
 ### 4. Configure `opencode.json` and permissions
 
