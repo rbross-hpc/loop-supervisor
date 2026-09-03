@@ -481,3 +481,124 @@ def test_prune_runs_refuses_while_lock_is_present(tmp_path):
 
     # Not removed: the refusal must happen before anything is deleted.
     assert state.run_id in list_runs(repo.common_dir())
+
+
+def _write_unloadable_run(repo, run_id, *, schema_version=999):
+    """Write a run-state file that fails load_state() -- simulating both
+    plain corruption and (with the default schema_version=999) exactly
+    what ADR 0024's no-migration policy produces after a
+    STATE_SCHEMA_VERSION bump: every older run becomes unloadable."""
+    runs_dir = repo.common_dir() / "loop-supervisor" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    path = runs_dir / f"{run_id}.json"
+    path.write_text(json.dumps({"schema_version": schema_version, "run_id": run_id}))
+    return path
+
+
+def test_select_prune_candidates_run_ids_falls_back_to_unloadable(tmp_path):
+    """An explicitly-named --run id whose state file exists but fails
+    load_state() (corrupted, or orphaned by a schema bump) must still
+    produce a candidate -- not be silently dropped."""
+    repo = _init_repo(tmp_path / "project")
+    _write_unloadable_run(repo, "run0000000001")
+
+    candidates = select_prune_candidates(repo.common_dir(), run_ids=["run0000000001"])
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.run_id == "run0000000001"
+    assert candidate.loadable is False
+    assert candidate.updated_at == "?"
+    assert candidate.phase == "?"
+
+
+def test_select_prune_candidates_unloadable_via_history_dir_only(tmp_path):
+    """A run whose state file is gone entirely but whose history
+    directory survives must still be reachable via explicit --run."""
+    repo = _init_repo(tmp_path / "project")
+    history_path = history_dir(repo.common_dir(), "run0000000001")
+    history_path.mkdir(parents=True)
+    (history_path / "0001-planning.json").write_text("{}")
+
+    candidates = select_prune_candidates(repo.common_dir(), run_ids=["run0000000001"])
+
+    assert len(candidates) == 1
+    assert candidates[0].loadable is False
+    assert candidates[0].has_history is True
+
+
+def test_select_prune_candidates_run_ids_no_fallback_for_nonexistent_id(tmp_path):
+    """--run naming an id with nothing on disk at all selects nothing --
+    this must stay a silent no-op, not a fabricated candidate."""
+    repo = _init_repo(tmp_path / "project")
+    _write_run(tmp_path, repo, "run0000000001")
+
+    candidates = select_prune_candidates(repo.common_dir(), run_ids=["run0000000099"])
+
+    assert candidates == []
+
+
+def test_select_prune_candidates_run_ids_rejects_traversal_id_safely(tmp_path):
+    """A crafted --run value must never reach the filesystem as a path
+    component; validate_run_id inside _unloadable_candidate_if_present
+    rejects it before any exists() check."""
+    repo = _init_repo(tmp_path / "project")
+
+    candidates = select_prune_candidates(repo.common_dir(), run_ids=["../../etc/passwd"])
+
+    assert candidates == []
+
+
+def test_select_prune_candidates_keep_last_never_selects_unloadable(tmp_path):
+    """--keep-last/--older-than have no timestamp to rank an unloadable
+    run by, so they must never select one -- only explicit --run can."""
+    repo = _init_repo(tmp_path / "project")
+    _write_run(tmp_path, repo, "run0000000001", updated_at="2020-01-01T00:00:00+00:00")
+    _write_unloadable_run(repo, "run0000000002")
+
+    candidates = select_prune_candidates(repo.common_dir(), keep_last=0)
+
+    ids = {c.run_id for c in candidates}
+    assert ids == {"run0000000001"}
+
+
+def test_select_prune_candidates_keep_last_and_older_than_are_and_semantics(tmp_path):
+    """keep_last and older_than_days, when both supplied, must select
+    the intersection (a run satisfies both), not the union."""
+    from datetime import UTC, datetime, timedelta
+
+    repo = _init_repo(tmp_path / "project")
+    very_old = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+    recent_but_not_kept = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    newest = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    _write_run(tmp_path, repo, "run0000000001", updated_at=very_old)
+    _write_run(tmp_path, repo, "run0000000002", updated_at=recent_but_not_kept)
+    _write_run(tmp_path, repo, "run0000000003", updated_at=newest)
+
+    # keep_last=1 drops run0000000001 and run0000000002 into the
+    # "eligible for older_than" pool (run0000000003, the newest, is
+    # kept outright); older_than=7 then additionally requires "more
+    # than 7 days old", which only run0000000001 satisfies --
+    # run0000000002 (1 hour old) must NOT be selected despite being in
+    # the keep_last-eligible pool.
+    candidates = select_prune_candidates(repo.common_dir(), keep_last=1, older_than_days=7)
+
+    ids = {c.run_id for c in candidates}
+    assert ids == {"run0000000001"}
+
+
+def test_prune_runs_removes_unloadable_run(tmp_path):
+    repo = _init_repo(tmp_path / "project")
+    path = _write_unloadable_run(repo, "run0000000001")
+    history_path = history_dir(repo.common_dir(), "run0000000001")
+    history_path.mkdir(parents=True)
+    (history_path / "0001-planning.json").write_text("{}")
+
+    candidates = select_prune_candidates(repo.common_dir(), run_ids=["run0000000001"])
+    assert candidates[0].loadable is False
+
+    removed = prune_runs(repo.common_dir(), candidates)
+
+    assert removed == ["run0000000001"]
+    assert not path.exists()
+    assert not history_path.exists()

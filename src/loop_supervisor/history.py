@@ -55,7 +55,14 @@ from pathlib import Path
 from typing import Any
 
 from .locking import lock_is_present
-from .state import OperationalErrorRecord, RunState, list_runs, load_state, validate_run_id
+from .state import (
+    OperationalErrorRecord,
+    RunState,
+    StateError,
+    list_runs,
+    load_state,
+    validate_run_id,
+)
 from .supervisor import AdvanceOutcome, _redact_secrets
 
 _VERIFICATION_DIR_NAME = "verification"
@@ -204,17 +211,61 @@ class PhaseHistoryRecorder:
 
 @dataclass(frozen=True)
 class PruneCandidate:
-    """One run selected (or skipped) by `select_prune_candidates`."""
+    """One run selected (or skipped) by `select_prune_candidates`.
+
+    `loadable=False` means `load_state` could not parse this run's
+    state file (corrupted, or -- per ADR 0024's no-migration policy --
+    written by an older `STATE_SCHEMA_VERSION`), so `updated_at`/`phase`
+    are unknown (`"?"`) rather than fabricated. Only ever produced by an
+    explicit `--run <id>`: `--keep-last`/`--older-than` have no
+    timestamp to rank such a run by, so they never select it.
+    """
 
     run_id: str
     updated_at: str
     phase: str
     has_history: bool
     has_verification: bool
+    loadable: bool = True
 
 
 class PruneError(RuntimeError):
     """Raised when pruning cannot proceed safely."""
+
+
+_UNKNOWN = "?"
+
+
+def _unloadable_candidate_if_present(git_common_dir: Path, run_id: str) -> PruneCandidate | None:
+    """Build a `loadable=False` candidate for `run_id` if *anything* on
+    disk suggests it is a real (if unparseable) run -- its state file,
+    its history directory, or its verification directory -- so an
+    explicit `--run` can still target a run a schema bump or corruption
+    has made unreadable. Returns None if nothing exists for this id
+    (including if `run_id` fails `validate_run_id`, which is checked
+    first so a crafted id is never used to probe the filesystem)."""
+    try:
+        validated = validate_run_id(run_id)
+    except StateError:
+        return None
+
+    state_path = git_common_dir / "loop-supervisor" / "runs" / f"{validated}.json"
+    history_path = history_dir(git_common_dir, validated)
+    verification_path = git_common_dir / "loop-supervisor" / _VERIFICATION_DIR_NAME / validated
+
+    has_history = history_path.exists()
+    has_verification = verification_path.exists()
+    if not (state_path.exists() or has_history or has_verification):
+        return None
+
+    return PruneCandidate(
+        run_id=validated,
+        updated_at=_UNKNOWN,
+        phase=_UNKNOWN,
+        has_history=has_history,
+        has_verification=has_verification,
+        loadable=False,
+    )
 
 
 def select_prune_candidates(
@@ -231,6 +282,14 @@ def select_prune_candidates(
     a run must satisfy *both* supplied conditions to be selected) over
     every saved run, newest-first by `updated_at`. Never raises for an
     empty result; the caller decides what an empty selection means.
+
+    `run_ids` selection falls back to `loadable=False` candidates
+    (`_unloadable_candidate_if_present`) for any requested id that
+    exists on disk but failed `load_state` -- an explicitly-named run
+    is always prunable if it's really there, corrupted state or not.
+    `keep_last`/`older_than_days` selection considers loadable runs
+    only: neither has a timestamp to rank an unloadable run by, so an
+    id skipped here is only ever reachable via explicit `--run`.
     """
     all_ids = list_runs(git_common_dir)
     loaded: list[tuple[str, RunState]] = []
@@ -242,28 +301,16 @@ def select_prune_candidates(
             # concern to repair; skip it rather than fail the whole
             # selection (list_runs() already tolerates this at the
             # filename level -- this extends the same tolerance to a
-            # file that parses as a name but not as valid state).
+            # file that parses as a name but not as valid state). An
+            # explicit --run can still target it below, via
+            # _unloadable_candidate_if_present.
             continue
     loaded.sort(key=lambda pair: pair[1].updated_at, reverse=True)
 
     if run_ids is not None:
         wanted = set(run_ids)
-        selected = [(rid, state) for rid, state in loaded if rid in wanted]
-    else:
-        selected = loaded
-        if keep_last is not None:
-            selected = selected[keep_last:]
-        if older_than_days is not None:
-            cutoff = datetime.now(UTC).timestamp() - older_than_days * 86400
-            selected = [
-                (rid, state)
-                for rid, state in selected
-                if datetime.fromisoformat(state.updated_at).timestamp() < cutoff
-            ]
-
-    candidates = []
-    for run_id, state in selected:
-        candidates.append(
+        loadable_selected = [(rid, state) for rid, state in loaded if rid in wanted]
+        candidates = [
             PruneCandidate(
                 run_id=run_id,
                 updated_at=state.updated_at,
@@ -273,8 +320,45 @@ def select_prune_candidates(
                     git_common_dir / "loop-supervisor" / _VERIFICATION_DIR_NAME / run_id
                 ).exists(),
             )
+            for run_id, state in loadable_selected
+        ]
+        already_covered = {run_id for run_id, _ in loadable_selected}
+        # Iterate run_ids (not the set difference) to keep output order
+        # stable and match the order the operator specified --run in,
+        # rather than an arbitrary set-iteration order.
+        seen: set[str] = set()
+        for run_id in run_ids:
+            if run_id in already_covered or run_id in seen:
+                continue
+            seen.add(run_id)
+            candidate = _unloadable_candidate_if_present(git_common_dir, run_id)
+            if candidate is not None:
+                candidates.append(candidate)
+        return candidates
+
+    selected = loaded
+    if keep_last is not None:
+        selected = selected[keep_last:]
+    if older_than_days is not None:
+        cutoff = datetime.now(UTC).timestamp() - older_than_days * 86400
+        selected = [
+            (rid, state)
+            for rid, state in selected
+            if datetime.fromisoformat(state.updated_at).timestamp() < cutoff
+        ]
+
+    return [
+        PruneCandidate(
+            run_id=run_id,
+            updated_at=state.updated_at,
+            phase=state.phase,
+            has_history=history_dir(git_common_dir, run_id).exists(),
+            has_verification=(
+                git_common_dir / "loop-supervisor" / _VERIFICATION_DIR_NAME / run_id
+            ).exists(),
         )
-    return candidates
+        for run_id, state in selected
+    ]
 
 
 def prune_runs(
