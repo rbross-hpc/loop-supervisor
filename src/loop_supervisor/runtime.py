@@ -124,6 +124,7 @@ import inspect
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -139,7 +140,7 @@ from .opencode import (
     OpenCodeServerConfig,
     build_agent_env,
 )
-from .permissions import PermissionDenier
+from .permissions import PermissionPolicy, SessionEventConsumer, SessionMonitor
 from .sse import SSECleanupError
 from .state import RunOptions, RunState, StateError, list_runs, load_state, validate_run_id
 from .supervisor import AdvanceOutcome, InputProvider, LoopError, Supervisor
@@ -555,6 +556,7 @@ class RunSession:
         input_provider: InputProvider | None = None,
         recover_stale_lock: bool = False,
         server_observer: InvocationObserver | None = None,
+        session_event_consumers: list[SessionEventConsumer] | None = None,
         operation: str | None = None,
     ) -> None:
         self._project_root = project_root
@@ -574,14 +576,19 @@ class RunSession:
         self._input_provider = input_provider
         self._recover_stale_lock = recover_stale_lock
         self._server_observer = server_observer
+        # Extra SessionMonitor consumers beyond the always-installed
+        # PermissionPolicy -- e.g. a `-vv` StatsConsumer. Attached at the
+        # same point PermissionPolicy is, in start_server().
+        self._session_event_consumers = list(session_event_consumers or [])
 
         self._state = SessionState.NEW
         self._lease: _LockLease | None = None
         self._supervisor: Supervisor | None = None
         self._run_state: RunState | None = None
         self._server: OpenCodeServer | None = None
-        self._permission_denier: PermissionDenier | None = None
-        # Snapshot taken in close() before the denier is torn down, so
+        self._session_monitor: SessionMonitor | None = None
+        self._permission_policy: PermissionPolicy | None = None
+        # Snapshot taken in close() before the monitor is torn down, so
         # denied_permission_count/_summary remain readable by a caller
         # (e.g. the CLI) that only inspects the session after the `with`
         # block has exited.
@@ -657,26 +664,25 @@ class RunSession:
 
     @property
     def denied_permission_count(self) -> int:
-        """How many ``permission.asked`` requests the headless denier
-        (see ``permissions.PermissionDenier``) has auto-rejected so far.
-        Zero before the server is started or if no request ever arrived.
-        This is an in-memory diagnostic only, not persisted to
-        ``RunState``.
+        """How many ``permission.asked`` requests the headless
+        ``permissions.PermissionPolicy`` has auto-rejected so far. Zero
+        before the server is started or if no request ever arrived. This
+        is an in-memory diagnostic only, not persisted to ``RunState``.
 
         Readable after ``close()`` too: ``close()`` snapshots the count
-        before tearing the denier down, since the common shape is
-        ``with session: ...`` followed by inspecting the session once
+        before tearing the session monitor down, since the common shape
+        is ``with session: ...`` followed by inspecting the session once
         the block has already exited.
         """
-        if self._permission_denier is not None:
-            return self._permission_denier.denied_count
+        if self._permission_policy is not None:
+            return self._permission_policy.denied_count
         return self._denied_permission_count
 
     @property
     def denied_permission_summary(self) -> list[str]:
         """Distinct permission keys denied so far, in first-seen order."""
-        if self._permission_denier is not None:
-            return self._permission_denier.denied_summary
+        if self._permission_policy is not None:
+            return self._permission_policy.denied_summary
         return list(self._denied_permission_summary)
 
     # -- observer / invocation control -----------------------------------
@@ -988,9 +994,9 @@ class RunSession:
                     self._annotated.append(startup_exc)
                 raise
 
-        # Best-effort: a failure to start the permission denier must never
+        # Best-effort: a failure to start the session monitor must never
         # fail the run (mirrors sse.py's "SSE failure is strictly
-        # non-fatal" contract, which PermissionDenier itself builds on).
+        # non-fatal" contract, which SessionMonitor itself builds on).
         # Without it a stray permission.asked would silently stall a
         # phase for up to role_timeout with no diagnostic (see backlog
         # item 27); failing to start it is worse than not having it, but
@@ -1000,16 +1006,20 @@ class RunSession:
         except Exception:
             base_url = None
         if base_url is not None:
-            denier = PermissionDenier(base_url)
+            policy = PermissionPolicy(base_url)
+            monitor = SessionMonitor(
+                base_url, consumers=[policy, *self._session_event_consumers]
+            )
             try:
-                denier.start()
+                monitor.start()
             except Exception as exc:
                 print(
-                    f"loop-supervisor: permission denier failed to start: {exc}",
+                    f"loop-supervisor: session monitor failed to start: {exc}",
                     file=sys.stderr,
                 )
             else:
-                self._permission_denier = denier
+                self._session_monitor = monitor
+                self._permission_policy = policy
 
         # Separate stage: a failure here is a runner-handoff failure, not a
         # startup failure, and propagates raw.
@@ -1094,7 +1104,12 @@ class RunSession:
         if self._state_is(SessionState.ADVANCING):
             self._state = SessionState.STARTED
 
-    def run_to_completion(self, *, max_steps: int | None = None) -> RunState:
+    def run_to_completion(
+        self,
+        *,
+        max_steps: int | None = None,
+        on_advance: Callable[[AdvanceOutcome], None] | None = None,
+    ) -> RunState:
         """Run the supervisor loop to a terminal phase (or until input is
         unavailable, or ``max_steps`` completed advances have been taken),
         delegating to ``Supervisor.run()``.
@@ -1102,6 +1117,10 @@ class RunSession:
         ``max_steps`` is a per-invocation session control, not a persisted
         run option: it is never written into ``RunState.options`` and does
         not survive into a later resume.
+
+        ``on_advance``, if given, is passed straight through to
+        ``Supervisor.run()`` (see its docstring for the observation-only
+        contract) -- e.g. a `-v` phase-transition reporter.
 
         Cleanup is not performed here: the caller's ``with`` block triggers
         ``__exit__`` → ``close()``.
@@ -1139,7 +1158,7 @@ class RunSession:
             self._advance_done.clear()
 
         try:
-            final = supervisor.run(run_state, max_steps=max_steps)
+            final = supervisor.run(run_state, max_steps=max_steps, on_advance=on_advance)
         finally:
             # Release the barrier BEFORE reacquiring _state_lock -- same
             # lock-ordering requirement as advance(): a waiter must never
@@ -1280,13 +1299,15 @@ class RunSession:
             # outcome, matching every other best-effort teardown in this
             # method. Cleared even on failure so a retried close() does
             # not attempt to stop it again.
-            if self._permission_denier is not None:
-                denier = self._permission_denier
-                self._denied_permission_count = denier.denied_count
-                self._denied_permission_summary = denier.denied_summary
-                self._permission_denier = None
+            if self._permission_policy is not None:
+                self._denied_permission_count = self._permission_policy.denied_count
+                self._denied_permission_summary = self._permission_policy.denied_summary
+                self._permission_policy = None
+            if self._session_monitor is not None:
+                monitor = self._session_monitor
+                self._session_monitor = None
                 try:
-                    denier.stop()
+                    monitor.stop()
                 except SSECleanupError:
                     pass
 
@@ -1396,6 +1417,7 @@ def new_run_session(
     input_provider: InputProvider | None = None,
     recover_stale_lock: bool = False,
     server_observer: InvocationObserver | None = None,
+    session_event_consumers: list[SessionEventConsumer] | None = None,
     operation: str | None = None,
 ) -> RunSession:
     """Return an inert :class:`RunSession` for a new run.
@@ -1418,6 +1440,7 @@ def new_run_session(
         input_provider=input_provider,
         recover_stale_lock=recover_stale_lock,
         server_observer=server_observer,
+        session_event_consumers=session_event_consumers,
         operation=operation,
     )
 
@@ -1429,6 +1452,7 @@ def resume_run_session(
     input_provider: InputProvider | None = None,
     recover_stale_lock: bool = False,
     server_observer: InvocationObserver | None = None,
+    session_event_consumers: list[SessionEventConsumer] | None = None,
     operation: str | None = None,
 ) -> RunSession:
     """Return an inert :class:`RunSession` resuming ``run_id``.
@@ -1447,6 +1471,7 @@ def resume_run_session(
         input_provider=input_provider,
         recover_stale_lock=recover_stale_lock,
         server_observer=server_observer,
+        session_event_consumers=session_event_consumers,
         operation=operation,
     )
 
@@ -1469,16 +1494,16 @@ def _start_server_call_lineno(func: object) -> int:
 
 def _report_denied_permissions(session: RunSession) -> None:
     """Print a one-line stderr diagnostic if the headless permission
-    denier (see permissions.PermissionDenier) auto-rejected any
+    policy (see permissions.PermissionPolicy) auto-rejected any
     ``permission.asked`` request during this run/resume invocation.
 
     This is the CLI-facing half of backlog item 27 ("no diagnostic"): a
     phase that stalled or failed because of a denial is otherwise
     silent about it. Deliberately printed here (inside the `with
     session:` block having just exited run_to_completion(), but before
-    close() tears the denier down) rather than only in cmd_run/
-    cmd_resume, so both headless entry points get it uniformly without
-    duplicating the check.
+    close() tears the session monitor down) rather than only in
+    cmd_run/cmd_resume, so both headless entry points get it uniformly
+    without duplicating the check.
 
     Callers must invoke this from a ``finally``, not only on
     ``run_to_completion()``'s successful-return path: an operational
@@ -1506,6 +1531,9 @@ def run_new(
     input_provider: InputProvider | None = None,
     recover_stale_lock: bool = False,
     max_steps: int | None = None,
+    server_observer: InvocationObserver | None = None,
+    session_event_consumers: list[SessionEventConsumer] | None = None,
+    on_advance: Callable[[AdvanceOutcome], None] | None = None,
 ) -> RunState:
     """Start a new run from project_root.
 
@@ -1520,17 +1548,24 @@ def run_new(
     ``max_steps`` is a per-invocation session control (see
     ``RunSession.run_to_completion``), not part of the persisted
     ``RunOptions``.
+
+    ``server_observer``, ``session_event_consumers``, and ``on_advance``
+    are the headless `-v`/`-vv` reporting hooks (see ``cli.py``'s
+    ``_build_verbosity_hooks``); all three are optional and purely
+    observational (see ``Supervisor.run``'s ``on_advance`` docstring).
     """
     session = new_run_session(
         project_root,
         options,
         input_provider=input_provider,
         recover_stale_lock=recover_stale_lock,
+        server_observer=server_observer,
+        session_event_consumers=session_event_consumers,
     )
     with session:
         session.start_server()
         try:
-            return session.run_to_completion(max_steps=max_steps)
+            return session.run_to_completion(max_steps=max_steps, on_advance=on_advance)
         finally:
             # In a finally, not only on the successful-return path: an
             # operational failure raises LoopError out of
@@ -1552,6 +1587,9 @@ def run_resume(
     input_provider: InputProvider | None = None,
     recover_stale_lock: bool = False,
     max_steps: int | None = None,
+    server_observer: InvocationObserver | None = None,
+    session_event_consumers: list[SessionEventConsumer] | None = None,
+    on_advance: Callable[[AdvanceOutcome], None] | None = None,
 ) -> RunState:
     """Resume a saved run from project_root.
 
@@ -1564,6 +1602,9 @@ def run_resume(
     do not need to inject a different provider (e.g. the TUI's
     non-blocking queue-backed provider).
 
+    ``server_observer``, ``session_event_consumers``, and ``on_advance``
+    are the headless `-v`/`-vv` reporting hooks; see ``run_new``.
+
     ``max_steps`` is a per-invocation session control (see
     ``RunSession.run_to_completion``), not part of the persisted
     ``RunOptions``.
@@ -1573,11 +1614,13 @@ def run_resume(
         run_id,
         input_provider=input_provider,
         recover_stale_lock=recover_stale_lock,
+        server_observer=server_observer,
+        session_event_consumers=session_event_consumers,
     )
     with session:
         session.start_server()
         try:
-            return session.run_to_completion(max_steps=max_steps)
+            return session.run_to_completion(max_steps=max_steps, on_advance=on_advance)
         finally:
             # See run_new()'s identical finally: LoopError from an
             # operational failure must not skip this diagnostic.

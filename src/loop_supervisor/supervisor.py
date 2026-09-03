@@ -13,6 +13,7 @@ import os
 import re
 import uuid
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -783,7 +784,13 @@ class Supervisor:
 
     # -- compatibility loop over advance() ------------------------------
 
-    def run(self, state: RunState, *, max_steps: int | None = None) -> RunState:
+    def run(
+        self,
+        state: RunState,
+        *,
+        max_steps: int | None = None,
+        on_advance: Callable[[AdvanceOutcome], None] | None = None,
+    ) -> RunState:
         """Compatibility loop: runs advance() repeatedly until terminal, input
         unavailable, the step budget is exhausted, or an error. Re-raises
         LoopError-originated failures to preserve existing headless CLI
@@ -795,12 +802,25 @@ class Supervisor:
         behavior exactly. When the budget is exhausted before a terminal
         phase is reached, the current (non-terminal) state is returned
         without error, the same as ``INPUT_UNAVAILABLE``.
+
+        ``on_advance``, if given, is called with every ``AdvanceOutcome``
+        immediately after each ``advance()`` call, before this method
+        acts on its status -- purely an observation hook (e.g. for
+        headless `-v` phase-transition reporting); it must not raise, and
+        it has no influence on the loop's own control flow. A raising
+        callback is not caught here deliberately: an observer that cannot
+        be trusted not to raise should not be installed, the same
+        contract ``InvocationObserver`` callers already rely on
+        (``OpenCodeServer._notify_started``/``_notify_finished`` catch
+        observer exceptions at that layer instead).
         """
         steps_taken = 0
         while state.phase not in _TERMINAL_PHASES:
             if max_steps is not None and steps_taken >= max_steps:
                 return state
             outcome = self.advance(state)
+            if on_advance is not None:
+                on_advance(outcome)
             state = outcome.state
             steps_taken += 1
             if outcome.status == AdvanceStatus.INPUT_UNAVAILABLE:

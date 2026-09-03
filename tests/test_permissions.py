@@ -1,4 +1,4 @@
-"""Tests for src/loop_supervisor/permissions.py (PermissionDenier)."""
+"""Tests for src/loop_supervisor/permissions.py (SessionMonitor, PermissionPolicy)."""
 
 import json
 import os
@@ -7,7 +7,8 @@ import sys
 import time
 from pathlib import Path
 
-from loop_supervisor.permissions import PermissionDenier
+from loop_supervisor.opencode_events import normalize_global_event
+from loop_supervisor.permissions import PermissionPolicy, SessionMonitor
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "fake_opencode.py"
 
@@ -58,6 +59,21 @@ def _wait_for(predicate, timeout=3.0):
     return False
 
 
+def _monitor_with_policy(base_url: str) -> tuple[SessionMonitor, PermissionPolicy]:
+    policy = PermissionPolicy(base_url)
+    monitor = SessionMonitor(base_url, consumers=[policy])
+    return monitor, policy
+
+
+def _feed(policy: PermissionPolicy, raw_event: dict) -> None:
+    """Directly exercise PermissionPolicy.on_event with a raw envelope,
+    the way SessionMonitor's own dispatch would after normalizing it --
+    used by tests that check filtering/malformed-input behavior without
+    a live SSE connection."""
+    event = normalize_global_event(raw_event)
+    policy.on_event(raw_event, event)
+
+
 def test_permission_asked_triggers_reject_reply(tmp_path):
     log_path = tmp_path / "replies.jsonl"
     server = _FakeServer(
@@ -67,9 +83,9 @@ def test_permission_asked_triggers_reject_reply(tmp_path):
         }
     )
     server.start()
-    denier = PermissionDenier(server.base_url)
+    monitor, policy = _monitor_with_policy(server.base_url)
     try:
-        denier.start()
+        monitor.start()
         assert _wait_for(lambda: log_path.exists() and log_path.read_text().strip() != "")
         lines = log_path.read_text().strip().splitlines()
         assert len(lines) == 1
@@ -78,7 +94,7 @@ def test_permission_asked_triggers_reject_reply(tmp_path):
         assert record["body"] == {"reply": "reject"}
         assert record["directory"] == "/repo"
     finally:
-        denier.stop()
+        monitor.stop()
         server.stop()
 
 
@@ -101,7 +117,7 @@ def test_reply_is_scoped_to_the_ask_s_own_directory(tmp_path, capsys):
         }
     )
     server.start()
-    denier = PermissionDenier(server.base_url)
+    monitor, policy = _monitor_with_policy(server.base_url)
     seen_stderr = ""
 
     def _saw_failure() -> bool:
@@ -110,22 +126,22 @@ def test_reply_is_scoped_to_the_ask_s_own_directory(tmp_path, capsys):
         return "failed to deny permission request 'per_wrongscope'" in seen_stderr
 
     try:
-        denier.start()
+        monitor.start()
         assert _wait_for(_saw_failure)
         assert "HTTP 404" in seen_stderr
-        assert denier.denied_count == 0
-        assert denier.denied_summary == []
+        assert policy.denied_count == 0
+        assert policy.denied_summary == []
     finally:
-        denier.stop()
+        monitor.stop()
         server.stop()
 
 
 def test_reply_carries_the_ask_s_own_directory_and_succeeds_when_scoped(tmp_path):
     """The positive case for the same scoping mechanism: when the ask's
     directory and the reply's required directory match, the reply must
-    succeed and be counted, and the reply the denier actually sent must
-    carry that same directory -- not a hardcoded default, and not the
-    project root, but whatever the specific ask's own envelope said."""
+    succeed and be counted, and the reply actually sent must carry that
+    same directory -- not a hardcoded default, and not the project root,
+    but whatever the specific ask's own envelope said."""
     log_path = tmp_path / "replies.jsonl"
     server = _FakeServer(
         {
@@ -136,17 +152,17 @@ def test_reply_carries_the_ask_s_own_directory_and_succeeds_when_scoped(tmp_path
         }
     )
     server.start()
-    denier = PermissionDenier(server.base_url)
+    monitor, policy = _monitor_with_policy(server.base_url)
     try:
-        denier.start()
-        assert _wait_for(lambda: denier.denied_count == 1)
-        assert denier.denied_summary == ["bash"]
+        monitor.start()
+        assert _wait_for(lambda: policy.denied_count == 1)
+        assert policy.denied_summary == ["bash"]
         lines = log_path.read_text().strip().splitlines()
         assert len(lines) == 1
         record = json.loads(lines[0])
         assert record["directory"] == "/worktrees/task-002"
     finally:
-        denier.stop()
+        monitor.stop()
         server.stop()
 
 
@@ -154,13 +170,13 @@ def test_non_permission_events_do_not_trigger_a_reply(tmp_path):
     log_path = tmp_path / "replies.jsonl"
     server = _FakeServer({"FAKE_OPENCODE_PERMISSION_REPLY_LOG": str(log_path)})
     server.start()
-    denier = PermissionDenier(server.base_url)
+    monitor, _policy = _monitor_with_policy(server.base_url)
     try:
-        denier.start()
+        monitor.start()
         time.sleep(0.5)
         assert not log_path.exists()
     finally:
-        denier.stop()
+        monitor.stop()
         server.stop()
 
 
@@ -169,8 +185,9 @@ def test_event_with_id_but_wrong_type_is_ignored():
     whose type is not permission.asked must not be treated as a
     permission request. This specifically exercises the event-type
     filter, distinct from the id-presence check exercised elsewhere."""
-    denier = PermissionDenier("http://127.0.0.1:1")
-    denier._on_event(
+    policy = PermissionPolicy("http://127.0.0.1:1")
+    _feed(
+        policy,
         {
             "directory": "/repo",
             "payload": {
@@ -181,9 +198,9 @@ def test_event_with_id_but_wrong_type_is_ignored():
                     "permission": "bash",
                 },
             },
-        }
+        },
     )
-    assert denier.denied_count == 0
+    assert policy.denied_count == 0
 
 
 def test_denied_count_and_summary_track_permission_key(tmp_path):
@@ -195,13 +212,13 @@ def test_denied_count_and_summary_track_permission_key(tmp_path):
         }
     )
     server.start()
-    denier = PermissionDenier(server.base_url)
+    monitor, policy = _monitor_with_policy(server.base_url)
     try:
-        denier.start()
-        assert _wait_for(lambda: denier.denied_count == 1)
-        assert denier.denied_summary == ["bash"]
+        monitor.start()
+        assert _wait_for(lambda: policy.denied_count == 1)
+        assert policy.denied_summary == ["bash"]
     finally:
-        denier.stop()
+        monitor.stop()
         server.stop()
 
 
@@ -224,7 +241,7 @@ def test_reply_http_failure_is_not_counted_as_denied(tmp_path, capsys):
         }
     )
     server.start()
-    denier = PermissionDenier(server.base_url)
+    monitor, policy = _monitor_with_policy(server.base_url)
     seen_stderr = ""
 
     def _saw_failure() -> bool:
@@ -233,13 +250,13 @@ def test_reply_http_failure_is_not_counted_as_denied(tmp_path, capsys):
         return "failed to deny permission request 'per_fail'" in seen_stderr
 
     try:
-        denier.start()
+        monitor.start()
         assert _wait_for(_saw_failure)
         assert "HTTP 500" in seen_stderr
-        assert denier.denied_count == 0
-        assert denier.denied_summary == []
+        assert policy.denied_count == 0
+        assert policy.denied_summary == []
     finally:
-        denier.stop()
+        monitor.stop()
         server.stop()
 
 
@@ -248,14 +265,14 @@ def test_reply_transport_error_is_not_counted_as_denied(monkeypatch, capsys):
     status) must not raise out of the event handler, and must not be
     counted as a denial for the same reason as a non-2xx status: the
     reject was never actually accepted. Exercised directly against
-    _on_event/_reply_reject (rather than through a live SSE connection)
-    because both PermissionDenier and SSEClient share the same httpx
-    module, so a global httpx.Client patch would also break the SSE
-    transport itself, not just the reply POST.
+    PermissionPolicy.on_event/_reply_reject (rather than through a live
+    SSE connection) because both PermissionPolicy and SSEClient share the
+    same httpx module, so a global httpx.Client patch would also break
+    the SSE transport itself, not just the reply POST.
     """
     import loop_supervisor.permissions as permissions_module
 
-    denier = PermissionDenier("http://127.0.0.1:1")
+    policy = PermissionPolicy("http://127.0.0.1:1")
 
     class _BoomClient:
         def __init__(self, *args, **kwargs):
@@ -269,17 +286,18 @@ def test_reply_transport_error_is_not_counted_as_denied(monkeypatch, capsys):
 
     monkeypatch.setattr(permissions_module.httpx, "Client", _BoomClient)
 
-    denier._on_event(
+    _feed(
+        policy,
         {
             "directory": "/repo",
             "payload": {
                 "type": "permission.asked",
                 "properties": {"id": "per_neterr", "sessionID": "ses1", "permission": "bash"},
             },
-        }
+        },
     )
-    assert denier.denied_count == 0
-    assert denier.denied_summary == []
+    assert policy.denied_count == 0
+    assert policy.denied_summary == []
     stderr = capsys.readouterr().err
     assert "failed to deny permission request 'per_neterr'" in stderr
     assert "ConnectError" in stderr
@@ -288,31 +306,32 @@ def test_reply_transport_error_is_not_counted_as_denied(monkeypatch, capsys):
 def test_malformed_permission_asked_missing_id_is_ignored(tmp_path):
     """A permission.asked event whose properties lack a usable id must
     not increment the denied count or crash the handler."""
-    denier = PermissionDenier("http://127.0.0.1:1")
-    denier._on_event(
+    policy = PermissionPolicy("http://127.0.0.1:1")
+    _feed(
+        policy,
         {
             "directory": "/repo",
             "payload": {"type": "permission.asked", "properties": {}},
-        }
+        },
     )
-    assert denier.denied_count == 0
+    assert policy.denied_count == 0
 
 
 def test_start_prints_attach_confirmation_once_live(capsys):
     """A successful SSE attach must be positively observable, not just
     inferable from the absence of a start failure -- otherwise "the
-    denier attached and saw nothing" is indistinguishable from "the
-    denier never attached at all."""
+    monitor attached and saw nothing" is indistinguishable from "the
+    monitor never attached at all."""
     server = _FakeServer()
     server.start()
-    denier = PermissionDenier(server.base_url)
+    monitor, _policy = _monitor_with_policy(server.base_url)
     try:
-        denier.start()
+        monitor.start()
         assert _wait_for(
-            lambda: f"permission denier watching {server.base_url}" in capsys.readouterr().err
+            lambda: f"session monitor watching {server.base_url}" in capsys.readouterr().err
         )
     finally:
-        denier.stop()
+        monitor.stop()
         server.stop()
 
 
@@ -327,14 +346,14 @@ def test_successful_denial_still_counts_and_reports(tmp_path, capsys):
         }
     )
     server.start()
-    denier = PermissionDenier(server.base_url)
+    monitor, policy = _monitor_with_policy(server.base_url)
     try:
-        denier.start()
-        assert _wait_for(lambda: denier.denied_count == 1)
-        assert denier.denied_summary == ["bash"]
+        monitor.start()
+        assert _wait_for(lambda: policy.denied_count == 1)
+        assert policy.denied_summary == ["bash"]
         assert "denied permission request 'per_ok'" in capsys.readouterr().err
     finally:
-        denier.stop()
+        monitor.stop()
         server.stop()
 
 
@@ -342,26 +361,73 @@ def test_sse_notice_is_forwarded_to_stderr(capsys):
     """SSE-level notices (reconnects, malformed events, non-2xx stream
     responses) must not be silently discarded; they are diagnosable
     conditions the operator should be able to see."""
-    denier = PermissionDenier("http://127.0.0.1:1")
-    denier._on_notice("SSE error: boom")
+    monitor = SessionMonitor("http://127.0.0.1:1")
+    monitor._on_notice("SSE error: boom")
     captured = capsys.readouterr()
     assert "loop-supervisor:" in captured.err
     assert "SSE error: boom" in captured.err
 
 
 def test_stop_before_start_is_safe():
-    denier = PermissionDenier("http://127.0.0.1:9")
-    denier.stop()
+    monitor = SessionMonitor("http://127.0.0.1:9")
+    monitor.stop()
 
 
 def test_stop_is_idempotent(tmp_path):
     server = _FakeServer()
     server.start()
-    denier = PermissionDenier(server.base_url)
+    monitor, _policy = _monitor_with_policy(server.base_url)
     try:
-        denier.start()
+        monitor.start()
         time.sleep(0.1)
-        denier.stop()
-        denier.stop()
+        monitor.stop()
+        monitor.stop()
     finally:
         server.stop()
+
+
+def test_consumer_that_raises_does_not_break_other_consumers(capsys):
+    """SessionMonitor's fan-out contract: one consumer raising must be
+    reported as a notice and must never prevent another attached
+    consumer from seeing the same event, and must never propagate out of
+    the SSE callback (mirroring sse.py's own non-fatal contract)."""
+
+    class _BoomConsumer:
+        def on_event(self, raw_event, event):
+            raise RuntimeError("boom")
+
+    seen: list[str] = []
+
+    class _RecordingConsumer:
+        def on_event(self, raw_event, event):
+            seen.append(event.type)
+
+    monitor = SessionMonitor(
+        "http://127.0.0.1:1", consumers=[_BoomConsumer(), _RecordingConsumer()]
+    )
+    monitor._on_event(
+        {
+            "directory": "/repo",
+            "payload": {"type": "session.idle", "properties": {"sessionID": "ses1"}},
+        }
+    )
+    assert seen == ["session.idle"]
+    stderr = capsys.readouterr().err
+    assert "_BoomConsumer" in stderr
+    assert "boom" in stderr
+
+
+def test_malformed_envelope_reaches_no_consumer():
+    """An envelope normalize_global_event rejects must not reach any
+    consumer at all -- the monitor's own normalization failure, not a
+    consumer's problem to filter."""
+
+    calls: list[dict] = []
+
+    class _RecordingConsumer:
+        def on_event(self, raw_event, event):
+            calls.append(raw_event)
+
+    monitor = SessionMonitor("http://127.0.0.1:1", consumers=[_RecordingConsumer()])
+    monitor._on_event({"payload": {"type": "session.idle"}})  # missing "directory"
+    assert calls == []

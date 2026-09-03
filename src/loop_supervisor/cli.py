@@ -11,7 +11,7 @@ import re
 import shutil
 import signal
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,11 +21,19 @@ from .doctor import validate_report
 from .git import GitError
 from .input_providers import StdinInputProvider
 from .locking import LockError
+from .opencode import InvocationObserver
+from .permissions import SessionEventConsumer
 from .phases import PHASE_OPERATIONAL_FAILURE, TERMINAL_PHASES
 from .runtime import RuntimeError_, list_run_ids, load_run, run_new, run_resume
 from .skill import run_skill
 from .state import RunOptions, StateError
-from .supervisor import FailurePersistenceError, LoopError
+from .supervisor import AdvanceOutcome, FailurePersistenceError, LoopError
+from .verbosity import (
+    CompositeInvocationObserver,
+    StatsConsumer,
+    StatsReportingObserver,
+    VerboseReporter,
+)
 
 # Expected application-level failures that a normal `run`/`resume`
 # invocation should report as a single sanitized error line and exit 1,
@@ -53,7 +61,7 @@ def _bridge_sigterm_to_keyboard_interrupt() -> Iterator[None]:
     """Make SIGTERM drive the same cleanup path SIGINT already does.
 
     Every cleanup obligation in this codebase -- stopping the OpenCode
-    process group, stopping the permission denier, releasing the
+    process group, stopping the session monitor, releasing the
     supervisor lock -- is reached exclusively through Python exception
     unwinding (`RunSession.__exit__` / `OpenCodeServer.__exit__`; see ADR
     0015). SIGINT's default disposition already raises
@@ -128,6 +136,58 @@ def _add_step_control_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="N",
         help="Stop after N completed phase transitions, even if the run has not finished",
     )
+
+
+def _add_verbosity_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the cumulative, ssh-style ``-v``/``-vv`` verbosity flags.
+
+    Per-invocation, like ``--step``/``--max-steps``: not persisted into
+    ``RunOptions``, safe on ``resume``, and has no effect on run
+    behavior -- see ``_build_verbosity_hooks`` for what each level adds.
+    """
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Print timestamped diagnostics to stderr while running "
+        "(repeatable: -v for phase/invocation transitions, "
+        "-vv adds per-invocation event-timing statistics)",
+    )
+
+
+def _build_verbosity_hooks(verbosity: int) -> tuple[
+    InvocationObserver | None,
+    list[SessionEventConsumer],
+    Callable[[AdvanceOutcome], None] | None,
+]:
+    """Build the `-v`/`-vv` observer/consumer/callback triple for
+    ``run_new``/``run_resume``, or an all-``None``/empty triple at
+    verbosity 0 (the default), which reproduces prior behavior exactly.
+
+    ``-vv`` implies ``-v`` (cumulative, matching ``ssh``): both levels
+    get the ``VerboseReporter``'s invocation and phase-transition lines;
+    ``-vv`` additionally attaches a ``StatsConsumer`` to the session
+    monitor and bridges its summaries into the same observer via
+    ``StatsReportingObserver``, so both print in the same place (stderr)
+    interleaved in real invocation order.
+    """
+    if verbosity <= 0:
+        return None, [], None
+
+    reporter = VerboseReporter()
+    observers: list[InvocationObserver] = [reporter]
+    consumers: list[SessionEventConsumer] = []
+
+    if verbosity >= 2:
+        stats = StatsConsumer()
+        consumers.append(stats)
+        observers.append(StatsReportingObserver(stats))
+
+    observer: InvocationObserver = (
+        observers[0] if len(observers) == 1 else CompositeInvocationObserver(observers)
+    )
+    return observer, consumers, reporter.on_advance
 
 
 def _resolve_max_steps(args: argparse.Namespace) -> int | None:
@@ -249,6 +309,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    observer, consumers, on_advance = _build_verbosity_hooks(getattr(args, "verbose", 0))
+
     try:
         with _bridge_sigterm_to_keyboard_interrupt():
             final = run_new(
@@ -257,6 +319,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 input_provider=StdinInputProvider(),
                 recover_stale_lock=getattr(args, "recover_stale_lock", False),
                 max_steps=max_steps,
+                server_observer=observer,
+                session_event_consumers=consumers,
+                on_advance=on_advance,
             )
     except _EXPECTED_CLI_ERRORS as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -319,6 +384,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
         )
         return 1
 
+    observer, consumers, on_advance = _build_verbosity_hooks(getattr(args, "verbose", 0))
+
     try:
         with _bridge_sigterm_to_keyboard_interrupt():
             final = run_resume(
@@ -327,6 +394,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 input_provider=StdinInputProvider(),
                 recover_stale_lock=getattr(args, "recover_stale_lock", False),
                 max_steps=max_steps,
+                server_observer=observer,
+                session_event_consumers=consumers,
+                on_advance=on_advance,
             )
     except _EXPECTED_CLI_ERRORS as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -555,6 +625,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--verify-timeout", type=float, default=None)
     _add_step_control_arguments(run_parser)
+    _add_verbosity_arguments(run_parser)
     run_parser.set_defaults(func=cmd_run)
 
     # `resume` deliberately does not accept run-behavior flags (limits,
@@ -562,8 +633,10 @@ def build_parser() -> argparse.ArgumentParser:
     # immutable and persisted in RunState.options at `start_new_run()`,
     # and resume reconstructs the supervisor's behavior entirely from
     # that persisted state, never from CLI arguments supplied at resume
-    # time. --step/--max-steps are a per-invocation session control, not
-    # a run-behavior flag, and are exempt from that rule (see ADR 0006).
+    # time. --step/--max-steps/-v are a per-invocation session control,
+    # not a run-behavior flag, and are exempt from that rule (see ADR
+    # 0006 for --step/--max-steps; -v carries the same exemption since it
+    # has no effect on run behavior, only on what is printed).
     resume_parser = sub.add_parser("resume", help="Resume a paused run (omit run_id to list)")
     resume_parser.add_argument("--project", default=None, help="Path to the integration repo")
     resume_parser.add_argument("run_id", nargs="?", default=None)
@@ -573,6 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remove a stale lock from a dead local process and retry",
     )
     _add_step_control_arguments(resume_parser)
+    _add_verbosity_arguments(resume_parser)
     resume_parser.set_defaults(func=cmd_resume)
 
     tui_parser = sub.add_parser("tui", help="Open the Textual TUI")
