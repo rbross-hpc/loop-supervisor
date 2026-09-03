@@ -1,6 +1,6 @@
 """Supervisor repository lock.
 
-Prevents two mutating supervisor processes (run, resume, tui) from racing
+Prevents two mutating supervisor processes (run, resume) from racing
 against the same Git repository. The lock record is stored at:
 
     <git-common-dir>/loop-supervisor/supervisor.lock
@@ -53,6 +53,8 @@ class MalformedLockError(LockError):
 
 
 _SCHEMA_VERSION = 1
+# "tui" is retained for back-compat with lock records written by the
+# now-retired in-process TUI; nothing currently writes it.
 _VALID_OPERATIONS = frozenset({"run", "resume", "tui"})
 _LOCK_RECORD_FIELDS = frozenset(
     {
@@ -350,8 +352,7 @@ class SupervisorLock:
     git_common_dir:
         The Git common directory (``git rev-parse --git-common-dir``).
     operation:
-        Human-readable label for what this process is doing ("run", "resume",
-        "tui").
+        Human-readable label for what this process is doing ("run", "resume").
     run_id:
         Optional run ID being operated on.
     integration_path:

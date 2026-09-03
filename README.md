@@ -264,10 +264,7 @@ backlog item 48 for the incident that motivated this.
 **This protection is `run`-only.** `resume` reloads `provision_commands`
 from the run's own persisted state rather than re-reading
 `loop-supervisor.toml`, so a run started before provisioning was
-configured stays unprotected across every future resume. `tui` never
-reads `loop-supervisor.toml` at all — its `_DEFAULT_OPTIONS` hardcode
-provisioning off — so a TUI-driven run remains fully exposed to the
-item-48 hijack regardless of this file. See backlog item 52.
+configured stays unprotected across every future resume.
 
 ## Running
 
@@ -295,41 +292,18 @@ results shown to the auditor). See ADR 0025 for the config format and
 The integration checkout must be a clean Git working tree on a real
 branch (not detached `HEAD`) before a run starts.
 
-## Textual TUI
+## TUI (being rebuilt)
 
-```bash
-loop-supervisor tui --project /path/to/integration/checkout
-```
-
-Opens a terminal UI with:
-
-- **Run browser** — lists saved runs (phase, task, last error) and a
-  "Start new run" action. No lock is acquired while browsing.
-- **Run screen** — shows durable supervisor state and best-effort live
-  OpenCode activity in separate, clearly-labelled panes.
-- **Pending-input panel** — presents the appropriate controls (multiline
-  text, approve/reject buttons, retry) for each operator-input scenario.
-
-The TUI acquires the repository lock before starting execution and
-releases it on exit. Pass `--recover-stale-lock` if a previous run
-crashed and left a stale lock from a demonstrably dead local process.
-
-### Durable vs live status
-
-The left pane ("Durable supervisor state") shows the authoritative
-`RunState` from disk: phase, run ID, task, revision/replan counters,
-and the last error record. This never changes unless `advance()` commits
-a transition.
-
-The right pane ("Live OpenCode activity — ephemeral") shows real-time
-SSE telemetry: active sessions, assistant text tail, active tools, and
-file edits. If SSE disconnects, a notice is shown and the durable pane
-remains fully functional. Live state is never used to infer supervisor
-phase.
+The previous in-process Textual TUI, which drove `RunSession` directly
+and shared live event state with a reducer, has been retired. `loop-
+supervisor tui` is currently a no-op stub that prints a notice and
+exits; use `run`/`resume` in the meantime. A replacement TUI that reads
+run state from disk (per-phase history under `runs/<run_id>/` and
+verification logs) rather than sharing in-process state is planned.
 
 ### Repository lock
 
-Only one mutating supervisor session (run, resume, or TUI) can act on a
+Only one mutating supervisor session (run or resume) can act on a
 given repository at a time. The lock is stored at:
 
     <git-common-dir>/loop-supervisor/supervisor.lock
@@ -342,8 +316,8 @@ malformed locks are never auto-recovered.
 
 Transient failures (network errors, Git errors, merge conflicts) are
 persisted as `operational_failure` with a structured error record and a
-`retry_phase`. The TUI shows a Retry button; `loop-supervisor resume`
-also retries from the recorded phase.
+`retry_phase`. `loop-supervisor resume` retries from the recorded
+phase.
 
 Non-recoverable failures (policy limits, invariant violations) set
 `phase = "failed"`; no further resume is possible. Start a new run.
@@ -359,8 +333,7 @@ external changes the integration branch while a run is in progress
 run pointed at the same repository). If a `--no-ff` merge conflicts,
 the supervisor aborts the merge, records the conflict as an
 operational failure requiring repair, and stops. Resolve the conflict
-manually in the integration worktree, then resume (or click Retry in
-the TUI).
+manually in the integration worktree, then resume.
 
 ## Bootstrapping a new project
 
@@ -547,6 +520,7 @@ instead:
   inspection, are relied upon instead).
 - Cancellation during an active OpenCode invocation is cooperative
   (abort request sent); no guarantee of immediate termination.
-- Diff browsing and full log inspection are not yet in the TUI.
 - Automatic merge-conflict resolution is out of scope; operator repair is
   always required.
+- The interactive TUI is being rebuilt (see "TUI (being rebuilt)" above)
+  and is currently a no-op stub.

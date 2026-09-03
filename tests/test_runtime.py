@@ -4827,16 +4827,17 @@ def test_run_session_resume_lock_operation_is_resume(tmp_path):
 #
 # operation= is orthogonal to _RunKind: it only labels the lock record,
 # while _RunKind still drives run-id validation and which Supervisor
-# construction path runs. The TUI does both new runs and resumes, so it
-# needs operation="tui" independent of which kind of session it is.
+# construction path runs. "tui" remains in SupervisorLock's vocabulary
+# for back-compat with lock records written by the now-retired
+# in-process TUI (see the ADR retiring it); it is the only non-default
+# value available, so these tests use it purely as a vocabulary probe
+# for the override mechanism, not as a claim that a TUI exists.
 
 
-def test_run_session_new_run_operation_override_labels_lock_as_tui(tmp_path):
-    """A new run with operation="tui" writes operation="tui" to the lock
-    record, and run_id stays None -- exactly the record app.py's own
-    SupervisorLock construction produces today for a new TUI run
-    (operation="tui", run_id=self._run_id which is None for a new run).
-    This is the parity Phase B's RunSession adoption will depend on."""
+def test_run_session_new_run_operation_override_labels_lock_with_override(tmp_path):
+    """A new run with an explicit operation= override writes that value
+    to the lock record, and run_id stays None -- proving the override is
+    independent of run_kind."""
     import json
 
     import loop_supervisor.runtime as rt
@@ -4851,11 +4852,11 @@ def test_run_session_new_run_operation_override_labels_lock_as_tui(tmp_path):
             assert record["run_id"] is None
 
 
-def test_run_session_resume_operation_override_labels_lock_as_tui(tmp_path):
-    """A resume with operation="tui" writes operation="tui" *and* still
-    carries the real run_id -- proving operation= and _RunKind vary
-    independently. If operation were driving run_id instead of _RunKind,
-    this would regress to run_id=None."""
+def test_run_session_resume_operation_override_labels_lock_with_override(tmp_path):
+    """A resume with an explicit operation= override writes that value
+    *and* still carries the real run_id -- proving operation= and
+    _RunKind vary independently. If operation were driving run_id
+    instead of _RunKind, this would regress to run_id=None."""
     import json
 
     from loop_supervisor.locking import _lock_path

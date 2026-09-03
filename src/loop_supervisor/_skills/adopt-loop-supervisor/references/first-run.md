@@ -17,7 +17,7 @@ any `paused at phase ...` line.
 
 If this is what you see, show it to the human (the checkpoint at the
 end of `SKILL.md`), then let them decide whether to continue with
-`loop-supervisor run --project .` (no step limit) or `tui`.
+`loop-supervisor run --project .` (no step limit).
 
 ## Common early failures and what they mean
 

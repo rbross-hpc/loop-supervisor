@@ -31,6 +31,15 @@ normal rotation: they are correctness or test-coverage gaps in
 existing, already-built behavior, not blocked on an undecided design
 question the way the deferred items are.
 
+**Update: the in-process TUI described by this note and by items 16,
+17, 18, 40, 42, and 52 below has been retired** (see the ADR retiring
+the in-process Textual TUI and `src/loop_supervisor/tui/` removal).
+`loop-supervisor tui` is now a no-op stub. Those items are moot against
+the removed code and are not carried forward; a future TUI reading
+on-disk run state starts from a clean slate rather than inheriting this
+backlog. Left in place, unedited, as the historical record of what was
+found against the removed implementation.
+
 ## Corrections to prior commit messages
 
 Commit messages in this project are treated as part of the durable
@@ -555,6 +564,9 @@ after the fact get written down.
     not be picked up as a planner task until reopened. See the
     "Deferred: TUI work" note at the top of this file.
 
+    **Moot: the referenced `tui/app.py`/`tui/renderers.py` code has
+    since been removed** (see the "Deferred: TUI work" note's update).
+
 17. **DEFERRED. `tui` should validate new-run options the same way
     `run` does, and accept the same run-behavior flags instead of a
     hardcoded default.** `src/loop_supervisor/cli.py:416-422` (the
@@ -572,9 +584,15 @@ after the fact get written down.
     headless one. Deferred alongside item 16; see the note at the top
     of this file.
 
+    **Moot: the referenced `tui/app.py` code has since been removed**
+    (see the "Deferred: TUI work" note's update).
+
 18. **DEFERRED. Define and propagate meaningful TUI process exit
     status.** `src/loop_supervisor/cli.py:234-250`. Deferred alongside
     item 16; see the note at the top of this file.
+
+    **Moot: `cmd_tui` is now a no-op stub that always returns 0** (see
+    the "Deferred: TUI work" note's update).
 
 19. **Add parser event-size limits and reconnect/backoff acceptance
     coverage** for the SSE client.
@@ -1468,6 +1486,9 @@ after the fact get written down.
     abandoned plan -- deferred alongside the rest of the TUI work
     rather than decided now; see the note at the top of this file.
 
+    **Moot: `tui/app.py` has since been removed entirely** (see the
+    "Deferred: TUI work" note's update).
+
 41. **`tests/fixtures/fake_opencode.py` emits only the legacy
     `structured_output` response shape; the canonical `info.structured`
     shape it was supposed to gain has no test coverage on this
@@ -1493,6 +1514,9 @@ after the fact get written down.
     if any rendered text ever includes agent- or repository-controlled
     content (a commit message, a file path, an error string) that
     could contain literal Rich markup syntax.
+
+    **Moot: `tests/test_tui_app.py` and `tui/renderers.py` have since
+    been removed** (see the "Deferred: TUI work" note's update).
 
 43. **Opt-in pruning for OpenCode sessions the supervisor created.**
     (Tier 5 — documentation/testing debt)
@@ -1901,6 +1925,12 @@ after the fact get written down.
     work for a UI surface not currently prioritized. README's
     provisioning-isolation claim (see item 48's "Setup" section
     addition) was scoped to `run` explicitly once this was found.
+
+    **Moot: `tui/app.py`'s `_DEFAULT_OPTIONS` has since been removed
+    along with the rest of the in-process TUI** (see the "Deferred: TUI
+    work" note's update). The README's provisioning-isolation scoping
+    to `run`-only stands regardless, since `resume` still has its own,
+    unrelated limitation described above.
 
 53. ~~**Builder commits carry no message body.**~~ **Resolved.** (Tier
     5 — documentation/testing debt)

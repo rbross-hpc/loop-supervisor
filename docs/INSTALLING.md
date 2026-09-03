@@ -154,8 +154,9 @@ full run. Once satisfied:
 loop-supervisor run --project .
 ```
 
-or `loop-supervisor tui --project .` for the interactive view. See the
-main [README](../README.md) for the full run/resume/TUI model.
+for a full unattended run. See the main [README](../README.md) for the
+full run/resume model. (`loop-supervisor tui` exists but is currently a
+no-op stub while the interactive TUI is rebuilt.)
 
 ## Troubleshooting
 

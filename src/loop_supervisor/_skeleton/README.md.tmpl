@@ -77,15 +77,11 @@ Useful flags: `--worktree-root`, `--max-tasks`, `--max-revisions`,
 The checkout must be a clean Git working tree on a real branch (not
 detached `HEAD`) before a run starts.
 
-## Textual TUI
-
-```bash
-loop-supervisor tui --project /path/to/this/checkout
-```
-
 See the `loop-supervisor` package's own documentation for the full
-run/resume/TUI/lock/retry model — that behavior is unchanged from the
-tool this project depends on, not something this project redefines.
+run/resume/lock/retry model — that behavior is unchanged from the tool
+this project depends on, not something this project redefines.
+(`loop-supervisor tui` exists but is currently a no-op stub while the
+interactive TUI is rebuilt.)
 
 ## Testing and quality checks
 
