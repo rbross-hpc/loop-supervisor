@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import signal
+from typing import Any, cast
 
 import pytest
 
@@ -13,7 +14,7 @@ import loop_supervisor.cli as cli_mod
 from loop_supervisor.git import GitError
 from loop_supervisor.locking import LockError
 from loop_supervisor.runtime import RuntimeError_
-from loop_supervisor.supervisor import FailurePersistenceError, LoopError
+from loop_supervisor.supervisor import AdvanceOutcome, FailurePersistenceError, LoopError
 
 
 def _run_args(tmp_path, **overrides):
@@ -665,6 +666,55 @@ def test_build_verbosity_hooks_at_two_adds_stats_consumer_and_composite_observer
     assert on_advance is not None
 
 
+def test_build_on_advance_always_records_history_even_at_verbosity_zero(tmp_path, monkeypatch):
+    """ADR 0034: PhaseHistoryRecorder is composed into on_advance
+    unconditionally, one level below -v -- verbosity 0 still gets a
+    non-None on_advance, unlike _build_verbosity_hooks alone."""
+    observer, consumers, on_advance = cli_mod._build_on_advance(0)
+    assert observer is None
+    assert consumers == []
+    assert on_advance is not None
+
+    recorded: list[Any] = []
+    monkeypatch.setattr(cli_mod, "PhaseHistoryRecorder", lambda: _FakeRecorder(recorded))
+    observer, consumers, on_advance = cli_mod._build_on_advance(0)
+    outcome = cast(AdvanceOutcome, object())
+    on_advance(outcome)
+    assert recorded == [outcome]
+
+
+class _FakeRecorder:
+    def __init__(self, sink: list[Any]) -> None:
+        self._sink = sink
+
+    def on_advance(self, outcome: AdvanceOutcome) -> None:
+        self._sink.append(outcome)
+
+
+def test_build_on_advance_chains_verbosity_reporter_on_top(monkeypatch, capsys):
+    calls: list[Any] = []
+    monkeypatch.setattr(cli_mod, "PhaseHistoryRecorder", lambda: _FakeRecorder(calls))
+    observer, consumers, on_advance = cli_mod._build_on_advance(1)
+    assert isinstance(observer, cli_mod.VerboseReporter)
+
+    class _FakeState:
+        planner_result = None
+        original_task_id = None
+
+    class _FakeOutcome:
+        state = _FakeState()
+        phase_before = "planning"
+        phase_after = "building"
+
+    outcome = cast(AdvanceOutcome, _FakeOutcome())
+    on_advance(outcome)
+    # The (fake) recorder ran, and the real VerboseReporter.on_advance
+    # ran too (printed a phase-transition line to stderr) -- confirming
+    # both halves of the composed callback fired, not just one.
+    assert calls == [outcome]
+    assert "planning -> building" in capsys.readouterr().err
+
+
 def test_cmd_run_passes_verbosity_hooks_to_run_new(tmp_path, monkeypatch):
     captured: dict[str, object] = {}
 
@@ -686,6 +736,9 @@ def test_cmd_run_passes_verbosity_hooks_to_run_new(tmp_path, monkeypatch):
 
 
 def test_cmd_run_omits_verbosity_hooks_when_not_requested(tmp_path, monkeypatch):
+    """At verbosity 0, the `-v`/`-vv` observer/consumers are omitted, but
+    `on_advance` is still populated: ADR 0034's phase-history recorder is
+    always on, one level below `-v` (see `_build_on_advance`)."""
     captured: dict[str, object] = {}
 
     class FakeState:
@@ -702,7 +755,7 @@ def test_cmd_run_omits_verbosity_hooks_when_not_requested(tmp_path, monkeypatch)
     assert rc == 0
     assert captured["server_observer"] is None
     assert captured["session_event_consumers"] == []
-    assert captured["on_advance"] is None
+    assert captured["on_advance"] is not None
 
 
 def test_cmd_resume_passes_verbosity_hooks_to_run_resume(tmp_path, monkeypatch):
@@ -923,3 +976,164 @@ def test_cmd_config_validate_ok_true_exits_zero(tmp_path, monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr()
     assert "all checks passed" in out.out
+
+
+def test_build_parser_wires_runs_prune():
+    parser = cli_mod.build_parser()
+    args = parser.parse_args(["runs", "prune", "--project", "/tmp/x", "--keep-last", "3"])
+    assert args.func is cli_mod.cmd_runs_prune
+    assert args.project == "/tmp/x"
+    assert args.keep_last == 3
+    assert args.older_than is None
+    assert args.run is None
+    assert args.include_verification is False
+    assert args.yes is False
+
+
+def test_build_parser_runs_requires_a_subcommand():
+    parser = cli_mod.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["runs"])
+
+
+def _init_repo_for_prune(tmp_path):
+    import subprocess
+
+    def run(args, cwd):
+        result = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+    project = tmp_path / "project"
+    project.mkdir()
+    run(["init", "-b", "main"], project)
+    run(["config", "user.email", "test@example.com"], project)
+    run(["config", "user.name", "Test"], project)
+    (project / "README.md").write_text("hello\n")
+    run(["add", "-A"], project)
+    run(["commit", "-m", "initial"], project)
+    return project
+
+
+def _write_prune_fixture_run(project, run_id):
+    from loop_supervisor.git import GitRepo
+    from loop_supervisor.state import STATE_SCHEMA_VERSION, RunState, save_state
+    from loop_supervisor.supervisor import _default_run_options
+
+    repo = GitRepo(project)
+    state = RunState(
+        schema_version=STATE_SCHEMA_VERSION,
+        run_id=run_id,
+        git_common_dir=str(repo.common_dir()),
+        integration_path=str(repo.root),
+        integration_branch=repo.current_branch(),
+        integration_commit_at_start=repo.head_commit(),
+        options=_default_run_options(),
+        integration_expected_head=repo.head_commit(),
+        integration_status_snapshot=repo.status_snapshot(),
+        phase="done",
+    )
+    save_state(repo.common_dir(), state)
+    return repo
+
+
+def test_cmd_runs_prune_dry_run_by_default(tmp_path, capsys):
+    project = _init_repo_for_prune(tmp_path)
+    _write_prune_fixture_run(project, "run0000000001")
+
+    args = argparse.Namespace(
+        project=str(project),
+        run=["run0000000001"],
+        keep_last=None,
+        older_than=None,
+        include_verification=False,
+        yes=False,
+    )
+    rc = cli_mod.cmd_runs_prune(args)
+    assert rc == 0
+    out = capsys.readouterr()
+    assert "would remove: run0000000001" in out.out
+    assert "re-run with --yes" in out.out
+
+    from loop_supervisor.git import GitRepo
+    from loop_supervisor.state import list_runs
+
+    assert "run0000000001" in list_runs(GitRepo(project).common_dir())
+
+
+def test_cmd_runs_prune_with_yes_actually_deletes(tmp_path, capsys):
+    project = _init_repo_for_prune(tmp_path)
+    _write_prune_fixture_run(project, "run0000000001")
+
+    args = argparse.Namespace(
+        project=str(project),
+        run=["run0000000001"],
+        keep_last=None,
+        older_than=None,
+        include_verification=False,
+        yes=True,
+    )
+    rc = cli_mod.cmd_runs_prune(args)
+    assert rc == 0
+    out = capsys.readouterr()
+    assert "removed 1 run(s)" in out.out
+
+    from loop_supervisor.git import GitRepo
+    from loop_supervisor.state import list_runs
+
+    assert "run0000000001" not in list_runs(GitRepo(project).common_dir())
+
+
+def test_cmd_runs_prune_rejects_run_with_keep_last(tmp_path, capsys):
+    project = _init_repo_for_prune(tmp_path)
+    args = argparse.Namespace(
+        project=str(project),
+        run=["run0000000001"],
+        keep_last=1,
+        older_than=None,
+        include_verification=False,
+        yes=False,
+    )
+    rc = cli_mod.cmd_runs_prune(args)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "mutually exclusive" in err
+
+
+def test_cmd_runs_prune_no_candidates(tmp_path, capsys):
+    project = _init_repo_for_prune(tmp_path)
+    args = argparse.Namespace(
+        project=str(project),
+        run=None,
+        keep_last=100,
+        older_than=None,
+        include_verification=False,
+        yes=False,
+    )
+    rc = cli_mod.cmd_runs_prune(args)
+    assert rc == 0
+    assert "no runs selected" in capsys.readouterr().out
+
+
+def test_cmd_runs_prune_refuses_while_locked(tmp_path, capsys):
+    from loop_supervisor.git import GitRepo
+    from loop_supervisor.locking import SupervisorLock
+
+    project = _init_repo_for_prune(tmp_path)
+    _write_prune_fixture_run(project, "run0000000001")
+    repo = GitRepo(project)
+    lock = SupervisorLock(repo.common_dir(), operation="run", integration_path=str(repo.root))
+    lock.acquire()
+    try:
+        args = argparse.Namespace(
+            project=str(project),
+            run=["run0000000001"],
+            keep_last=None,
+            older_than=None,
+            include_verification=False,
+            yes=True,
+        )
+        rc = cli_mod.cmd_runs_prune(args)
+        assert rc == 1
+        assert "refusing to prune" in capsys.readouterr().err
+    finally:
+        lock.release()
