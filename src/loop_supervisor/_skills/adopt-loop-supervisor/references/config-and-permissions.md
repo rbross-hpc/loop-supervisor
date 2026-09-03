@@ -36,42 +36,32 @@ computes these entries automatically. Run `loop-supervisor config
 validate` after any manual edit — it checks both the parent itself and
 a representative descendant path.
 
-## 2. Config changes must be committed before a worktree exists
+## 2. `opencode.json` need not be tracked, but must be gitignored if you don't track it
 
-OpenCode resolves `opencode.json` from **the invocation's own working
-directory**, not from wherever the supervisor's server process
-started. For the planner/architect roles this is the integration root
-and rarely matters. For the builder and auditor, each task runs inside
-its own task worktree — a separate git checkout with its own copy of
-every tracked file, including `opencode.json`.
+The supervisor sets `OPENCODE_CONFIG` to the integration root's
+`opencode.json` for every agent invocation, so a builder or auditor
+running inside a task worktree resolves that one file by absolute path
+rather than the worktree's own checked-out copy (ADR 0032). Two
+consequences follow:
 
-This means: if you fix `opencode.json` in the integration root
-*after* a task worktree has already been created (for example, while
-debugging a stuck run), that worktree's own copy of `opencode.json` is
-still whatever it was checked out with, and the fix does not apply to
-it. The builder/auditor invocations running in that worktree will keep
-using the stale config until the worktree itself gets the fix — which
-means committing the same config change again, inside the task
-worktree, on the task's own branch.
+- **A config fix at the integration root reaches in-flight worktrees
+  automatically.** You do not need to re-apply and re-commit the same
+  edit inside each task worktree — the old "commit config before a
+  worktree exists" trap is gone. (This was previously a real failure
+  mode: OpenCode used to load each worktree's own copy, so a mid-run
+  fix at the root silently didn't apply.)
+- **Whether `opencode.json` is version-controlled is your choice.** It
+  often holds environment-specific provider, model, or MCP settings a
+  project may not want committed. Resolution no longer depends on git
+  carrying the file into worktrees.
 
-**Practical implication:** get `opencode.json` and permissions right
-*before* starting the first run, not after. If you do need to fix
-config mid-run because a task worktree already exists:
+If you choose **not** to track `opencode.json`, add it to `.gitignore`
+rather than leaving it merely untracked. The supervisor's cleanliness
+gates and `loop-supervisor config validate` both use `git status
+--porcelain`, which lists untracked-but-not-ignored files — so an
+untracked, unignored `opencode.json` reads as a dirty working tree and
+will block a run. A gitignored file does not appear there.
 
-1. Fix `opencode.json` in the integration root and commit it there.
-2. Also apply the identical fix inside the affected task worktree
-   (`cd` into it, edit, commit on its own branch).
-3. If the worktree's `HEAD` moves as a result, resume may reject it
-   with "resume task worktree has changed since it was paused" —
-   this is loop-supervisor correctly detecting the worktree changed
-   out from under the recorded run state, not a bug. There is no
-   supported "reconcile expected head" command for a moved `HEAD`
-   specifically (see the `use-loop-supervisor` skill's
-   `recovering-an-interrupted-run.md` for the one case that *is*
-   recoverable — uncommitted edits with `HEAD` unchanged, which this
-   is not); treat step 2 above as something you should avoid needing
-   by getting config right at adoption time in the first place.
-
-Checking `loop-supervisor config validate` at both step 0 and step 5
-of the main workflow — before and after writing config — is what
-catches most instances of both gotchas before a run ever starts.
+Run `loop-supervisor config validate` before the first run; it checks
+that `opencode.json` exists on disk and that its `external_directory`
+scoping is correct, regardless of the file's tracking status.

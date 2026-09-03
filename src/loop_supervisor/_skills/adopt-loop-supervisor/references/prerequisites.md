@@ -13,7 +13,7 @@ responds (see `loop-supervisor`'s ADR 0022 if you want the rationale).
 | `git_executable` | Install git; loop-supervisor shells out to it directly. |
 | `opencode_executable` | OpenCode itself isn't installed or isn't on `PATH`. Install it (https://opencode.ai) or pass `--opencode-executable /path/to/opencode` to every `run`/`resume`/`config validate` invocation. |
 | `git_repository` | `--project` doesn't point at a git repository. Adoption requires an existing repo — if there isn't one yet, `git init` it first. |
-| `git_clean_worktree` | Commit or stash outstanding changes, and make sure you're on a real branch, not detached HEAD. loop-supervisor refuses to start a run on a dirty or detached integration worktree. |
+| `git_clean_worktree` | Commit or stash outstanding changes, and make sure you're on a real branch, not detached HEAD. loop-supervisor refuses to start a run on a dirty or detached integration worktree. Note: an `opencode.json` you've chosen not to track counts as a dirty tree unless it's *gitignored* (see `config-and-permissions.md`). |
 | `opencode_json` | `opencode.json` is missing or isn't valid JSON. You'll write this in step 4 of `SKILL.md`; before that, this check failing is expected and not a problem to fix yet. |
 | `external_directory_permission` | See `config-and-permissions.md` — both the task-worktree parent and its `/**` subtree must be allowed. |
 | `agent_definitions` | One or more of `.opencode/agents/loop-{planner,architect,builder,auditor}.md` is missing. You'll copy these in step 3. |

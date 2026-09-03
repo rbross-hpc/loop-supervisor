@@ -40,14 +40,15 @@ Check the same permission configuration first.
 
 **`error: resume task worktree has changed since it was paused`.**
 Something modified the task worktree outside of loop-supervisor's own
-control after it was created — most likely a manual config fix applied
-directly to the worktree (see `config-and-permissions.md`'s second
-gotcha), or a process interrupted mid-edit. If the worktree's `HEAD`
-moved (e.g. a manual commit), there is no supported way to reconcile
-this; avoid needing to by getting config right before starting. If
-`HEAD` did not move and the worktree is merely dirty (e.g. a killed
-builder invocation), this is recoverable — see the `use-loop-supervisor`
-skill's `recovering-an-interrupted-run.md`.
+control after it was created — a manual edit or commit inside it, or a
+process interrupted mid-edit. (Config fixes no longer require touching
+a worktree: the supervisor points every invocation at the integration
+root's `opencode.json` via `OPENCODE_CONFIG`, so fix it there and it
+applies everywhere — see `config-and-permissions.md`.) If the
+worktree's `HEAD` moved (e.g. a manual commit), there is no supported
+way to reconcile this. If `HEAD` did not move and the worktree is
+merely dirty (e.g. a killed builder invocation), this is recoverable —
+see the `use-loop-supervisor` skill's `recovering-an-interrupted-run.md`.
 
 **The planner or auditor requests a design decision
 (`decision_required: true`) and the architect responds `NEEDS_INPUT`.**
