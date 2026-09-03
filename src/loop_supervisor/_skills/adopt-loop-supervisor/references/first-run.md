@@ -9,9 +9,8 @@ any `paused at phase ...` line.
 
 - `final phase: planning` (or similar), with a paused message, and the
   planner's chosen task visible via `loop-supervisor resume` (list
-  mode, no run_id) or the TUI. The task should be a coherent,
-  reasonably-scoped unit of work that plausibly matches
-  `docs/OBJECTIVE.md`.
+  mode, no run_id). The task should be a coherent, reasonably-scoped
+  unit of work that plausibly matches `docs/OBJECTIVE.md`.
 - Exit code `1` is normal here — it means the run paused rather than
   reaching `done`, which is expected after exactly one step.
 
