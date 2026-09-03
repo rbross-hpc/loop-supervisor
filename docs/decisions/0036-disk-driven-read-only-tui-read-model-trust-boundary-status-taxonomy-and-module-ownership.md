@@ -72,23 +72,30 @@ missing during its load, symlinked, non-regular, malformed, identity-mismatched,
 uses an unsupported schema is `unloadable`, with an actionable diagnostic and no
 invented phase or timestamp. History never changes this classification.
 
-Repository activity has exactly these observation variants:
+Repository activity has exactly the variants below. The reader applies these rules
+in order and stops at the first match; later rules are not competing labels:
 
-- `absent`: no lock existed at inspection time;
-- `local_live_associated`: a strictly validated lock names a run, its hostname is
-  local, its PID responds to the existing liveness check, its canonical integration
-  path identifies the selected project, and the named loadable `RunState` has the
-  same run ID and integration path;
-- `fresh_run_unassociated`: a validated local live lock has `run_id = null`; this is
-  repository activity with unknown run association;
-- `unassociated`: a validated local live lock names no discovered, loadable run;
-- `mismatched`: a validated lock's integration path, named run identity, or loaded
-  run integration path conflicts with the selected project;
-- `stale`: a validated local lock names a PID that is demonstrably not live;
-- `remote`: a validated lock names another hostname, so local liveness is unknown;
-  and
-- `malformed`: the lock path or record cannot be safely opened and strictly
-  validated, including a symlink or non-regular file.
+1. `absent` if the verified lock directory has no lock leaf at inspection time.
+2. `malformed` if the directory or present leaf cannot be safely opened, is a symlink
+   or non-regular file, exceeds the structured-input bound below, or the record fails
+   strict lock validation.
+3. `remote` if the validated hostname differs from the local hostname. This wins even
+   when project paths disagree; local PID liveness is not tested for a remote lock.
+4. `stale` if the hostname is local and the existing liveness check proves the PID is
+   dead. This wins over every path or run-association disagreement.
+5. `mismatched` if the local live lock's integration path is null, cannot be
+   canonicalized, or does not equal the selected canonical integration path.
+6. `fresh_run_unassociated` if that matching local live lock has `run_id = null`.
+7. `unassociated` if its non-null run ID has no discovered, loadable current state.
+8. `mismatched` if the named loaded state's validated run ID or canonical integration
+   path disagrees with the lock or selected project.
+9. `local_live_associated` otherwise: the matching local live lock names that
+   loadable run and all three identities agree.
+
+Thus every observation has one deterministic variant. In particular, remote and
+stale take precedence over path mismatch, while path mismatch takes precedence over
+`run_id = null` or run lookup. An unloadable named state is `unassociated`, not
+`mismatched`, because no trusted state identity exists to compare.
 
 A run may be labeled `running` only for `local_live_associated`, and only the named
 run receives that label. Every other run is `not evidenced running`; with an absent
@@ -122,6 +129,41 @@ safe scan leaves the already displayed snapshot intact and reports refresh failu
 a completed scan, including degraded rows, replaces it. The observation time is UI
 metadata only. The reader never retries until files become consistent and never
 turns timestamps into phase starts, durations, heartbeat, stall, or workflow claims.
+
+### Structured-input and rendered-output bounds
+
+Every current-state file, history record, and lock record is opened securely and read
+as bytes up to a hard 4 MiB limit plus one sentinel byte. Observing the sentinel marks
+that artifact `oversized`; its bytes are not passed to a JSON parser and it is handled
+at the same scope as any malformed artifact. UTF-8 decoding is strict for structured
+JSON. After parsing, a shared iterative shape check permits at most 64 nested
+array/object levels, 100,000 aggregate scalar/container nodes, 10,000 members in any
+one object or array, and 1 MiB of UTF-8 bytes in any one string. Exceeding any limit
+is an oversized/malformed diagnostic, never partial valid data. These constants are
+owned by the read-model boundary and are not configurable from artifact contents.
+The 1 MiB log-read and 256 KiB/10,000-line log-render bounds below are separate and
+stricter because logs are unstructured display data.
+
+Current state still has exactly one parser and validator. The implementation must
+extend the supervisor's public `state.load_state` reader (or a public helper that it
+itself calls) to perform the secure 4 MiB-plus-sentinel read and shared shape check
+before its existing `RunState.from_dict` validation. The explorer calls that bounded
+validated API; it must not pre-read, pre-parse, fall back to `json.load`, or construct
+`RunState` independently. Consequently an oversized current snapshot is an
+`unloadable` run for both the explorer and the authoritative state-reader contract,
+not a read-model interpretation of unchecked JSON. History uses the same bounded
+JSON utility followed by its history-specific validator.
+
+No opinionated field, diagnostic, raw-JSON view, or other text payload may contribute
+more than 256 KiB of UTF-8 text or 10,000 rendered lines to one view. The read model
+serializes raw JSON from the already validated and shape-bounded value, then truncates
+at the first limit reached on a Unicode-code-point boundary and returns an explicit
+truncation flag; the presentation appends a fixed literal truncation marker outside
+the payload. Opinionated views apply the same limit after assembling their literal
+text. This rendered bound never changes validation and truncated text is never used
+as evidence. A snapshot scans at most 10,000 run candidates, 10,000 history leaves
+per run, 10,000 commit directories per run, and 10,000 log leaves per commit; excess
+entries produce an incomplete diagnostic rather than unbounded work.
 
 ### History discovery and validation
 
