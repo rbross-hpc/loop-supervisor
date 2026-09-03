@@ -793,6 +793,23 @@ def test_project_complete_immediately(tmp_path):
     assert final.accepted_task_count == 0
 
 
+def test_run_raising_on_advance_does_not_abort_the_run(tmp_path):
+    """A misbehaving on_advance callback must never propagate out of
+    run() and interrupt the loop -- it is a pure observation hook, the
+    same non-fatal contract InvocationObserver callers already rely on."""
+    runner = ScriptedRunner({"loop-planner": [_planner_complete()]})
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+
+    def boom_on_advance(outcome):
+        raise RuntimeError("boom")
+
+    final = supervisor.run(state, on_advance=boom_on_advance)
+
+    assert final.phase == PHASE_DONE
+    assert final.accepted_task_count == 0
+
+
 def test_revise_then_accept(tmp_path):
     runner = ScriptedRunner(
         {

@@ -180,7 +180,7 @@ async def test_refresh_durable_shows_denied_permissions_from_session(tmp_path, m
     """RunSession.denied_permission_count/_summary (runtime.py) are read
     every time _refresh_durable() runs; they are not part of RunState.
     Backlog item 31 and ADR 0021 note the TUI already runs the same
-    headless permission denier via start_server() without previously
+    headless permission policy via start_server() without previously
     surfacing what it denied."""
     repo = _init_repo(tmp_path / "repo")
     _patch_server(monkeypatch)
@@ -201,11 +201,11 @@ async def test_refresh_durable_shows_denied_permissions_from_session(tmp_path, m
         content_before = _static_text(screen.query_one("#durable-content", app_mod.Static))
         assert "Denied permissions" not in content_before
 
-        # No live PermissionDenier exists in this fake-server setup
-        # (base_url stays None, per _FakeServer.start()), so the
+        # No live SessionMonitor/PermissionPolicy exists in this fake-server
+        # setup (base_url stays None, per _FakeServer.start()), so the
         # count/summary RunSession falls back to are these two private
         # snapshot attributes -- exactly what close() itself populates
-        # once a real denier has run (runtime.py:1263-1267).
+        # once a real permission policy has run (runtime.py:1302-1305).
         monkeypatch.setattr(screen._session, "_denied_permission_count", 2)
         monkeypatch.setattr(screen._session, "_denied_permission_summary", ["bash", "webfetch"])
 

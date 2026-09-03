@@ -276,7 +276,7 @@ class SessionMonitor:
             event = normalize_global_event(raw_event)
         except OpenCodeEventError:
             return
-        for consumer in self._consumers:
+        for consumer in list(self._consumers):
             try:
                 consumer.on_event(raw_event, event)
             except Exception as exc:
