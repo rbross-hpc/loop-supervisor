@@ -109,6 +109,21 @@ fresh `run` never records a `run_id` in its lock (`locking.py`), so a
 per-run match is not reliably available, and a wrong permissive guess
 here would delete a live run's own history out from under it.
 
+`--keep-last`/`--older-than` rank runs by `updated_at`, so they only
+ever consider runs `load_state` can actually parse. `--run <id>...` is
+different: an explicitly-named run is selected even when its state
+file exists but fails to load (corrupted, or -- per ADR 0024's
+no-migration policy -- written by an older `STATE_SCHEMA_VERSION`),
+via `_unloadable_candidate_if_present`, as long as *something* for it
+is still on disk (its state file, its history directory, or its
+verification directory). Such a candidate is displayed with
+`phase=?`/`updated_at=?` and an explicit `[unloadable]` tag rather than
+fabricated values, and deletion proceeds by validated run ID alone
+(`prune_runs` never needed to read the state it removes). A `--run
+<id>` naming nothing on disk at all still selects nothing, silently
+(`no runs selected for pruning`) -- that case is indistinguishable from
+a typo and is not escalated to an error.
+
 ## Consequences
 
 - `runs/<run_id>.json` (the existing latest-state snapshot) and
@@ -124,13 +139,31 @@ here would delete a live run's own history out from under it.
 - The TUI is out of scope for this pass: it drives `RunSession`
   directly via `new_run_session`/`resume_run_session` /
   `run_to_completion`, none of which this change touches, so TUI-driven
-  runs do not get phase history capture. Extending it there, if wanted,
-  is a separate follow-up.
+  runs silently get no phase history capture, with no in-app signal
+  that CLI-driven and TUI-driven runs now diverge in this respect.
+  Extending it there, if wanted, is a separate follow-up.
 - `runs prune` never deletes anything while any lock file exists in the
   repository, even one unrelated to the run(s) being pruned. This is
   strictly safer than it is precise; an operator who wants to prune
   while a run is genuinely active elsewhere in the same repository must
   wait for that run to finish (or fail) and release its lock first.
+- `runs prune`'s lock check (`lock_is_present`) happens once, before
+  the delete loop, not held for its duration: a `run`/`resume`/`tui`
+  invocation could acquire the lock in the window between that check
+  and a given candidate's `shutil.rmtree`, and prune would then delete
+  a now-live run's state or history. This is an accepted, narrow
+  (single-process, millisecond-scale) race for an explicit, operator-
+  initiated command, not a design goal; holding the lock for the whole
+  prune was not done since prune's own writes never need `advance()`'s
+  guarantees, only its absence of concurrent mutation.
+- After a `STATE_SCHEMA_VERSION` bump, every run written under the
+  prior schema becomes unloadable (ADR 0024: no migration path) and is
+  therefore invisible to `--keep-last`/`--older-than`, which cannot
+  rank what they cannot parse. Such runs remain reachable and prunable
+  one at a time via explicit `--run <id>` (see Decision); there is no
+  bulk "prune everything unloadable" flag, since enumerating unloadable
+  runs to select by default risks silently sweeping up something an
+  operator did not name.
 - Retention is unbounded by default (append-only forever, per project
   preference); disk usage from history accumulates until an operator
   runs `runs prune` explicitly. No automatic pruning was added.

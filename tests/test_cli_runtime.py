@@ -1137,3 +1137,35 @@ def test_cmd_runs_prune_refuses_while_locked(tmp_path, capsys):
         assert "refusing to prune" in capsys.readouterr().err
     finally:
         lock.release()
+
+
+def test_cmd_runs_prune_marks_unloadable_run_and_still_deletes_it(tmp_path, capsys):
+    """A --run id whose state file fails load_state() (e.g. orphaned by
+    a STATE_SCHEMA_VERSION bump, per ADR 0024's no-migration policy)
+    must be visibly annotated as unloadable and still be prunable."""
+    import json
+
+    project = _init_repo_for_prune(tmp_path)
+    runs_dir = project / ".git" / "loop-supervisor" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    state_path = runs_dir / "run0000000001.json"
+    state_path.write_text(json.dumps({"schema_version": 999, "run_id": "run0000000001"}))
+
+    args = argparse.Namespace(
+        project=str(project),
+        run=["run0000000001"],
+        keep_last=None,
+        older_than=None,
+        include_verification=False,
+        yes=False,
+    )
+    rc = cli_mod.cmd_runs_prune(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "would remove: run0000000001 (phase=?, updated_at=?) [unloadable]" in out
+
+    args.yes = True
+    rc = cli_mod.cmd_runs_prune(args)
+    assert rc == 0
+    assert "removed 1 run(s)" in capsys.readouterr().out
+    assert not state_path.exists()

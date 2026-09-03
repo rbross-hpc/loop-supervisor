@@ -480,6 +480,8 @@ def cmd_runs_prune(args: argparse.Namespace) -> int:
     action = "would remove" if not args.yes else "removing"
     for candidate in candidates:
         extras = []
+        if not candidate.loadable:
+            extras.append("unloadable")
         if candidate.has_history:
             extras.append("history")
         if candidate.has_verification:
