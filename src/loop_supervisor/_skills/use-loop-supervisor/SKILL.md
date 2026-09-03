@@ -60,11 +60,37 @@ running `git checkout --` or `git clean` in a task worktree, or before
 concluding a resume failure means the run must be abandoned — both of
 those are easy to get wrong in a way that discards real, good work.
 
+## What the integration branch is (you don't create one)
+
+The integration branch is simply whatever branch is checked out in the
+directory you pass to `--project` when the run starts — the supervisor
+reads it with `git branch --show-current` at that moment and treats it
+as the merge target for the rest of the run. There is no
+`--integration-branch` flag, and the supervisor never creates a branch
+for this purpose. Nothing to set up beyond checking out the branch you
+want.
+
+Point `--project` at a checkout of whichever branch fits your own dev
+process — running it against a `main` checkout works fine, and the
+loop then merges each accepted task's `loop/task-NNN` branch into
+`main` with its own `--no-ff` merges. Equally, pointing it at a
+checkout of some `feature/...` branch you want the loop to build up
+works the same way. The supervisor doesn't prefer or require `main`;
+it adapts to whatever's checked out. A separate branch created just to
+be "the integration branch" is redundant — the loop's own per-task
+worktrees and branches are the entire isolation mechanism; your
+checked-out branch only ever receives finished, accepted merges.
+
+One consequence worth knowing: `resume` requires the *same* branch to
+still be checked out as when the run started (a mismatch fails with
+`resume integration branch mismatch`), so don't switch what's checked
+out in `--project` mid-run.
+
 ## Before trusting (and pushing) what the loop merged
 
-The loop merges into your integration branch on its own; treat that
-merge the way you would treat a human contributor's PR, not as
-automatically correct just because the gates passed. Read
+The loop merges into whatever you pointed `--project` at (see above) on
+its own; treat that merge the way you would treat a human contributor's
+PR, not as automatically correct just because the gates passed. Read
 `references/auditing-a-merge.md` for the specific checks (merge shape,
 commit-message quality, failing-first evidence, gate re-run on the
 merged result) before pushing.
