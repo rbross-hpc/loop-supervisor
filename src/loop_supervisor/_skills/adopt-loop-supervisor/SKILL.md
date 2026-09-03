@@ -146,4 +146,4 @@ further steps. Once they're satisfied, hand off to normal operation:
 loop-supervisor run --project .
 ```
 
-or `loop-supervisor tui --project .` for the interactive view.
+for a full unattended run.

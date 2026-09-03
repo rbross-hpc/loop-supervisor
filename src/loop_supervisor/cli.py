@@ -85,13 +85,10 @@ def _bridge_sigterm_to_keyboard_interrupt() -> Iterator[None]:
     never installed in library code such as `RunSession` or
     `OpenCodeServer`, so importing loop_supervisor does not silently
     change a host application's signal disposition, and never wrapped
-    around `cmd_tui`: Textual's Linux driver already strips the
-    terminal's ISIG flag in raw mode (Ctrl-C is read as an ordinary
-    keypress, not delivered as SIGINT) and injecting an externally
-    raised KeyboardInterrupt into Textual's running asyncio event loop is
-    untested and could leave the terminal stuck in raw mode. TUI-side
-    signal handling needs its own UX decision and is deliberately out of
-    scope here (see ADR 0015).
+    around `cmd_tui`: the interactive TUI is currently a no-op stub
+    pending a rebuild (see the ADR retiring the in-process Textual TUI),
+    and its eventual replacement will need its own signal-handling UX
+    decision. Deliberately out of scope here (see ADR 0015).
     """
     previous = signal.getsignal(signal.SIGTERM)
 
@@ -643,21 +640,19 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
-    project_root = _project_root(args.project)
-    load_dotenv(project_root / ".env")
+    """No-op stub: the in-process Textual TUI has been retired.
 
-    from .tui.app import LoopSupervisorApp
-
-    try:
-        app = LoopSupervisorApp(
-            project_root,
-            recover_stale_lock=getattr(args, "recover_stale_lock", False),
-        )
-    except _EXPECTED_CLI_ERRORS as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-    app.run()
+    A replacement TUI that reads on-disk run state (per-phase history
+    under `runs/<run_id>/` and verification logs) is planned but not yet
+    built. See the ADR retiring the in-process TUI for context. Until
+    then, `run`/`resume` are the supported entry points.
+    """
+    print(
+        "loop-supervisor: the interactive TUI is being rebuilt and is "
+        "currently unavailable.\nUse `loop-supervisor run` or "
+        "`loop-supervisor resume` instead.",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -788,13 +783,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prune_parser.set_defaults(func=cmd_runs_prune)
 
-    tui_parser = sub.add_parser("tui", help="Open the Textual TUI")
-    tui_parser.add_argument("--project", default=None, help="Path to the integration repo")
-    tui_parser.add_argument(
-        "--recover-stale-lock",
-        action="store_true",
-        help="Remove a stale lock from a dead local process and retry",
+    tui_parser = sub.add_parser(
+        "tui", help="Interactive TUI (currently a no-op stub; being rebuilt)"
     )
+    tui_parser.add_argument("--project", default=None, help="Path to the integration repo")
     tui_parser.set_defaults(func=cmd_tui)
 
     init_parser = sub.add_parser(

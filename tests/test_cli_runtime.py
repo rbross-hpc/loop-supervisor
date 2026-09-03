@@ -782,19 +782,15 @@ def test_cmd_resume_passes_verbosity_hooks_to_run_resume(tmp_path, monkeypatch):
     assert captured["on_advance"] is not None
 
 
-def test_cmd_tui_normalizes_prelaunch_errors(tmp_path, monkeypatch, capsys):
-    import loop_supervisor.tui.app as app_mod
-
-    def fake_init(self, *args, **kwargs):
-        raise LockError("lock is held by another process")
-
-    monkeypatch.setattr(app_mod.LoopSupervisorApp, "__init__", fake_init)
-
+def test_cmd_tui_is_a_no_op_stub(tmp_path, capsys):
+    """The interactive TUI has been retired pending a rebuild; `tui`
+    prints a notice and exits 0 rather than launching anything."""
     rc = cli_mod.cmd_tui(_resume_args(tmp_path, run_id=None))
 
-    assert rc == 1
+    assert rc == 0
     captured = capsys.readouterr()
-    assert captured.err.startswith("error: ")
+    assert "run" in captured.err
+    assert "resume" in captured.err
     assert "Traceback" not in captured.err
 
 
@@ -886,36 +882,20 @@ def test_cmd_resume_wraps_run_resume_in_the_sigterm_bridge(tmp_path, monkeypatch
     )
 
 
-def test_cmd_tui_is_not_wrapped_by_the_sigterm_bridge(tmp_path, monkeypatch):
-    """cmd_tui must not install the SIGTERM bridge: Textual's Linux
-    driver already disables terminal-level SIGINT delivery in raw mode,
-    and injecting an externally raised KeyboardInterrupt into Textual's
-    running event loop is untested and could leave the terminal stuck in
-    raw mode. Verified by observing the disposition *during* the
-    LoopSupervisorApp construction call, not just before/after cmd_tui
-    returns -- checking only before/after is insufficient because the
-    bridge's own `finally` restores the prior disposition before
-    propagating, which would mask an accidental wrap. Actually
-    delivering a real SIGTERM with default disposition here would
-    terminate this test process outright, which is the whole point:
-    that must not be caught and converted."""
-    import loop_supervisor.tui.app as app_mod
-
+def test_cmd_tui_is_not_wrapped_by_the_sigterm_bridge(tmp_path):
+    """cmd_tui must not install the SIGTERM bridge. It is currently a
+    no-op stub, but the eventual TUI replacement will need its own
+    signal-handling UX decision (see the docstring on
+    `_bridge_sigterm_to_keyboard_interrupt`), so this pins the
+    "never wrapped" invariant regardless of what `cmd_tui` does
+    internally."""
     before = signal.getsignal(signal.SIGTERM)
-    seen = {}
-
-    def fake_init(self, *args, **kwargs):
-        seen["disposition"] = signal.getsignal(signal.SIGTERM)
-        raise LockError("lock is held by another process")
-
-    monkeypatch.setattr(app_mod.LoopSupervisorApp, "__init__", fake_init)
 
     rc = cli_mod.cmd_tui(_resume_args(tmp_path, run_id=None))
     after = signal.getsignal(signal.SIGTERM)
 
-    assert rc == 1
-    assert seen["disposition"] is before, "cmd_tui must not touch SIGTERM disposition at all"
-    assert after is before
+    assert rc == 0
+    assert after is before, "cmd_tui must not touch SIGTERM disposition at all"
 
 
 def test_build_parser_wires_config_validate():

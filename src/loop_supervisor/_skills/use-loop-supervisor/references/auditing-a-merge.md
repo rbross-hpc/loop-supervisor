@@ -58,7 +58,7 @@ are the same commands the supervisor itself already ran against the
 task's commit — rerunning them on the merged integration branch is
 still worth doing, since the two are not always guaranteed to be
 identical (see the project's own backlog for whether `[provision]`/
-`[verify]` config applies uniformly across `run`/`resume`/`tui`).
+`[verify]` config applies uniformly across `run`/`resume`).
 
 ## Spot-check the failing-first claim
 
