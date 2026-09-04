@@ -3,7 +3,7 @@ description: Implements one bounded project task.
 mode: primary
 model: argo/GPT-5.6 Terra
 temperature: 0.1
-steps: 80
+steps: 120
 permission:
   edit: allow
   skill: deny

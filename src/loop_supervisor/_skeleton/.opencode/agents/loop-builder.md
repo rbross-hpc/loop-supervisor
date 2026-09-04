@@ -2,7 +2,7 @@
 description: Implements one bounded project task.
 mode: primary
 temperature: 0.1
-steps: 80
+steps: 120
 permission:
   edit: allow
   skill: deny
