@@ -90,6 +90,11 @@ class GitRepo:
             raise GitError("git executable not found on PATH") from exc
         return result.returncode == 0 and result.stdout.strip() == "true"
 
+    def integration_root(self) -> Path:
+        """Return Git's canonical worktree root for this repository context."""
+        result = _run(["rev-parse", "--show-toplevel"], cwd=self.root)
+        return Path(result.stdout.strip()).resolve()
+
     def common_dir(self) -> Path:
         result = _run(["rev-parse", "--git-common-dir"], cwd=self.root)
         common = Path(result.stdout.strip())
