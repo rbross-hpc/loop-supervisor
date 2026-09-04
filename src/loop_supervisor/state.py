@@ -1121,8 +1121,12 @@ def _required_open_flag(name: str) -> int:
 
 
 @contextlib.contextmanager
-def _open_state_directory(git_common_dir: Path, *, create: bool):
-    """Yield the runs directory descriptor without following storage symlinks."""
+def open_state_directory(git_common_dir: Path, *, create: bool):
+    """Yield the runs directory descriptor without following storage symlinks.
+
+    Read-model consumers use this public descriptor boundary to enumerate state
+    candidates without reverting to path-based globbing.
+    """
     directory_flag = _required_open_flag("O_DIRECTORY")
     nofollow_flag = _required_open_flag("O_NOFOLLOW")
     supervisor = git_common_dir / "loop-supervisor"
@@ -1184,7 +1188,7 @@ def save_state(git_common_dir: Path, state: RunState) -> None:
     target = state_path(git_common_dir, state.run_id)
     tmp_name = f".tmp-{uuid.uuid4().hex}.json"
     try:
-        with _open_state_directory(git_common_dir, create=True) as directory_fd:
+        with open_state_directory(git_common_dir, create=True) as directory_fd:
             _reject_state_symlink(directory_fd, target.name, target)
             fd = os.open(
                 tmp_name,
@@ -1229,7 +1233,7 @@ def load_state(git_common_dir: Path, run_id: str) -> RunState:
     validated_id = validate_run_id(run_id)
     path = state_path(git_common_dir, validated_id)
     try:
-        with _open_state_directory(git_common_dir, create=False) as directory_fd:
+        with open_state_directory(git_common_dir, create=False) as directory_fd:
             _reject_state_symlink(directory_fd, path.name, path)
             try:
                 data = read_bounded_json(directory_fd, path.name, path)
