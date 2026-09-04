@@ -93,6 +93,35 @@ def test_load_missing_run_raises(tmp_path):
         load_state(tmp_path, "does-not-exist")
 
 
+@pytest.mark.parametrize(
+    ("payload", "match"),
+    [
+        (b" " * (4 * 1024 * 1024 + 1), "oversized"),
+        (b'"' + b"x" * (1024 * 1024 + 1) + b'"', "string"),
+        (b"[" * 65 + b"0" + b"]" * 65, "nesting"),
+        (b"[" + b"0," * 100_000 + b"0]", "node"),
+        (b"[" + b"0," * 10_000 + b"0]", "members"),
+    ],
+)
+def test_load_state_rejects_bounded_json_before_state_validation(tmp_path, payload, match):
+    run_id = new_run_id()
+    runs = tmp_path / "loop-supervisor" / "runs"
+    runs.mkdir(parents=True)
+    (runs / f"{run_id}.json").write_bytes(payload)
+
+    with pytest.raises(StateError, match=match):
+        load_state(tmp_path, run_id)
+
+
+def test_load_state_rejects_non_regular_json_target(tmp_path):
+    run_id = new_run_id()
+    target = tmp_path / "loop-supervisor" / "runs" / f"{run_id}.json"
+    target.mkdir(parents=True)
+
+    with pytest.raises(StateError, match="regular file"):
+        load_state(tmp_path, run_id)
+
+
 def test_load_rejects_wrong_schema_version(tmp_path):
     state = _make_state(new_run_id())
     save_state(tmp_path, state)
