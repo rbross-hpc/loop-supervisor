@@ -1,6 +1,7 @@
 ---
 description: Chooses the next coherent task for the project.
 mode: primary
+model: argo/Claude Opus 4.8
 temperature: 0.1
 steps: 20
 permission:

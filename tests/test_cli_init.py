@@ -17,44 +17,59 @@ _SKELETON_AGENTS_DIR = _REPO_ROOT / "src" / "loop_supervisor" / "_skeleton" / ".
 # which assumes this project's own language/tooling (pytest, ruff,
 # mypy) and would be actively wrong advice pasted into an arbitrary
 # new project. Divergence in loop-builder.md and loop-auditor.md is
-# therefore intentional, not drift; loop-planner.md has no such
-# repository-specific content and is expected to match exactly.
-# loop-architect.md is templated (ADR 0023: generated projects ship no
-# provider configuration, so the architect's `model:` pin is optional
-# and substituted at init time) and is compared separately, modulo
-# that one line. This allowlist exists so a *future*, unintended
-# divergence in the two allowed-to-differ files is still caught if it
-# stops being about "Testing discipline" specifically -- see
+# therefore intentional, not drift.
+#
+# Every live agent also pins this repository's own development model
+# choice (its own Argo/OpenCode setup, not something generic to every
+# loop-supervisor project -- ADR 0023) with a `model:` frontmatter
+# line. The generic skeleton must stay provider-neutral, so that line
+# is expected to be absent from every skeleton copy and is stripped
+# before comparison in every test below. loop-planner.md has no other
+# repository-specific content and is expected to match exactly once
+# that one line is set aside. loop-architect.md is additionally
+# templated (its `model:` pin is user-overridable at init time via
+# `--architect-model`) and is compared separately. This allowlist
+# exists so a *future*, unintended divergence in the two
+# allowed-to-differ files is still caught if it stops being about
+# "Testing discipline" specifically -- see
 # test_skeleton_agent_divergence_is_limited_to_testing_discipline
 # below.
 _EXPECTED_IDENTICAL = ("loop-planner.md",)
 _EXPECTED_TO_DIVERGE = ("loop-builder.md", "loop-auditor.md")
 
 
+def _without_model_line(text: str) -> str:
+    """Drop this repository's own `model:` frontmatter pin so live/skeleton
+    comparisons focus on prompt content, not this project's own model
+    choice (ADR 0023: generated projects ship no provider configuration,
+    so the skeleton never pins a model)."""
+    return "\n".join(line for line in text.splitlines() if not line.startswith("model: ")) + "\n"
+
+
 def test_skeleton_agents_planner_matches_live_exactly():
-    """loop-planner.md has no repository-specific content, so the
-    packaged skeleton copy `init` ships to every new project must be
-    byte-identical to this repository's own -- any difference here is
-    unintended drift (see backlog item 35), not an intentional
-    divergence."""
+    """loop-planner.md has no repository-specific content beyond its own
+    `model:` pin, so the packaged skeleton copy `init` ships to every new
+    project must match this repository's own byte-for-byte once that pin
+    is set aside -- any other difference here is unintended drift (see
+    backlog item 35), not an intentional divergence."""
     for name in _EXPECTED_IDENTICAL:
-        live = (_LIVE_AGENTS_DIR / name).read_text()
+        live = _without_model_line((_LIVE_AGENTS_DIR / name).read_text())
         skeleton = (_SKELETON_AGENTS_DIR / name).read_text()
         assert skeleton == live, (
             f"{name}: skeleton copy has drifted from the live agent prompt; "
             "sync src/loop_supervisor/_skeleton/.opencode/agents/ from "
-            ".opencode/agents/ (or update this test if the divergence is "
-            "now intentional)"
+            ".opencode/agents/ (ignoring the live-only model: pin), or "
+            "update this test if the divergence is now intentional"
         )
 
 
 def test_skeleton_architect_matches_live_modulo_model_line():
     """loop-architect.md.tmpl differs from the live loop-architect.md in
-    exactly one respect: the live file pins `model: argo/Claude Opus
-    4.8` (this project's own development choice, per ADR 0023), while
-    the skeleton substitutes `__LOOP_SUPERVISOR_ARCHITECT_MODEL_LINE__`
-    -- empty by default, or an `--architect-model`-supplied line at
-    init time. Any other difference is unintended drift."""
+    exactly one respect: the live file pins `model: argo/GPT-5.6 Sol`
+    (this project's own development choice, per ADR 0023), while the
+    skeleton substitutes `__LOOP_SUPERVISOR_ARCHITECT_MODEL_LINE__` --
+    empty by default, or an `--architect-model`-supplied line at init
+    time. Any other difference is unintended drift."""
     live_lines = (_LIVE_AGENTS_DIR / "loop-architect.md").read_text().splitlines()
     skeleton_lines = (_SKELETON_AGENTS_DIR / "loop-architect.md.tmpl").read_text().splitlines()
 
@@ -67,7 +82,7 @@ def test_skeleton_architect_matches_live_modulo_model_line():
         assert (
             tag == "replace"
             and skeleton_only == ["__LOOP_SUPERVISOR_ARCHITECT_MODEL_LINE__temperature: 0.1"]
-            and live_only == ["model: argo/Claude Opus 4.8", "temperature: 0.1"]
+            and live_only == ["model: argo/GPT-5.6 Sol", "temperature: 0.1"]
         ), (
             "loop-architect.md.tmpl differs from the live agent prompt in a way "
             "not accounted for by the model-line placeholder "
@@ -90,7 +105,7 @@ def test_skeleton_agent_divergence_is_limited_to_testing_discipline():
     missing from live, unlike a one-directional line-membership diff.
     """
     for name in _EXPECTED_TO_DIVERGE:
-        live_lines = (_LIVE_AGENTS_DIR / name).read_text().splitlines()
+        live_lines = _without_model_line((_LIVE_AGENTS_DIR / name).read_text()).splitlines()
         skeleton_lines = (_SKELETON_AGENTS_DIR / name).read_text().splitlines()
 
         matcher = difflib.SequenceMatcher(a=skeleton_lines, b=live_lines, autojunk=False)
