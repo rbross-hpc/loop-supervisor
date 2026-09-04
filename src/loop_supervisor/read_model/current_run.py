@@ -78,7 +78,7 @@ def load_current_run(git_common_dir: Path, run_id: str) -> CurrentRun:
         created_at=state.created_at,
         updated_at=state.updated_at,
         integration_branch=state.integration_branch,
-        current_task_id=state.original_task_id,
+        current_task_id=_current_task_id(state.planner_result),
         accepted_task_count=state.accepted_task_count,
         revision_count=state.revision_count,
         replan_count=state.replan_count,
@@ -88,6 +88,14 @@ def load_current_run(git_common_dir: Path, run_id: str) -> CurrentRun:
         latest_operational_error=error_message,
         diagnostic=None,
     )
+
+
+def _current_task_id(planner_result: dict[str, object] | None) -> str | None:
+    """Return the validated planner's current logical task, when one exists."""
+    if planner_result is None:
+        return None
+    task_id = planner_result.get("task_id")
+    return task_id if isinstance(task_id, str) else None
 
 
 def _safe_diagnostic(error: Exception) -> str:

@@ -35,9 +35,13 @@ def _save_state(
     git_common_dir: Path,
     run_id: str = "current",
     *,
+    phase: str | None = None,
+    original_task_id: str | None = "task-42",
+    planner_task_id: str = "task-42",
     pending_question: dict[str, object] | None = None,
     last_error: dict[str, object] | None = None,
 ) -> Path:
+    creating_worktree = phase == "creating_worktree"
     state = RunState(
         schema_version=STATE_SCHEMA_VERSION,
         run_id=run_id,
@@ -48,16 +52,19 @@ def _save_state(
         options=_options(),
         integration_expected_head="abc123",
         integration_status_snapshot="",
-        original_task_id="task-42",
-        task_worktree_path="/worktrees/task-42",
-        task_branch="loop/task-42",
-        task_base_commit="abc123",
-        task_expected_head="abc123",
-        task_status_snapshot="",
-        phase="awaiting_input" if pending_question is not None else "planning",
+        original_task_id=original_task_id,
+        task_worktree_path=None if creating_worktree else "/worktrees/task-42",
+        task_branch=None if creating_worktree else "loop/task-42",
+        task_base_commit=None if creating_worktree else "abc123",
+        task_expected_head=None if creating_worktree else "abc123",
+        task_status_snapshot=None if creating_worktree else "",
+        pending_worktree_path="/worktrees/task-42" if creating_worktree else None,
+        pending_worktree_branch="loop/task-42" if creating_worktree else None,
+        pending_worktree_base="abc123" if creating_worktree else None,
+        phase=phase or ("awaiting_input" if pending_question is not None else "planning"),
         planner_result={
             "status": "READY",
-            "task_id": "task-42",
+            "task_id": planner_task_id,
             "objective": "Build the detail reader",
             "rationale": "The summary needs it",
             "acceptance_criteria": ["Map current state"],
@@ -88,6 +95,29 @@ def _save_state(
     payload["updated_at"] = "2026-01-02T00:00:00+00:00"
     path.write_text(json.dumps(payload))
     return path
+
+
+def test_load_current_run_uses_replanned_logical_task_identity(tmp_path: Path) -> None:
+    _save_state(tmp_path, original_task_id="stable-worktree-task", planner_task_id="replanned-task")
+
+    current = load_current_run(tmp_path, "current")
+
+    assert current.loadable is True, current.diagnostic
+    assert current.current_task_id == "replanned-task"
+
+
+def test_load_current_run_uses_planner_task_while_creating_worktree(tmp_path: Path) -> None:
+    _save_state(
+        tmp_path,
+        phase="creating_worktree",
+        original_task_id=None,
+        planner_task_id="planned-task",
+    )
+
+    current = load_current_run(tmp_path, "current")
+
+    assert current.loadable is True, current.diagnostic
+    assert current.current_task_id == "planned-task"
 
 
 def test_load_current_run_maps_validated_state_into_immutable_summary(tmp_path: Path) -> None:
