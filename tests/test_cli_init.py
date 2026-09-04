@@ -24,17 +24,19 @@ _SKELETON_AGENTS_DIR = _REPO_ROOT / "src" / "loop_supervisor" / "_skeleton" / ".
 # loop-supervisor project -- ADR 0023) with a `model:` frontmatter
 # line. The generic skeleton must stay provider-neutral, so that line
 # is expected to be absent from every skeleton copy and is stripped
-# before comparison in every test below. loop-planner.md has no other
-# repository-specific content and is expected to match exactly once
-# that one line is set aside. loop-architect.md is additionally
-# templated (its `model:` pin is user-overridable at init time via
-# `--architect-model`) and is compared separately. This allowlist
-# exists so a *future*, unintended divergence in the two
-# allowed-to-differ files is still caught if it stops being about
-# "Testing discipline" specifically -- see
-# test_skeleton_agent_divergence_is_limited_to_testing_discipline
-# below.
-_EXPECTED_IDENTICAL = ("loop-planner.md",)
+# before comparison in every test below. loop-architect.md is
+# additionally templated (its `model:` pin is user-overridable at init
+# time via `--architect-model`) and is compared separately.
+#
+# loop-planner.md is currently a deliberate, temporary exception: its
+# live copy is carrying an in-progress task-sizing prompt revision
+# (tighter task scoping, 1-3 acceptance criteria, deferred-scope
+# rationale) that is being validated against real planner invocations
+# before being folded into the generic skeleton every new project
+# gets. There is intentionally no drift test for loop-planner.md while
+# this is live-only; once the revision is validated, sync it into
+# src/loop_supervisor/_skeleton/.opencode/agents/loop-planner.md and
+# restore exact-match (or model-line-modulo) parity coverage.
 _EXPECTED_TO_DIVERGE = ("loop-builder.md", "loop-auditor.md")
 
 
@@ -44,23 +46,6 @@ def _without_model_line(text: str) -> str:
     choice (ADR 0023: generated projects ship no provider configuration,
     so the skeleton never pins a model)."""
     return "\n".join(line for line in text.splitlines() if not line.startswith("model: ")) + "\n"
-
-
-def test_skeleton_agents_planner_matches_live_exactly():
-    """loop-planner.md has no repository-specific content beyond its own
-    `model:` pin, so the packaged skeleton copy `init` ships to every new
-    project must match this repository's own byte-for-byte once that pin
-    is set aside -- any other difference here is unintended drift (see
-    backlog item 35), not an intentional divergence."""
-    for name in _EXPECTED_IDENTICAL:
-        live = _without_model_line((_LIVE_AGENTS_DIR / name).read_text())
-        skeleton = (_SKELETON_AGENTS_DIR / name).read_text()
-        assert skeleton == live, (
-            f"{name}: skeleton copy has drifted from the live agent prompt; "
-            "sync src/loop_supervisor/_skeleton/.opencode/agents/ from "
-            ".opencode/agents/ (ignoring the live-only model: pin), or "
-            "update this test if the divergence is now intentional"
-        )
 
 
 def test_skeleton_architect_matches_live_modulo_model_line():
