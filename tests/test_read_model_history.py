@@ -154,3 +154,42 @@ def test_load_history_reports_record_that_disappears_after_enumeration(tmp_path,
     assert any(
         diagnostic.seq == 1 and "open" in diagnostic.reason for diagnostic in loaded.diagnostics
     )
+
+
+def test_load_history_diagnoses_oversized_filename_sequence_without_crashing(tmp_path, monkeypatch):
+    directory = tmp_path / "loop-supervisor" / "runs" / "run-1"
+    directory.mkdir(parents=True)
+    oversized_name = f"{'9' * 5_000}-planning.json"
+    monkeypatch.setattr(history.os, "listdir", lambda _fd: [oversized_name])
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert loaded.entries == ()
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert len(loaded.diagnostics) == 1
+    assert loaded.diagnostics[0].reason == "filename sequence is too large"
+    assert len(loaded.diagnostics[0].artifact) < 300
+
+
+def test_load_history_reports_huge_sparse_sequence_as_one_bounded_gap(tmp_path):
+    huge_seq = 99_999_999_999_999_999_999
+    _write_history(tmp_path, "0001-planning.json", _record("run-1", 1))
+    _write_history(tmp_path, f"{huge_seq}-planning.json", _record("run-1", huge_seq))
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert [entry.seq for entry in loaded.entries] == [1, huge_seq]
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert [(diagnostic.seq, diagnostic.reason) for diagnostic in loaded.diagnostics] == [
+        (2, f"sequence gap from 2 to {huge_seq - 1}")
+    ]
+
+
+def test_history_entry_counters_are_immutable(tmp_path):
+    _write_history(tmp_path, "0001-planning.json", _record("run-1", 1))
+
+    entry = load_history(tmp_path, "run-1").entries[0]
+
+    with pytest.raises(TypeError, match="mappingproxy.*does not support item assignment"):
+        entry.counters["revision_count"] = 1
+    assert entry.counters["revision_count"] == 0

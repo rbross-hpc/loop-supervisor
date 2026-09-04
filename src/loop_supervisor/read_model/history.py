@@ -5,12 +5,13 @@ from __future__ import annotations
 import os
 import re
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -27,6 +28,9 @@ from ..supervisor import AdvanceStatus
 from .json_reader import BoundedJsonError, read_bounded_json
 
 _HISTORY_NAME_RE = re.compile(r"^(?P<seq>[0-9]{4,})-(?P<phase>[a-z_]+)\.json$")
+_MAX_SEQUENCE_DIGITS = 128
+"""Maximum filename sequence digits accepted for bounded numeric processing."""
+_MAX_DIAGNOSTIC_ARTIFACT_LENGTH = 256
 _COUNTER_FIELDS = frozenset(
     {
         "accepted_task_count",
@@ -75,7 +79,7 @@ class HistoryEntry:
     phase_after: str
     status: AdvanceStatus
     recorded_at: str
-    counters: dict[str, int]
+    counters: Mapping[str, int]
     original_task_id: str | None
     has_result: bool
     has_error: bool
@@ -163,14 +167,19 @@ def _load_enumerated(
         if match is None:
             diagnostics.append(HistoryDiagnostic(name, "invalid history filename"))
             continue
-        seq = int(match["seq"])
-        phase = match["phase"]
-        if seq <= 0 or phase not in ALL_PHASES:
+        parsed_seq = _parse_filename_sequence(match["seq"])
+        if parsed_seq is None:
             diagnostics.append(
-                HistoryDiagnostic(name, "filename has invalid sequence or phase", seq)
+                HistoryDiagnostic(_safe_artifact_name(name), "filename sequence is too large")
             )
             continue
-        candidates.setdefault(seq, []).append((name, phase))
+        phase = match["phase"]
+        if parsed_seq <= 0 or phase not in ALL_PHASES:
+            diagnostics.append(
+                HistoryDiagnostic(name, "filename has invalid sequence or phase", parsed_seq)
+            )
+            continue
+        candidates.setdefault(parsed_seq, []).append((name, phase))
 
     entries: list[HistoryEntry] = []
     for seq in sorted(candidates):
@@ -193,19 +202,35 @@ def _load_enumerated(
     return HistoryLoad(tuple(entries), completeness, tuple(diagnostics))
 
 
+def _parse_filename_sequence(value: str) -> int | None:
+    """Return a bounded numeric filename sequence without huge-int conversion."""
+    if len(value) > _MAX_SEQUENCE_DIGITS:
+        return None
+    return int(value)
+
+
+def _safe_artifact_name(name: str) -> str:
+    """Bound a diagnostic's untrusted logical artifact name."""
+    if len(name) <= _MAX_DIAGNOSTIC_ARTIFACT_LENGTH:
+        return name
+    return f"{name[: _MAX_DIAGNOSTIC_ARTIFACT_LENGTH - 3]}..."
+
+
 def _append_gap_diagnostics(
     entries: list[HistoryEntry], diagnostics: list[HistoryDiagnostic]
 ) -> None:
-    sequences = {entry.seq for entry in entries}
-    candidate_sequences = {
-        diagnostic.seq for diagnostic in diagnostics if diagnostic.seq is not None
-    }
-    seen = sequences | candidate_sequences
-    if not seen:
+    sequences = sorted(entry.seq for entry in entries)
+    if not sequences:
         return
-    for seq in range(1, max(seen) + 1):
-        if seq not in sequences:
-            diagnostics.append(HistoryDiagnostic(str(seq), f"sequence gap at {seq}", seq))
+    expected = 1
+    for seq in sequences:
+        if seq > expected:
+            if seq == expected + 1:
+                reason = f"sequence gap at {expected}"
+            else:
+                reason = f"sequence gap from {expected} to {seq - 1}"
+            diagnostics.append(HistoryDiagnostic(str(expected), reason, expected))
+        expected = seq + 1
 
 
 def _validate_record(raw: Any, run_id: str, filename_seq: int, filename_phase: str) -> HistoryEntry:
@@ -258,7 +283,7 @@ def _validate_record(raw: Any, run_id: str, filename_seq: int, filename_phase: s
         phase_after=phase_after,
         status=status,
         recorded_at=recorded_at,
-        counters=dict(counters),
+        counters=MappingProxyType(dict(counters)),
         original_task_id=original_task_id,
         has_result=result is not None,
         has_error=error is not None,
