@@ -25,10 +25,12 @@ from .locking import LockError
 from .opencode import InvocationObserver
 from .permissions import SessionEventConsumer
 from .phases import PHASE_OPERATIONAL_FAILURE, TERMINAL_PHASES
+from .read_model import ProjectResolutionError, scan_project
 from .runtime import RuntimeError_, list_run_ids, load_run, run_new, run_resume
 from .skill import run_skill
 from .state import RunOptions, StateError
 from .supervisor import AdvanceOutcome, FailurePersistenceError, LoopError
+from .tui import RunBrowserApp
 from .verbosity import (
     CompositeInvocationObserver,
     StatsConsumer,
@@ -154,7 +156,9 @@ def _add_verbosity_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _build_verbosity_hooks(verbosity: int) -> tuple[
+def _build_verbosity_hooks(
+    verbosity: int,
+) -> tuple[
     InvocationObserver | None,
     list[SessionEventConsumer],
     Callable[[AdvanceOutcome], None] | None,
@@ -640,19 +644,13 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
-    """No-op stub: the in-process Textual TUI has been retired.
-
-    A replacement TUI that reads on-disk run state (per-phase history
-    under `runs/<run_id>/` and verification logs) is planned but not yet
-    built. See the ADR retiring the in-process TUI for context. Until
-    then, `run`/`resume` are the supported entry points.
-    """
-    print(
-        "loop-supervisor: the interactive TUI is being rebuilt and is "
-        "currently unavailable.\nUse `loop-supervisor run` or "
-        "`loop-supervisor resume` instead.",
-        file=sys.stderr,
-    )
+    """Launch the read-only run browser after resolving and scanning the project."""
+    try:
+        snapshot = scan_project(args.project)
+    except ProjectResolutionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    RunBrowserApp(snapshot).run()
     return 0
 
 
@@ -783,9 +781,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prune_parser.set_defaults(func=cmd_runs_prune)
 
-    tui_parser = sub.add_parser(
-        "tui", help="Interactive TUI (currently a no-op stub; being rebuilt)"
-    )
+    tui_parser = sub.add_parser("tui", help="Browse persisted supervisor runs read-only")
     tui_parser.add_argument("--project", default=None, help="Path to the integration repo")
     tui_parser.set_defaults(func=cmd_tui)
 

@@ -783,16 +783,39 @@ def test_cmd_resume_passes_verbosity_hooks_to_run_resume(tmp_path, monkeypatch):
     assert captured["on_advance"] is not None
 
 
-def test_cmd_tui_is_a_no_op_stub(tmp_path, capsys):
-    """The interactive TUI has been retired pending a rebuild; `tui`
-    prints a notice and exits 0 rather than launching anything."""
-    rc = cli_mod.cmd_tui(_resume_args(tmp_path, run_id=None))
+def test_cmd_tui_reports_invalid_project_before_starting_app(tmp_path, monkeypatch, capsys):
+    """Project resolution fails before constructing or entering Textual."""
 
-    assert rc == 0
+    def fake_app(*args, **kwargs):
+        raise AssertionError("the app must not start for an invalid project")
+
+    monkeypatch.setattr(cli_mod, "RunBrowserApp", fake_app)
+    rc = cli_mod.cmd_tui(argparse.Namespace(project=str(tmp_path / "missing")))
+
+    assert rc == 1
     captured = capsys.readouterr()
-    assert "run" in captured.err
-    assert "resume" in captured.err
+    assert captured.out == ""
+    assert "error: cannot resolve project" in captured.err.lower()
+    assert "currently unavailable" not in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_cmd_tui_starts_the_read_only_browser_after_scanning(tmp_path, monkeypatch):
+    snapshot = object()
+    started: list[object] = []
+
+    class FakeBrowserApp:
+        def __init__(self, received_snapshot):
+            assert received_snapshot is snapshot
+
+        def run(self) -> None:
+            started.append(snapshot)
+
+    monkeypatch.setattr(cli_mod, "scan_project", lambda path: snapshot)
+    monkeypatch.setattr(cli_mod, "RunBrowserApp", FakeBrowserApp)
+
+    assert cli_mod.cmd_tui(argparse.Namespace(project=str(tmp_path))) == 0
+    assert started == [snapshot]
 
 
 # -- SIGTERM-to-KeyboardInterrupt bridge (backlog item 22a / ADR 0015) --
@@ -883,16 +906,20 @@ def test_cmd_resume_wraps_run_resume_in_the_sigterm_bridge(tmp_path, monkeypatch
     )
 
 
-def test_cmd_tui_is_not_wrapped_by_the_sigterm_bridge(tmp_path):
-    """cmd_tui must not install the SIGTERM bridge. It is currently a
-    no-op stub, but the eventual TUI replacement will need its own
-    signal-handling UX decision (see the docstring on
-    `_bridge_sigterm_to_keyboard_interrupt`), so this pins the
-    "never wrapped" invariant regardless of what `cmd_tui` does
-    internally."""
+def test_cmd_tui_is_not_wrapped_by_the_sigterm_bridge(tmp_path, monkeypatch):
+    """The browser does not inherit the headless run/resume SIGTERM bridge."""
     before = signal.getsignal(signal.SIGTERM)
 
-    rc = cli_mod.cmd_tui(_resume_args(tmp_path, run_id=None))
+    class FakeBrowserApp:
+        def __init__(self, snapshot):
+            pass
+
+        def run(self):
+            return None
+
+    monkeypatch.setattr(cli_mod, "scan_project", lambda path: object())
+    monkeypatch.setattr(cli_mod, "RunBrowserApp", FakeBrowserApp)
+    rc = cli_mod.cmd_tui(argparse.Namespace(project=str(tmp_path)))
     after = signal.getsignal(signal.SIGTERM)
 
     assert rc == 0
