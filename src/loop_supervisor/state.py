@@ -26,6 +26,7 @@ from .phases import (
     PHASE_OPERATIONAL_FAILURE,
     RETRY_TARGET_PHASES,
 )
+from .read_model.json_reader import BoundedJsonError, read_bounded_json
 
 # Reset to 1 (backlog item 30): this project has no users and no
 # production installs, so every RunState document ever persisted was
@@ -1231,17 +1232,11 @@ def load_state(git_common_dir: Path, run_id: str) -> RunState:
         with _open_state_directory(git_common_dir, create=False) as directory_fd:
             _reject_state_symlink(directory_fd, path.name, path)
             try:
-                fd = os.open(
-                    path.name,
-                    os.O_RDONLY | _required_open_flag("O_NOFOLLOW"),
-                    dir_fd=directory_fd,
-                )
-            except FileNotFoundError:
-                raise StateError(f"no saved state for run {validated_id!r} at {path}") from None
-            with os.fdopen(fd) as handle:
-                data = json.load(handle)
-    except json.JSONDecodeError as exc:
-        raise StateError(f"state file for run {validated_id!r} is not valid JSON: {exc}") from exc
+                data = read_bounded_json(directory_fd, path.name, path)
+            except BoundedJsonError as exc:
+                raise StateError(
+                    f"state file for run {validated_id!r} is unloadable: {exc}"
+                ) from exc
     except StateError:
         raise
     except OSError as exc:
