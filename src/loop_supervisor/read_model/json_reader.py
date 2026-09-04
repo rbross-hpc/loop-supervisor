@@ -27,12 +27,17 @@ class BoundedJsonError(RuntimeError):
 def read_bounded_json(directory_fd: int, name: str, display_path: Path) -> Any:
     """Securely read, parse, and shape-check one JSON leaf below ``directory_fd``.
 
-    The descriptor-relative, no-follow open and regular-file check keep callers
-    from following a substituted leaf.  No bytes reach the JSON parser when the
-    sentinel proves the configured hard read limit was exceeded.
+    The descriptor-relative, no-follow, nonblocking open and regular-file check
+    keep callers from following a substituted leaf or blocking on special files.
+    No bytes reach the JSON parser when the sentinel proves the configured hard
+    read limit was exceeded.
     """
     try:
-        fd = os.open(name, os.O_RDONLY | _required_open_flag("O_NOFOLLOW"), dir_fd=directory_fd)
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | _required_open_flag("O_NOFOLLOW"),
+            dir_fd=directory_fd,
+        )
     except OSError as exc:
         raise BoundedJsonError(f"cannot securely open JSON file {display_path}: {exc}") from exc
     try:

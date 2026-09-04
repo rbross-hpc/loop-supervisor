@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -61,3 +63,39 @@ def test_read_bounded_json_rejects_a_non_regular_target(tmp_path):
 
     with pytest.raises(BoundedJsonError, match="regular file"):
         _read(tmp_path, "directory.json")
+
+
+def test_read_bounded_json_promptly_rejects_a_fifo_without_a_writer(tmp_path):
+    fifo = tmp_path / "state.json"
+    os.mkfifo(fifo)
+    script = """
+import os
+import sys
+from pathlib import Path
+from loop_supervisor.read_model.json_reader import BoundedJsonError, read_bounded_json
+
+path = Path(sys.argv[1])
+directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    try:
+        read_bounded_json(directory_fd, path.name, path)
+    except BoundedJsonError as exc:
+        if "regular file" not in str(exc):
+            raise SystemExit(f"unexpected bounded JSON error: {exc}")
+    else:
+        raise SystemExit("FIFO was accepted")
+finally:
+    os.close(directory_fd)
+"""
+
+    environment = os.environ | {"PYTHONPATH": str(Path(__file__).parents[1] / "src")}
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(fifo)],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
