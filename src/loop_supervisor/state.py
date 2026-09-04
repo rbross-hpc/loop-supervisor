@@ -528,7 +528,7 @@ def _validate_nested_results(data: dict[str, Any]) -> None:
     _validate_role_result(data, "architect_result", ArchitectResult)
     builder = _validate_role_result(data, "builder_result", BuilderResult)
     auditor = _validate_role_result(data, "auditor_result", AuditorResult)
-    _validate_verification_result(data.get("verification_result"))
+    validate_verification_result(data.get("verification_result"))
 
     planner_task_id = getattr(planner, "task_id", None)
     if builder is not None and planner_task_id is not None:
@@ -551,7 +551,7 @@ def _validate_nested_results(data: dict[str, Any]) -> None:
             )
 
 
-def _validate_verification_result(value: object) -> None:
+def validate_verification_result(value: object) -> None:
     if value is None:
         return
     if not isinstance(value, dict):

@@ -1,0 +1,294 @@
+"""Secure, typed best-effort loading of append-only phase history."""
+
+from __future__ import annotations
+
+import os
+import re
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from enum import StrEnum
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, ValidationError
+
+from ..contracts import ArchitectResult, AuditorResult, BuilderResult, PlannerResult
+from ..phases import ALL_PHASES
+from ..state import (
+    OperationalErrorRecord,
+    StateError,
+    validate_run_id,
+    validate_verification_result,
+)
+from ..supervisor import AdvanceStatus
+from .json_reader import BoundedJsonError, read_bounded_json
+
+_HISTORY_NAME_RE = re.compile(r"^(?P<seq>[0-9]{4,})-(?P<phase>[a-z_]+)\.json$")
+_COUNTER_FIELDS = frozenset(
+    {
+        "accepted_task_count",
+        "revision_count",
+        "replan_count",
+        "architect_retry_count",
+        "builder_guidance_count",
+    }
+)
+_RECORD_FIELDS = frozenset(
+    {
+        "seq",
+        "run_id",
+        "phase",
+        "phase_after",
+        "status",
+        "recorded_at",
+        "original_task_id",
+        "counters",
+        "result",
+        "error",
+    }
+)
+_RESULT_VALIDATORS: dict[str, type[BaseModel]] = {
+    "planning": PlannerResult,
+    "architecting": ArchitectResult,
+    "building": BuilderResult,
+    "auditing": AuditorResult,
+}
+
+
+class HistoryStatus(StrEnum):
+    """The available history evidence, without inferring omitted transitions."""
+
+    ABSENT = "absent"
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+
+
+@dataclass(frozen=True)
+class HistoryEntry:
+    """One validated phase outcome record."""
+
+    seq: int
+    phase: str
+    phase_after: str
+    status: AdvanceStatus
+    recorded_at: str
+    counters: dict[str, int]
+    original_task_id: str | None
+    has_result: bool
+    has_error: bool
+
+
+@dataclass(frozen=True)
+class HistoryDiagnostic:
+    """A safe logical artifact name and reason for omitted history evidence."""
+
+    artifact: str
+    reason: str
+    seq: int | None = None
+
+
+@dataclass(frozen=True)
+class HistoryLoad:
+    """Validated history entries and the completeness of their disk evidence."""
+
+    entries: tuple[HistoryEntry, ...]
+    completeness: HistoryStatus
+    diagnostics: tuple[HistoryDiagnostic, ...]
+
+
+def load_history(git_common_dir: Path, run_id: str) -> HistoryLoad:
+    """Load one run's history without following directories or artifact leaves.
+
+    A missing history directory is unavailable evidence. Once a real directory
+    is observed, every rejected, disappearing, duplicate, or missing sequence
+    makes the best-effort result incomplete while valid siblings remain useful.
+    """
+    validated_run_id = validate_run_id(run_id)
+    display_directory = git_common_dir / "loop-supervisor" / "runs" / validated_run_id
+    try:
+        with _open_history_directory(git_common_dir, validated_run_id) as directory_fd:
+            names = os.listdir(directory_fd)
+            return _load_enumerated(directory_fd, names, display_directory, validated_run_id)
+    except FileNotFoundError:
+        return HistoryLoad((), HistoryStatus.ABSENT, ())
+    except OSError as exc:
+        diagnostic = HistoryDiagnostic(validated_run_id, f"history directory is unavailable: {exc}")
+        return HistoryLoad((), HistoryStatus.INCOMPLETE, (diagnostic,))
+
+
+@contextmanager
+def _open_history_directory(git_common_dir: Path, run_id: str) -> Iterator[int]:
+    flags = os.O_RDONLY | _required_open_flag("O_DIRECTORY") | _required_open_flag("O_NOFOLLOW")
+    supervisor_path = git_common_dir / "loop-supervisor"
+    try:
+        supervisor_fd = os.open(supervisor_path, flags)
+    except FileNotFoundError:
+        raise
+    try:
+        runs_fd = os.open("runs", flags, dir_fd=supervisor_fd)
+        try:
+            directory_fd = os.open(run_id, flags, dir_fd=runs_fd)
+            try:
+                if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+                    raise OSError("history target is not a directory")
+                yield directory_fd
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(runs_fd)
+    finally:
+        os.close(supervisor_fd)
+
+
+def _required_open_flag(name: str) -> int:
+    value = getattr(os, name, None)
+    if not isinstance(value, int):
+        raise OSError(f"secure history reads require os.{name}")
+    return value
+
+
+def _load_enumerated(
+    directory_fd: int, names: list[str], display_directory: Path, run_id: str
+) -> HistoryLoad:
+    if not names:
+        return HistoryLoad((), HistoryStatus.ABSENT, ())
+
+    diagnostics: list[HistoryDiagnostic] = []
+    candidates: dict[int, list[tuple[str, str]]] = {}
+    for name in names:
+        match = _HISTORY_NAME_RE.fullmatch(name)
+        if match is None:
+            diagnostics.append(HistoryDiagnostic(name, "invalid history filename"))
+            continue
+        seq = int(match["seq"])
+        phase = match["phase"]
+        if seq <= 0 or phase not in ALL_PHASES:
+            diagnostics.append(
+                HistoryDiagnostic(name, "filename has invalid sequence or phase", seq)
+            )
+            continue
+        candidates.setdefault(seq, []).append((name, phase))
+
+    entries: list[HistoryEntry] = []
+    for seq in sorted(candidates):
+        records = candidates[seq]
+        if len(records) != 1:
+            names_for_seq = ", ".join(name for name, _ in sorted(records))
+            diagnostics.append(
+                HistoryDiagnostic(names_for_seq, f"duplicate sequence {seq} conflict", seq)
+            )
+            continue
+        name, phase = records[0]
+        try:
+            raw = read_bounded_json(directory_fd, name, display_directory / name)
+            entries.append(_validate_record(raw, run_id, seq, phase))
+        except (BoundedJsonError, StateError, ValueError, ValidationError) as exc:
+            diagnostics.append(HistoryDiagnostic(name, f"malformed history record: {exc}", seq))
+
+    _append_gap_diagnostics(entries, diagnostics)
+    completeness = HistoryStatus.COMPLETE if not diagnostics else HistoryStatus.INCOMPLETE
+    return HistoryLoad(tuple(entries), completeness, tuple(diagnostics))
+
+
+def _append_gap_diagnostics(
+    entries: list[HistoryEntry], diagnostics: list[HistoryDiagnostic]
+) -> None:
+    sequences = {entry.seq for entry in entries}
+    candidate_sequences = {
+        diagnostic.seq for diagnostic in diagnostics if diagnostic.seq is not None
+    }
+    seen = sequences | candidate_sequences
+    if not seen:
+        return
+    for seq in range(1, max(seen) + 1):
+        if seq not in sequences:
+            diagnostics.append(HistoryDiagnostic(str(seq), f"sequence gap at {seq}", seq))
+
+
+def _validate_record(raw: Any, run_id: str, filename_seq: int, filename_phase: str) -> HistoryEntry:
+    if not isinstance(raw, dict) or set(raw) != _RECORD_FIELDS:
+        raise ValueError("record must be an object with exactly the required fields")
+    seq = raw["seq"]
+    if not _positive_int(seq):
+        raise ValueError("seq must be a positive integer")
+    if seq != filename_seq:
+        raise ValueError("embedded seq does not match filename")
+    if raw["run_id"] != run_id:
+        raise ValueError("embedded run_id does not match selected run")
+    phase = _validated_phase(raw["phase"], "phase")
+    if phase != filename_phase:
+        raise ValueError("embedded phase does not match filename")
+    phase_after = _validated_phase(raw["phase_after"], "phase_after")
+    try:
+        status = AdvanceStatus(raw["status"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("status is not a known advance status") from exc
+    recorded_at = raw["recorded_at"]
+    if not isinstance(recorded_at, str) or not recorded_at:
+        raise ValueError("recorded_at must be a non-empty ISO-8601 string")
+    try:
+        parsed_at = datetime.fromisoformat(recorded_at)
+    except ValueError as exc:
+        raise ValueError("recorded_at must be ISO-8601") from exc
+    if parsed_at.tzinfo is None or parsed_at.utcoffset() is None:
+        raise ValueError("recorded_at must be timezone-aware")
+    original_task_id = raw["original_task_id"]
+    if original_task_id is not None and (
+        not isinstance(original_task_id, str) or not original_task_id
+    ):
+        raise ValueError("original_task_id must be null or a non-empty string")
+    counters = raw["counters"]
+    if not isinstance(counters, dict) or set(counters) != _COUNTER_FIELDS:
+        raise ValueError("counters must contain exactly the five known counters")
+    if not all(_non_negative_int(value) for value in counters.values()):
+        raise ValueError("counters must be non-negative integers")
+    result = raw["result"]
+    error = raw["error"]
+    _validate_result(phase, result)
+    if error is not None:
+        if not isinstance(error, dict):
+            raise ValueError("error must be an object or null")
+        OperationalErrorRecord.from_dict(error)
+    return HistoryEntry(
+        seq=seq,
+        phase=phase,
+        phase_after=phase_after,
+        status=status,
+        recorded_at=recorded_at,
+        counters=dict(counters),
+        original_task_id=original_task_id,
+        has_result=result is not None,
+        has_error=error is not None,
+    )
+
+
+def _validated_phase(value: object, name: str) -> str:
+    if not isinstance(value, str) or value not in ALL_PHASES:
+        raise ValueError(f"{name} is not a known phase")
+    return value
+
+
+def _validate_result(phase: str, result: object) -> None:
+    validator = _RESULT_VALIDATORS.get(phase)
+    if validator is None:
+        if phase == "verifying":
+            if result is not None:
+                validate_verification_result(result)
+        elif result is not None:
+            raise ValueError(f"phase {phase!r} cannot have a result")
+        return
+    if result is not None:
+        if not isinstance(result, dict):
+            raise ValueError("result must be an object or null")
+        validator.model_validate(result)
+
+
+def _positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _non_negative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
