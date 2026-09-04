@@ -170,7 +170,15 @@ def _read_lock_record(git_common_dir: Path) -> dict[str, object]:
     """Read and validate one lock record, dropping its token before return."""
     path = git_common_dir / "loop-supervisor" / "supervisor.lock"
     with _open_lock_directory(git_common_dir) as directory_fd:
-        data = read_bounded_json(directory_fd, path.name, path)
+        try:
+            data = read_bounded_json(directory_fd, path.name, path)
+        except BoundedJsonError as exc:
+            # A verified directory with no leaf is ADR 0036's ordinary
+            # ``absent`` case. Every other secure-open failure remains
+            # malformed, including symlinked and non-regular leaves.
+            if isinstance(exc.__cause__, FileNotFoundError):
+                raise exc.__cause__ from exc
+            raise
     if not isinstance(data, dict):
         raise LockObservationError("lock record must be a JSON object")
     _validate_lock_record(data)

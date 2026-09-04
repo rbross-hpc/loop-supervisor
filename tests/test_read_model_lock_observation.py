@@ -101,6 +101,14 @@ def test_observe_lock_classifies_non_running_taxonomy(tmp_path, prepare, expecte
     assert "token" not in observation.__dataclass_fields__
 
 
+def test_observe_lock_reports_absent_when_verified_directory_has_no_lock_leaf(tmp_path):
+    (tmp_path / "loop-supervisor").mkdir()
+
+    observation = observe_lock(tmp_path, tmp_path, ())
+
+    assert observation.activity is LockActivity.ABSENT
+
+
 def test_observe_lock_rejects_oversized_symlinked_and_non_regular_leaves(tmp_path):
     directory = tmp_path / "loop-supervisor"
     directory.mkdir()
