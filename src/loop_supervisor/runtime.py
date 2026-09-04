@@ -1007,9 +1007,7 @@ class RunSession:
             base_url = None
         if base_url is not None:
             policy = PermissionPolicy(base_url)
-            monitor = SessionMonitor(
-                base_url, consumers=[policy, *self._session_event_consumers]
-            )
+            monitor = SessionMonitor(base_url, consumers=[policy, *self._session_event_consumers])
             try:
                 monitor.start()
             except Exception as exc:
