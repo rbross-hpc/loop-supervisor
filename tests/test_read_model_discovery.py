@@ -80,6 +80,15 @@ def test_discover_runs_returns_loadable_and_degraded_summaries_without_paths(tmp
     assert summaries[2].diagnostic is not None
 
 
+def test_discover_runs_orders_loadable_summaries_by_updated_at_instant(tmp_path):
+    _save_state(tmp_path, "earlier-local", updated_at="2026-01-01T11:00:00+02:00")
+    _save_state(tmp_path, "later-utc", updated_at="2026-01-01T10:00:00+00:00")
+
+    summaries = discover_runs(tmp_path)
+
+    assert [summary.run_id for summary in summaries] == ["later-utc", "earlier-local"]
+
+
 def test_discover_runs_returns_no_summaries_when_the_runs_directory_is_absent(tmp_path):
     assert discover_runs(tmp_path) == []
 

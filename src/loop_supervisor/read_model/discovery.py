@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from ..state import StateError, load_state, open_state_directory, validate_run_id
@@ -84,6 +85,12 @@ def _sort_summaries(summaries: list[RunSummary]) -> list[RunSummary]:
     """Put loadable rows newest-first; degraded rows follow without invented time."""
     loadable = [summary for summary in summaries if summary.loadable]
     degraded = [summary for summary in summaries if not summary.loadable]
-    return sorted(loadable, key=lambda summary: summary.updated_at or "", reverse=True) + sorted(
+    return sorted(loadable, key=_updated_at_instant, reverse=True) + sorted(
         degraded, key=lambda summary: summary.run_id
     )
+
+
+def _updated_at_instant(summary: RunSummary) -> datetime:
+    """Return the validated, timezone-aware snapshot update instant for ordering."""
+    assert summary.updated_at is not None
+    return datetime.fromisoformat(summary.updated_at)
