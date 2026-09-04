@@ -561,7 +561,11 @@ def build_agent_env(
     if (project_root / ".venv" / "bin").is_dir():
         prefix.append(absolute_entry)
 
-    prefix = [entry for entry in prefix if entry not in existing_entries]
+    # Keep the relative entry first even when an inherited environment already
+    # contains it. It must resolve against each agent invocation's cwd; merely
+    # deduplicating it out of the prefix could leave the absolute fallback
+    # first and send task commands to the integration venv instead.
+    existing_entries = [entry for entry in existing_entries if entry not in prefix]
 
     env["PATH"] = os.pathsep.join([*prefix, *existing_entries])
 

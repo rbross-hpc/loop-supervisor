@@ -47,6 +47,9 @@ loop_supervisor = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Prefer this checkout's source tree over a parent checkout inherited through
+# PYTHONPATH. Task worktrees must exercise their own editable installation.
+pythonpath = ["src"]
 # An exception escaping a worker thread (or a __del__/callback, for the
 # unraisable case) is otherwise downgraded to an ignorable warning: a test
 # can pass while its thread silently raised. This let a characterization
