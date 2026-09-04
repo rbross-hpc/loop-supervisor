@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .current_run import CurrentRun
     from .discovery import RunSummary
     from .history import HistoryDiagnostic, HistoryEntry, HistoryLoad, HistoryStatus
     from .lock_observation import ActivityLabel, LockActivity, LockObservation, RunActivity
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "CurrentRun",
     "HistoryDiagnostic",
     "HistoryEntry",
     "HistoryLoad",
@@ -40,6 +42,7 @@ __all__ = [
     "build_snapshot",
     "discover_runs",
     "discover_verification",
+    "load_current_run",
     "load_history",
     "observe_lock",
     "read_log",
@@ -50,6 +53,10 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:
     """Lazily expose readers so state can import the JSON utility without a cycle."""
+    if name in {"CurrentRun", "load_current_run"}:
+        from . import current_run
+
+        return getattr(current_run, name)
     if name in {"RunSummary", "discover_runs"}:
         from . import discovery
 
