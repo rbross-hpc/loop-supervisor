@@ -160,7 +160,18 @@ def test_load_history_diagnoses_oversized_filename_sequence_without_crashing(tmp
     directory = tmp_path / "loop-supervisor" / "runs" / "run-1"
     directory.mkdir(parents=True)
     oversized_name = f"{'9' * 5_000}-planning.json"
-    monkeypatch.setattr(history.os, "listdir", lambda _fd: [oversized_name])
+
+    class _Entry:
+        name = oversized_name
+
+    class _Entries:
+        def __enter__(self):
+            return iter([_Entry()])
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(history.os, "scandir", lambda _fd: _Entries())
 
     loaded = load_history(tmp_path, "run-1")
 
@@ -193,3 +204,51 @@ def test_history_entry_counters_are_immutable(tmp_path):
     with pytest.raises(TypeError, match="mappingproxy.*does not support item assignment"):
         entry.counters["revision_count"] = 1
     assert entry.counters["revision_count"] == 0
+
+
+def test_load_history_bounds_enumeration_and_reports_excess_leaves(tmp_path):
+    _write_history(tmp_path, "0001-planning.json", _record("run-1", 1))
+    directory = tmp_path / "loop-supervisor" / "runs" / "run-1"
+    for index in range(10_000):
+        (directory / f"temporary-{index}").touch()
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert [entry.seq for entry in loaded.entries] == [1]
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert any(
+        diagnostic.reason == "history directory has excess entries"
+        for diagnostic in loaded.diagnostics
+    )
+
+
+def test_load_history_excludes_duplicate_sequence_with_unknown_phase_filename(tmp_path):
+    _write_history(tmp_path, "0001-planning.json", _record("run-1", 1))
+    _write_history(tmp_path, "0001-unknown.json", _record("run-1", 1))
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert loaded.entries == ()
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert any(
+        diagnostic.seq == 1 and "duplicate" in diagnostic.reason
+        for diagnostic in loaded.diagnostics
+    )
+
+
+def test_load_history_diagnostics_redact_paths_and_unchecked_values_and_bound_artifacts(tmp_path):
+    record = _record("run-1", 1)
+    record["result"] = {"status": "NOT_A_STATUS", "task_id": "secret-sentinel"}
+    _write_history(tmp_path, "0001-planning.json", record)
+    _write_history(tmp_path, "0002-planning.json", "{")
+    long_phase = "a" * 230
+    _write_history(tmp_path, f"0003-{long_phase}.json", _record("run-1", 3))
+    _write_history(tmp_path, f"0003-{'b' * 230}.json", _record("run-1", 3))
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert all(len(diagnostic.artifact) <= 256 for diagnostic in loaded.diagnostics)
+    assert all(str(tmp_path) not in diagnostic.reason for diagnostic in loaded.diagnostics)
+    assert all("NOT_A_STATUS" not in diagnostic.reason for diagnostic in loaded.diagnostics)
+    assert all("secret-sentinel" not in diagnostic.reason for diagnostic in loaded.diagnostics)

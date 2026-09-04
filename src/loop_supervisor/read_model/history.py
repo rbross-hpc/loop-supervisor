@@ -30,6 +30,8 @@ from .json_reader import BoundedJsonError, read_bounded_json
 _HISTORY_NAME_RE = re.compile(r"^(?P<seq>[0-9]{4,})-(?P<phase>[a-z_]+)\.json$")
 _MAX_SEQUENCE_DIGITS = 128
 """Maximum filename sequence digits accepted for bounded numeric processing."""
+_MAX_HISTORY_LEAVES = 10_000
+"""Maximum directory entries inspected for a single run's history."""
 _MAX_DIAGNOSTIC_ARTIFACT_LENGTH = 256
 _COUNTER_FIELDS = frozenset(
     {
@@ -114,13 +116,26 @@ def load_history(git_common_dir: Path, run_id: str) -> HistoryLoad:
     display_directory = git_common_dir / "loop-supervisor" / "runs" / validated_run_id
     try:
         with _open_history_directory(git_common_dir, validated_run_id) as directory_fd:
-            names = os.listdir(directory_fd)
-            return _load_enumerated(directory_fd, names, display_directory, validated_run_id)
+            names, has_excess = _enumerate_history_names(directory_fd)
+            return _load_enumerated(
+                directory_fd, names, has_excess, display_directory, validated_run_id
+            )
     except FileNotFoundError:
         return HistoryLoad((), HistoryStatus.ABSENT, ())
-    except OSError as exc:
-        diagnostic = HistoryDiagnostic(validated_run_id, f"history directory is unavailable: {exc}")
+    except OSError:
+        diagnostic = HistoryDiagnostic(validated_run_id, "history directory is unavailable")
         return HistoryLoad((), HistoryStatus.INCOMPLETE, (diagnostic,))
+
+
+def _enumerate_history_names(directory_fd: int) -> tuple[list[str], bool]:
+    """Return at most the configured leaf count and whether more were observed."""
+    names: list[str] = []
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            if len(names) == _MAX_HISTORY_LEAVES:
+                return names, True
+            names.append(entry.name)
+    return names, False
 
 
 @contextmanager
@@ -155,47 +170,66 @@ def _required_open_flag(name: str) -> int:
 
 
 def _load_enumerated(
-    directory_fd: int, names: list[str], display_directory: Path, run_id: str
+    directory_fd: int,
+    names: list[str],
+    has_excess: bool,
+    display_directory: Path,
+    run_id: str,
 ) -> HistoryLoad:
-    if not names:
+    if not names and not has_excess:
         return HistoryLoad((), HistoryStatus.ABSENT, ())
 
     diagnostics: list[HistoryDiagnostic] = []
-    candidates: dict[int, list[tuple[str, str]]] = {}
+    if has_excess:
+        diagnostics.append(HistoryDiagnostic(run_id, "history directory has excess entries"))
+    candidates: dict[int, list[tuple[str, str | None]]] = {}
     for name in names:
+        artifact = _safe_artifact_name(name)
         match = _HISTORY_NAME_RE.fullmatch(name)
         if match is None:
-            diagnostics.append(HistoryDiagnostic(name, "invalid history filename"))
+            diagnostics.append(HistoryDiagnostic(artifact, "invalid history filename"))
             continue
         parsed_seq = _parse_filename_sequence(match["seq"])
         if parsed_seq is None:
-            diagnostics.append(
-                HistoryDiagnostic(_safe_artifact_name(name), "filename sequence is too large")
-            )
+            diagnostics.append(HistoryDiagnostic(artifact, "filename sequence is too large"))
             continue
         phase = match["phase"]
-        if parsed_seq <= 0 or phase not in ALL_PHASES:
+        if parsed_seq <= 0:
             diagnostics.append(
-                HistoryDiagnostic(name, "filename has invalid sequence or phase", parsed_seq)
+                HistoryDiagnostic(artifact, "filename has invalid sequence", parsed_seq)
             )
             continue
-        candidates.setdefault(parsed_seq, []).append((name, phase))
+        candidates.setdefault(parsed_seq, []).append((name, phase if phase in ALL_PHASES else None))
 
     entries: list[HistoryEntry] = []
     for seq in sorted(candidates):
         records = candidates[seq]
         if len(records) != 1:
-            names_for_seq = ", ".join(name for name, _ in sorted(records))
             diagnostics.append(
-                HistoryDiagnostic(names_for_seq, f"duplicate sequence {seq} conflict", seq)
+                HistoryDiagnostic(
+                    _duplicate_artifact_name(name for name, _ in records),
+                    f"duplicate sequence {seq} conflict",
+                    seq,
+                )
             )
             continue
         name, phase = records[0]
+        if phase is None:
+            diagnostics.append(
+                HistoryDiagnostic(_safe_artifact_name(name), "filename has unknown phase", seq)
+            )
+            continue
         try:
             raw = read_bounded_json(directory_fd, name, display_directory / name)
             entries.append(_validate_record(raw, run_id, seq, phase))
-        except (BoundedJsonError, StateError, ValueError, ValidationError) as exc:
-            diagnostics.append(HistoryDiagnostic(name, f"malformed history record: {exc}", seq))
+        except BoundedJsonError as exc:
+            diagnostics.append(
+                HistoryDiagnostic(_safe_artifact_name(name), _bounded_json_reason(exc), seq)
+            )
+        except (StateError, ValueError, ValidationError) as exc:
+            diagnostics.append(
+                HistoryDiagnostic(_safe_artifact_name(name), _validation_reason(exc), seq)
+            )
 
     _append_gap_diagnostics(entries, diagnostics)
     completeness = HistoryStatus.COMPLETE if not diagnostics else HistoryStatus.INCOMPLETE
@@ -214,6 +248,31 @@ def _safe_artifact_name(name: str) -> str:
     if len(name) <= _MAX_DIAGNOSTIC_ARTIFACT_LENGTH:
         return name
     return f"{name[: _MAX_DIAGNOSTIC_ARTIFACT_LENGTH - 3]}..."
+
+
+def _duplicate_artifact_name(names: Iterator[str]) -> str:
+    """Return bounded logical names for a conflicting sequence's artifacts."""
+    return _safe_artifact_name(", ".join(sorted(_safe_artifact_name(name) for name in names)))
+
+
+def _bounded_json_reason(exc: BoundedJsonError) -> str:
+    """Classify JSON reader failures without exposing its path-bearing text."""
+    message = str(exc)
+    if "not a regular file" in message:
+        return "history record is not a regular file"
+    if "securely open" in message:
+        return "history record could not be opened"
+    return "malformed history record"
+
+
+def _validation_reason(exc: StateError | ValueError | ValidationError) -> str:
+    """Classify controlled validation failures without rendering untrusted values."""
+    if isinstance(exc, ValidationError):
+        return "history record has invalid result or error"
+    message = str(exc)
+    if message.startswith("embedded "):
+        return message
+    return "malformed history record"
 
 
 def _append_gap_diagnostics(
