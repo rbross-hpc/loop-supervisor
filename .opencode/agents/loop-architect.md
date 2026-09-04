@@ -1,7 +1,7 @@
 ---
 description: Resolves an escalated design decision. Read-only.
 mode: primary
-model: argo/Claude Opus 4.8
+model: argo/GPT-5.6 Sol
 temperature: 0.1
 steps: 30
 permission:

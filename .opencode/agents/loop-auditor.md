@@ -1,6 +1,7 @@
 ---
 description: Audits one project implementation step
 mode: primary
+model: argo/GPT-5.6 Sol
 temperature: 0.1
 steps: 40
 permission:
