@@ -43,7 +43,7 @@ class LogReference:
 class VerificationAttempt:
     """Validated compact command metadata and, where safe, its log reference."""
 
-    commit: str
+    commit: str | None
     ordinal: int
     command: str
     ok: bool
@@ -82,44 +82,64 @@ def discover_verification(
     never opened or resolved.
     """
     validated_run = validate_run_id(run_id)
+    if verification_result is None:
+        return VerificationDiscovery((), ())
     try:
         validate_verification_result(verification_result)
     except StateError:
         return VerificationDiscovery(
             (), (VerificationDiagnostic(validated_run, "invalid verification metadata"),)
         )
-    assert isinstance(verification_result, dict)
+    # Defensive for type narrowing despite the validator contract.
+    if not isinstance(verification_result, dict):
+        return VerificationDiscovery(
+            (), (VerificationDiagnostic(validated_run, "invalid verification metadata"),)
+        )
     commands = verification_result["commands"]
-    assert isinstance(commands, list)
+    # Defensive for type narrowing despite the validator contract.
+    if not isinstance(commands, list):
+        return VerificationDiscovery(
+            (), (VerificationDiagnostic(validated_run, "invalid verification metadata"),)
+        )
     diagnostics: list[VerificationDiagnostic] = []
     leaves = _discover_leaves(git_common_dir, validated_run, diagnostics)
     attempts: list[VerificationAttempt] = []
     for ordinal, command in enumerate(commands, start=1):
-        assert isinstance(command, dict)
+        if not isinstance(command, dict):  # Keep malformed metadata contained.
+            diagnostics.append(
+                VerificationDiagnostic(f"command-{ordinal}", "invalid command metadata")
+            )
+            continue
         output_path = command["output_path"]
-        assert isinstance(output_path, str)
+        if not isinstance(output_path, str):
+            diagnostics.append(
+                VerificationDiagnostic(f"command-{ordinal}", "invalid command metadata")
+            )
+            continue
         identity = _output_identity(git_common_dir, validated_run, output_path, ordinal)
+        commit: str | None = None
+        log: LogReference | None = None
         if identity is None:
             diagnostics.append(
                 VerificationDiagnostic(f"command-{ordinal}", "mismatched output path")
             )
-            continue
-        commit, name = identity
-        leaf = leaves.get((commit, ordinal))
-        if leaf != name:
-            diagnostics.append(VerificationDiagnostic(name, "authorized log is unavailable"))
-            continue
+        else:
+            commit, name = identity
+            if leaves.get((commit, ordinal)) != name:
+                diagnostics.append(VerificationDiagnostic(name, "authorized log is unavailable"))
+            else:
+                log = LogReference(validated_run, commit, ordinal, name)
         attempts.append(
             VerificationAttempt(
                 commit=commit,
                 ordinal=ordinal,
-                command=command["command"],  # validated above
+                command=command["command"],
                 ok=command["ok"],
                 returncode=command["returncode"],
                 timed_out=command["timed_out"],
                 duration=float(command["duration"]),
                 summary=command["summary"],
-                log=LogReference(validated_run, commit, ordinal, name),
+                log=log,
             )
         )
     return VerificationDiscovery(tuple(attempts), tuple(diagnostics))
@@ -188,7 +208,11 @@ def _discover_leaves(
         with _open_directory_chain(
             git_common_dir, ("loop-supervisor", "verification", run_id)
         ) as run_fd:
-            commit_names = _names(run_fd, _MAX_COMMIT_DIRECTORIES)
+            commit_names, commits_bounded = _names(run_fd, _MAX_COMMIT_DIRECTORIES)
+            if commits_bounded:
+                diagnostics.append(
+                    VerificationDiagnostic(run_id, "commit directory scan is incomplete")
+                )
             for commit in commit_names:
                 if not _COMMIT_RE.fullmatch(commit):
                     diagnostics.append(
@@ -204,7 +228,10 @@ def _discover_leaves(
                     continue
                 try:
                     by_ordinal: dict[int, list[str]] = {}
-                    for name in _names(commit_fd, _MAX_LOG_LEAVES):
+                    log_names, logs_bounded = _names(commit_fd, _MAX_LOG_LEAVES)
+                    if logs_bounded:
+                        diagnostics.append(VerificationDiagnostic(commit, "log scan is incomplete"))
+                    for name in log_names:
                         match = _LOG_RE.fullmatch(name)
                         if match is None:
                             diagnostics.append(
@@ -252,7 +279,9 @@ def _output_identity(
     git_common_dir: Path, run_id: str, output_path: str, ordinal: int
 ) -> tuple[str, str] | None:
     # abspath/normpath are lexical operations; unlike resolve(), neither follows
-    # an attacker-controlled output_path.
+    # an attacker-controlled output_path. Persisted metadata must already be absolute.
+    if not os.path.isabs(output_path):
+        return None
     expected_root = os.path.normpath(
         os.path.abspath(git_common_dir / "loop-supervisor" / "verification" / run_id)
     )
@@ -297,14 +326,14 @@ def _unavailable(reason: str) -> LogContent:
     return LogContent(False, "", False, False, False, reason)
 
 
-def _names(directory_fd: int, limit: int) -> list[str]:
+def _names(directory_fd: int, limit: int) -> tuple[list[str], bool]:
     names: list[str] = []
     with os.scandir(directory_fd) as entries:
         for entry in entries:
             if len(names) == limit:
-                break
+                return names, True
             names.append(entry.name)
-    return names
+    return names, False
 
 
 @contextmanager

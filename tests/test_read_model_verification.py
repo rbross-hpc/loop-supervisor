@@ -64,10 +64,112 @@ def test_discover_verification_rejects_mismatched_output_path_and_duplicate_ordi
         tmp_path, "run-1", _result(tmp_path, output_path=str(tmp_path / "outside.log"))
     )
 
-    assert discovered.attempts == ()
+    assert len(discovered.attempts) == 1
+    assert discovered.attempts[0].log is None
     assert any("duplicate ordinal" in diagnostic.reason for diagnostic in discovered.diagnostics)
     assert any(
         "mismatched output path" in diagnostic.reason for diagnostic in discovered.diagnostics
+    )
+
+
+def test_discover_verification_preserves_attempts_without_metadata_or_available_log(tmp_path):
+    missing = discover_verification(tmp_path, "run-1", None)
+    assert missing.attempts == ()
+    assert missing.diagnostics == ()
+
+    result = _result(tmp_path)
+    relative = _result(tmp_path, output_path="loop-supervisor/verification/run-1/path.log")
+    traversal = _result(
+        tmp_path,
+        output_path=str(_directory(tmp_path) / ".." / ".." / "outside.log"),
+    )
+    for metadata in (result, relative, traversal):
+        discovered = discover_verification(tmp_path, "run-1", metadata)
+        assert len(discovered.attempts) == 1
+        assert discovered.attempts[0].log is None
+        assert any(
+            "unavailable" in item.reason or "mismatched" in item.reason
+            for item in discovered.diagnostics
+        )
+
+
+def test_discovery_preserves_attempt_when_expected_log_is_pruned_or_directory_is_symlinked(
+    tmp_path, monkeypatch
+):
+    expected = _directory(tmp_path) / "01.log"
+    pruned = discover_verification(tmp_path, "run-1", _result(tmp_path))
+    assert len(pruned.attempts) == 1
+    assert pruned.attempts[0].log is None
+    assert any("unavailable" in item.reason for item in pruned.diagnostics)
+
+    expected.parent.rmdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    expected.parent.symlink_to(outside, target_is_directory=True)
+    symlinked = discover_verification(tmp_path, "run-1", _result(tmp_path))
+    assert len(symlinked.attempts) == 1
+    assert symlinked.attempts[0].log is None
+    assert any("unavailable" in item.reason for item in symlinked.diagnostics)
+
+    # A leaf lost after enumeration remains represented as unavailable.
+    expected.parent.unlink()
+    expected.parent.mkdir()
+    expected.write_text("will disappear")
+    original_open = verification.os.open
+
+    def remove_leaf_then_open(name, flags, *args, **kwargs):
+        if name == "01.log":
+            os.unlink(expected)
+        return original_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(verification.os, "open", remove_leaf_then_open)
+    disappeared = discover_verification(tmp_path, "run-1", _result(tmp_path))
+    assert len(disappeared.attempts) == 1
+    assert disappeared.attempts[0].log is None
+    assert any("unavailable" in item.reason for item in disappeared.diagnostics)
+
+
+def test_discovery_keeps_metadata_when_run_directory_is_symlinked(tmp_path):
+    directory = _directory(tmp_path)
+    metadata = _result(tmp_path, output_path=str(directory / "01.log"))
+    os.rmdir(directory)
+    run_directory = directory.parent
+    os.rmdir(run_directory)
+    outside = tmp_path / "outside-run"
+    outside.mkdir()
+    run_directory.symlink_to(outside, target_is_directory=True)
+
+    discovered = discover_verification(tmp_path, "run-1", metadata)
+
+    assert len(discovered.attempts) == 1
+    assert discovered.attempts[0].log is None
+    assert any(
+        "verification directory is unavailable" in item.reason for item in discovered.diagnostics
+    )
+
+
+def test_discovery_reports_malformed_metadata_without_raising(tmp_path):
+    discovered = discover_verification(tmp_path, "run-1", {"commands": []})
+
+    assert discovered.attempts == ()
+    assert discovered.diagnostics == (
+        verification.VerificationDiagnostic("run-1", "invalid verification metadata"),
+    )
+
+
+def test_discovery_reports_bounded_scans(tmp_path, monkeypatch):
+    directory = _directory(tmp_path)
+    (directory / "01.log").write_text("expected")
+    (directory / "02.log").write_text("overflow")
+    monkeypatch.setattr(verification, "_MAX_LOG_LEAVES", 1)
+    logs_bounded = discover_verification(tmp_path, "run-1", _result(tmp_path))
+    assert any("log scan is incomplete" in item.reason for item in logs_bounded.diagnostics)
+
+    (directory.parent / ("b" * 40)).mkdir()
+    monkeypatch.setattr(verification, "_MAX_COMMIT_DIRECTORIES", 1)
+    commits_bounded = discover_verification(tmp_path, "run-1", _result(tmp_path))
+    assert any(
+        "commit directory scan is incomplete" in item.reason for item in commits_bounded.diagnostics
     )
 
 
