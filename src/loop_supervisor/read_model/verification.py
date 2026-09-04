@@ -189,11 +189,13 @@ def read_log(git_common_dir: Path, reference: LogReference) -> LogContent:
             )
             try:
                 checked = os.fstat(check_fd)
+                if not stat.S_ISREG(checked.st_mode):
+                    return _unavailable("log is unavailable")
                 changed = changed or checked.st_ino != before.st_ino
             finally:
                 os.close(check_fd)
     except OSError:
-        changed = True
+        return _unavailable("log is unavailable")
     byte_truncated = len(raw) > LOG_READ_LIMIT
     text = raw[:LOG_READ_LIMIT].decode("utf-8", errors="replace")
     rendered, render_truncated = _bound_rendered(text)
@@ -253,16 +255,14 @@ def _discover_leaves(
                             continue
                         name = names[0]
                         try:
-                            fd = os.open(
-                                name, os.O_RDONLY | os.O_NONBLOCK | _nofollow(), dir_fd=commit_fd
-                            )
-                            try:
-                                regular = stat.S_ISREG(os.fstat(fd).st_mode)
-                            finally:
-                                os.close(fd)
+                            metadata = os.stat(name, dir_fd=commit_fd, follow_symlinks=False)
                         except OSError:
-                            regular = False
-                        if not regular:
+                            diagnostics.append(VerificationDiagnostic(name, "log is unavailable"))
+                            continue
+                        if stat.S_ISLNK(metadata.st_mode):
+                            diagnostics.append(VerificationDiagnostic(name, "log is a symlink"))
+                            continue
+                        if not stat.S_ISREG(metadata.st_mode):
                             diagnostics.append(
                                 VerificationDiagnostic(name, "log is not a regular file")
                             )

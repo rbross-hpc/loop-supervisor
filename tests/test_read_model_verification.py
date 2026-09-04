@@ -115,14 +115,14 @@ def test_discovery_preserves_attempt_when_expected_log_is_pruned_or_directory_is
     expected.parent.unlink()
     expected.parent.mkdir()
     expected.write_text("will disappear")
-    original_open = verification.os.open
+    original_stat = verification.os.stat
 
-    def remove_leaf_then_open(name, flags, *args, **kwargs):
+    def remove_leaf_then_stat(name, *args, **kwargs):
         if name == "01.log":
             os.unlink(expected)
-        return original_open(name, flags, *args, **kwargs)
+        return original_stat(name, *args, **kwargs)
 
-    monkeypatch.setattr(verification.os, "open", remove_leaf_then_open)
+    monkeypatch.setattr(verification.os, "stat", remove_leaf_then_stat)
     disappeared = discover_verification(tmp_path, "run-1", _result(tmp_path))
     assert len(disappeared.attempts) == 1
     assert disappeared.attempts[0].log is None
@@ -225,3 +225,51 @@ def test_verification_diagnostics_do_not_expose_unchecked_metadata(tmp_path):
 
     assert all(secret not in diagnostic.reason for diagnostic in discovered.diagnostics)
     assert all(str(tmp_path) not in diagnostic.reason for diagnostic in discovered.diagnostics)
+
+
+def test_discovery_diagnoses_nonregular_leaf_without_opening_it(tmp_path, monkeypatch):
+    directory = _directory(tmp_path)
+    nonregular = directory / "01.log"
+    nonregular.mkdir()
+    original_open = verification.os.open
+    opened_leaves: list[str] = []
+
+    def track_leaf_open(name, flags, *args, **kwargs):
+        if name == "01.log":
+            opened_leaves.append(name)
+        return original_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(verification.os, "open", track_leaf_open)
+
+    discovered = discover_verification(tmp_path, "run-1", _result(tmp_path))
+
+    assert discovered.attempts[0].log is None
+    assert any(item.artifact == "01.log" for item in discovered.diagnostics)
+    assert opened_leaves == []
+
+
+def test_read_log_is_unavailable_when_leaf_disappears_after_read(tmp_path, monkeypatch):
+    directory = _directory(tmp_path)
+    log = directory / "01.log"
+    log.write_text("read before pruning")
+    reference = discover_verification(tmp_path, "run-1", _result(tmp_path)).attempts[0].log
+    assert reference is not None
+    original_open = verification.os.open
+    leaf_opens = 0
+
+    def prune_before_post_read_check(name, flags, *args, **kwargs):
+        nonlocal leaf_opens
+        if name == "01.log":
+            leaf_opens += 1
+            if leaf_opens == 2:
+                os.unlink(log)
+        return original_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(verification.os, "open", prune_before_post_read_check)
+
+    content = read_log(tmp_path, reference)
+
+    assert leaf_opens == 2
+    assert not content.available
+    assert content.text == ""
+    assert content.diagnostic == "log is unavailable"
