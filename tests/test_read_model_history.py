@@ -164,6 +164,36 @@ def test_load_history_accepts_documented_counter_reset_to_zero(
     )
 
 
+@pytest.mark.parametrize("phase_after", ["verifying", "auditing"])
+@pytest.mark.parametrize(
+    ("status", "expects_regression"),
+    [("input_required", True), ("advanced", False)],
+)
+def test_load_history_permits_building_guidance_reset_only_after_successful_building_transition(
+    tmp_path, phase_after, status, expects_regression
+):
+    first = _record("run-1", 1)
+    first["phase_after"] = "building"
+    first_counters = first["counters"]
+    assert isinstance(first_counters, dict)
+    first_counters["builder_guidance_count"] = 2
+    following = _record("run-1", 2, "building")
+    following["phase_after"] = phase_after
+    following["status"] = status
+    following["recorded_at"] = "2026-01-01T00:00:01+00:00"
+    following["result"] = None
+    _write_history(tmp_path, "0001-planning.json", first)
+    _write_history(tmp_path, "0002-building.json", following)
+
+    loaded = load_history(tmp_path, "run-1")
+
+    has_regression = any(
+        "counter regression for builder_guidance_count" in diagnostic.reason
+        for diagnostic in loaded.diagnostics
+    )
+    assert has_regression is expects_regression
+
+
 def test_load_history_diagnoses_counter_decrease_to_nonzero_without_omitting_records(tmp_path):
     first, second = _consistent_adjacent_records()
     first_counters = first["counters"]

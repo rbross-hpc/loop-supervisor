@@ -365,10 +365,16 @@ def _append_adjacent_contradiction_diagnostics(
 
 def _is_permitted_counter_reset(field: str, following: HistoryEntry) -> bool:
     """Return whether a decreased counter is a documented reset on this transition."""
-    return following.counters[field] == 0 and (
-        following.phase,
-        following.phase_after,
-    ) in _RESET_TRANSITIONS_BY_COUNTER.get(field, frozenset())
+    transition = (following.phase, following.phase_after)
+    if following.counters[field] != 0 or transition not in _RESET_TRANSITIONS_BY_COUNTER.get(
+        field, frozenset()
+    ):
+        return False
+    return not (
+        field == "builder_guidance_count"
+        and transition in {("building", "verifying"), ("building", "auditing")}
+        and following.status is not AdvanceStatus.ADVANCED
+    )
 
 
 def _parse_recorded_at(recorded_at: str) -> datetime:
