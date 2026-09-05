@@ -75,8 +75,10 @@ def test_lock_file_contains_required_fields(tmp_path):
     lock.acquire()
     try:
         data = json.loads(_lock_path(tmp_path).read_text())
-        assert data["schema_version"] == 1
+        assert data["schema_version"] == 2
         assert isinstance(data["token"], str) and data["token"]
+        assert isinstance(data["owner_boot_id"], str) and data["owner_boot_id"]
+        assert isinstance(data["owner_process_start"], str) and data["owner_process_start"]
         assert data["pid"] == os.getpid()
         assert data["hostname"] == socket.gethostname()
         assert data["operation"] == "run"
@@ -84,6 +86,35 @@ def test_lock_file_contains_required_fields(tmp_path):
         assert data["integration_path"] == "/repo"
     finally:
         lock.release()
+
+
+def test_acquire_records_schema_v2_kernel_owner_identity(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        locking_mod,
+        "_read_kernel_owner_identity",
+        lambda pid: (f"boot-id-for-{pid}", "opaque-start-ticks"),
+    )
+    lock = _make_lock(tmp_path)
+    lock.acquire()
+    try:
+        data = json.loads(_lock_path(tmp_path).read_text())
+        assert data["schema_version"] == 2
+        assert data["owner_boot_id"] == f"boot-id-for-{os.getpid()}"
+        assert data["owner_process_start"] == "opaque-start-ticks"
+    finally:
+        lock.release()
+
+
+def test_acquire_fails_closed_when_kernel_owner_identity_is_unavailable(tmp_path, monkeypatch):
+    def _unavailable_identity(pid: int) -> tuple[str, str]:
+        raise LockError(f"cannot read kernel owner identity for PID {pid}")
+
+    monkeypatch.setattr(locking_mod, "_read_kernel_owner_identity", _unavailable_identity)
+
+    with pytest.raises(LockError, match="cannot read kernel owner identity"):
+        _make_lock(tmp_path).acquire()
+
+    assert not _lock_path(tmp_path).exists()
 
 
 def test_release_removes_lock_file(tmp_path):

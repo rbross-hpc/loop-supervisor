@@ -101,6 +101,29 @@ def test_observe_lock_classifies_non_running_taxonomy(tmp_path, prepare, expecte
     assert "token" not in observation.__dataclass_fields__
 
 
+def test_observe_lock_accepts_live_version_2_lock_without_upgrading_running(tmp_path, monkeypatch):
+    record = _lock_record(tmp_path) | {
+        "schema_version": 2,
+        "owner_boot_id": "boot-id",
+        "owner_process_start": "12345",
+    }
+    _write_lock(tmp_path, record)
+    import loop_supervisor.read_model.lock_observation as lock_observation
+
+    class State:
+        run_id = "run-1"
+        integration_path = str(tmp_path)
+
+    monkeypatch.setattr(lock_observation, "load_state", lambda *_: State())
+
+    observation = observe_lock(tmp_path, tmp_path, (_summary(),))
+
+    assert observation.activity is LockActivity.LOCAL_LIVE_ASSOCIATED
+    assert observation.owner_boot_id == "boot-id"
+    assert observation.owner_process_start == "12345"
+    assert observation.activities == (RunActivity(run_id="run-1", label=ActivityLabel.RUNNING),)
+
+
 def test_observe_lock_reports_absent_when_verified_directory_has_no_lock_leaf(tmp_path):
     (tmp_path / "loop-supervisor").mkdir()
 
