@@ -307,3 +307,58 @@ def test_read_log_is_unavailable_when_leaf_disappears_after_read(tmp_path, monke
     assert not content.available
     assert content.text == ""
     assert content.diagnostic == "log is unavailable"
+
+
+def test_read_log_reports_replacement_after_first_fstat(tmp_path, monkeypatch):
+    directory = _directory(tmp_path)
+    log = directory / "01.log"
+    log.write_text("opened inode")
+    reference = discover_verification(tmp_path, "run-1", _result(tmp_path)).attempts[0].log
+    assert reference is not None
+    original_open = verification.os.open
+    leaf_opens = 0
+
+    def replace_before_post_read_open(name, flags, *args, **kwargs):
+        nonlocal leaf_opens
+        if name == "01.log":
+            leaf_opens += 1
+            if leaf_opens == 2:
+                replacement = directory / "replacement.log"
+                replacement.write_text("replacement inode")
+                os.replace(replacement, log)
+        return original_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(verification.os, "open", replace_before_post_read_open)
+
+    content = read_log(tmp_path, reference)
+
+    assert leaf_opens == 2
+    assert content.available
+    assert content.text == "opened inode"
+    assert content.changed_during_read is True
+
+
+def test_read_log_reports_in_place_mutation_of_opened_inode(tmp_path, monkeypatch):
+    directory = _directory(tmp_path)
+    log = directory / "01.log"
+    log.write_text("before mutation")
+    reference = discover_verification(tmp_path, "run-1", _result(tmp_path)).attempts[0].log
+    assert reference is not None
+    original_fstat = verification.os.fstat
+    fstat_calls = 0
+
+    def mutate_before_post_read_fstat(fd):
+        nonlocal fstat_calls
+        fstat_calls += 1
+        if fstat_calls == 2:
+            log.write_text("after in-place mutation has a different size")
+        return original_fstat(fd)
+
+    monkeypatch.setattr(verification.os, "fstat", mutate_before_post_read_fstat)
+
+    content = read_log(tmp_path, reference)
+
+    assert fstat_calls == 3
+    assert content.available
+    assert content.text == "before mutation"
+    assert content.changed_during_read is True
