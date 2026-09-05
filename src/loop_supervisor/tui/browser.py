@@ -12,6 +12,7 @@ from ..read_model.discovery import RunSummary
 from ..read_model.history import HistoryEntry, HistoryLoad, HistoryStatus
 from ..read_model.lock_observation import ActivityLabel, LockActivity, LockObservation
 from ..read_model.snapshot import ProjectSnapshot, build_snapshot
+from ..state import StateError
 
 
 class RunBrowserApp(App[None]):
@@ -38,6 +39,7 @@ class RunBrowserApp(App[None]):
         "Verification log viewer truncated: rendered-output limit reached."
     )
     _SENSITIVE_LOG_WARNING = "WARNING: Verification output is unredacted and potentially sensitive."
+    _REFRESH_FAILURE_DIAGNOSTIC = "Refresh failed: unable to scan supervisor run state."
 
     TITLE = "Loop Supervisor"
     SUB_TITLE = "Run browser"
@@ -59,6 +61,7 @@ class RunBrowserApp(App[None]):
         self._selected_record_index: int | None = None
         self._selected_log_reference: verification.LogReference | None = None
         self._opened_log: verification.LogContent | None = None
+        self._refresh_failure: str | None = None
         self._raw_json_expanded = False
         self._detail_records: tuple[CurrentRun | HistoryEntry, ...] = ()
         self._openable_logs: tuple[verification.LogReference, ...] = ()
@@ -74,6 +77,8 @@ class RunBrowserApp(App[None]):
             yield from self._compose_detail(self._selected_run_id)
         else:
             yield from self._compose_record_detail()
+        if self._refresh_failure is not None:
+            yield Static(self._refresh_failure, markup=False, classes="refresh-failure")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -380,7 +385,17 @@ class RunBrowserApp(App[None]):
         self._selected_log_reference = None
         self._opened_log = None
         selected_run_id = self._selected_run_id
-        self._snapshot = build_snapshot(self._snapshot.project)
+        try:
+            refreshed_snapshot = build_snapshot(self._snapshot.project)
+        except (StateError, OSError):
+            # The old snapshot remains the only complete read model when a
+            # scan-wide failure prevents a safe replacement. Do not expose raw
+            # filesystem exception text, which may include sensitive paths.
+            self._refresh_failure = self._REFRESH_FAILURE_DIAGNOSTIC
+            self.refresh(recompose=True)
+            return
+        self._snapshot = refreshed_snapshot
+        self._refresh_failure = None
         self._run_id_by_row_index = tuple(summary.run_id for summary in self._snapshot.runs)
         if selected_run_id not in self._run_id_by_row_index:
             self._selected_run_id = None

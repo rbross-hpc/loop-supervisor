@@ -32,7 +32,14 @@ from loop_supervisor.read_model.verification import (
     VerificationDiagnostic,
     VerificationDiscovery,
 )
-from loop_supervisor.state import STATE_SCHEMA_VERSION, RunOptions, RunState, load_state, save_state
+from loop_supervisor.state import (
+    STATE_SCHEMA_VERSION,
+    RunOptions,
+    RunState,
+    StateError,
+    load_state,
+    save_state,
+)
 from loop_supervisor.supervisor import AdvanceStatus
 from loop_supervisor.tui import RunBrowserApp
 
@@ -378,6 +385,41 @@ async def test_run_browser_manual_refresh_updates_rows_and_reconciles_removed_se
         assert app.screen.query_one("#run-browser")
         remaining_rows = [cast(Any, row.render()).plain for row in app.screen.query(".run-row")]
         assert ["older" in row for row in remaining_rows] == [True]
+
+
+@pytest.mark.asyncio
+async def test_run_browser_refresh_failure_preserves_snapshot_selection_and_closes_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00", phase="auditing")
+    _persist_verification_result(tmp_path, run_id, _verification_result(tmp_path, run_id))
+    log = tmp_path / "loop-supervisor" / "verification" / run_id / ("a" * 40) / "01.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("previously opened log")
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+
+    def fail_scan(_: ProjectResolution) -> object:
+        raise StateError("raw replaced-state-directory path must not be rendered")
+
+    monkeypatch.setattr(browser, "build_snapshot", fail_scan)
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter", "tab", "enter")
+        assert app.screen.query_one("#verification-log-viewer")
+
+        await pilot.press("r")
+
+        detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        diagnostic = cast(Any, app.screen.query_one(".refresh-failure").render()).plain
+        assert app._snapshot is snapshot
+        assert tuple(summary.run_id for summary in app._snapshot.runs) == (run_id,)
+        assert "Run ID: selected" in detail
+        assert app._selected_run_id == run_id
+        assert app._opened_log is None
+        assert app._selected_log_reference is None
+        assert diagnostic == "Refresh failed: unable to scan supervisor run state."
+        assert "raw replaced-state-directory path" not in diagnostic
 
 
 @pytest.mark.asyncio
