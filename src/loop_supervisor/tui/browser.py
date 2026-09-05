@@ -46,7 +46,12 @@ class RunBrowserApp(App[None]):
 
     TITLE = "Loop Supervisor"
     SUB_TITLE = "Run browser"
-    BINDINGS = [("q", "quit", "Quit"), ("b", "back", "Back"), ("r", "refresh", "Refresh")]
+    BINDINGS = [
+        ("q", "quit", "Quit"),
+        ("b", "back", "Back"),
+        ("r", "refresh", "Refresh"),
+        ("e", "toggle_raw_json", "Toggle raw JSON"),
+    ]
     CSS = """
     #run-browser, #run-detail {
         padding: 1 2;
@@ -287,7 +292,7 @@ class RunBrowserApp(App[None]):
     def _render_record_detail(self, record: CurrentRun | HistoryEntry) -> str:
         result = record.result_detail or "unavailable (none recorded)."
         error = record.error_detail or "unavailable (none recorded)."
-        raw_status = "expanded" if self._raw_json_expanded else "collapsed (press r to expand)"
+        raw_status = "expanded" if self._raw_json_expanded else "collapsed (press e to expand)"
         if record.raw_json_truncated:
             raw_status = f"{raw_status}; output truncated"
         return self._bound_record_detail(
@@ -383,12 +388,14 @@ class RunBrowserApp(App[None]):
         """Keep the selected run's current and history records keyboard-accessible."""
         self.query_one("#record-list", ListView).focus()
 
-    def action_refresh(self) -> None:
-        """Replace the displayed snapshot with a fresh disk scan by selected run ID."""
+    def action_toggle_raw_json(self) -> None:
+        """Toggle the opt-in raw JSON view for the open record detail."""
         if self._selected_record_index is not None:
             self._raw_json_expanded = not self._raw_json_expanded
             self.refresh(recompose=True)
-            return
+
+    def action_refresh(self) -> None:
+        """Replace the displayed snapshot with a fresh disk scan by selected run ID."""
         self._selected_log_reference = None
         self._opened_log = None
         selected_run_id = self._selected_run_id

@@ -168,7 +168,8 @@ integration checkout; when omitted, the current directory is used. Runs are
 listed newest first; select one to inspect its summary, workflow timeline,
 record or escaped raw-JSON detail, verification summaries, and an explicitly
 opened bounded verification log viewer. Use the keyboard to select, refresh
-manually, go back, or quit.
+manually (`r`), go back, or quit. In record detail, use `e` to toggle the
+escaped raw-JSON view.
 
 The browser performs no writes, acquires no mutating lock, and does no
 automatic polling. It cannot start, resume, answer, prune, or repair runs;
