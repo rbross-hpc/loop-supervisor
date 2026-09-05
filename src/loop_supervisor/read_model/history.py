@@ -43,6 +43,36 @@ _COUNTER_FIELDS = frozenset(
         "builder_guidance_count",
     }
 )
+_RESET_TRANSITIONS_BY_COUNTER: dict[str, frozenset[tuple[str, str]]] = {
+    "revision_count": frozenset(
+        {
+            ("planning", "building"),
+            ("planning", "architecting"),
+            ("creating_worktree", "building"),
+            ("creating_worktree", "architecting"),
+            ("cleanup_branch", "planning"),
+        }
+    ),
+    "replan_count": frozenset({("cleanup_branch", "planning")}),
+    "architect_retry_count": frozenset(
+        {
+            ("recording_decision", "building"),
+            ("recording_decision", "planning"),
+            ("cleanup_branch", "planning"),
+        }
+    ),
+    "builder_guidance_count": frozenset(
+        {
+            ("planning", "building"),
+            ("planning", "architecting"),
+            ("creating_worktree", "building"),
+            ("creating_worktree", "architecting"),
+            ("building", "verifying"),
+            ("building", "auditing"),
+            ("cleanup_branch", "planning"),
+        }
+    ),
+}
 _RECORD_FIELDS = frozenset(
     {
         "seq",
@@ -320,7 +350,8 @@ def _append_adjacent_contradiction_diagnostics(
                 )
             )
         for field in sorted(_COUNTER_FIELDS):
-            if following.counters[field] < preceding.counters[field]:
+            is_regression = following.counters[field] < preceding.counters[field]
+            if is_regression and not _is_permitted_counter_reset(field, following):
                 diagnostics.append(
                     HistoryDiagnostic(
                         str(following.seq),
@@ -328,6 +359,14 @@ def _append_adjacent_contradiction_diagnostics(
                         following.seq,
                     )
                 )
+
+
+def _is_permitted_counter_reset(field: str, following: HistoryEntry) -> bool:
+    """Return whether a decreased counter is a documented reset on this transition."""
+    return following.counters[field] == 0 and (
+        following.phase,
+        following.phase_after,
+    ) in _RESET_TRANSITIONS_BY_COUNTER.get(field, frozenset())
 
 
 def _parse_recorded_at(recorded_at: str) -> datetime:

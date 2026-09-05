@@ -113,7 +113,58 @@ def test_load_history_diagnoses_adjacent_recorded_timestamp_reversal_without_omi
     assert any("timestamp reversal" in diagnostic.reason for diagnostic in loaded.diagnostics)
 
 
-def test_load_history_diagnoses_adjacent_counter_regression_without_omitting_records(tmp_path):
+@pytest.mark.parametrize(
+    ("counter", "phase", "phase_after"),
+    [
+        ("revision_count", "planning", "building"),
+        ("revision_count", "planning", "architecting"),
+        ("revision_count", "creating_worktree", "building"),
+        ("revision_count", "creating_worktree", "architecting"),
+        ("revision_count", "cleanup_branch", "planning"),
+        ("replan_count", "cleanup_branch", "planning"),
+        ("architect_retry_count", "recording_decision", "building"),
+        ("architect_retry_count", "recording_decision", "planning"),
+        ("architect_retry_count", "cleanup_branch", "planning"),
+        ("builder_guidance_count", "planning", "building"),
+        ("builder_guidance_count", "planning", "architecting"),
+        ("builder_guidance_count", "creating_worktree", "building"),
+        ("builder_guidance_count", "creating_worktree", "architecting"),
+        ("builder_guidance_count", "building", "verifying"),
+        ("builder_guidance_count", "building", "auditing"),
+        ("builder_guidance_count", "cleanup_branch", "planning"),
+    ],
+)
+def test_load_history_accepts_documented_counter_reset_to_zero(
+    tmp_path, counter, phase, phase_after
+):
+    first = _record("run-1", 1)
+    first["phase_after"] = phase
+    second = _record("run-1", 2, phase)
+    second["phase_after"] = phase_after
+    second["recorded_at"] = "2026-01-01T00:00:01+00:00"
+    second["result"] = None
+    first_counters = first["counters"]
+    second_counters = second["counters"]
+    assert isinstance(first_counters, dict)
+    assert isinstance(second_counters, dict)
+    first_counters[counter] = 2
+    _write_history(tmp_path, "0001-planning.json", first)
+    _write_history(tmp_path, f"0002-{phase}.json", second)
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert [(entry.seq, entry.counters[counter]) for entry in loaded.entries] == [
+        (1, 2),
+        (2, 0),
+    ]
+    assert loaded.completeness is HistoryStatus.COMPLETE
+    assert not any(
+        f"counter regression for {counter}" in diagnostic.reason
+        for diagnostic in loaded.diagnostics
+    )
+
+
+def test_load_history_diagnoses_counter_decrease_to_nonzero_without_omitting_records(tmp_path):
     first, second = _consistent_adjacent_records()
     first_counters = first["counters"]
     second_counters = second["counters"]
@@ -131,7 +182,31 @@ def test_load_history_diagnoses_adjacent_counter_regression_without_omitting_rec
         (2, 1),
     ]
     assert loaded.completeness is HistoryStatus.INCOMPLETE
-    assert any("counter regression" in diagnostic.reason for diagnostic in loaded.diagnostics)
+    assert any(
+        "counter regression for revision_count" in diagnostic.reason
+        for diagnostic in loaded.diagnostics
+    )
+
+
+def test_load_history_diagnoses_counter_decrease_to_zero_on_unlisted_transition(tmp_path):
+    first, second = _consistent_adjacent_records()
+    first_counters = first["counters"]
+    assert isinstance(first_counters, dict)
+    first_counters["revision_count"] = 2
+    _write_history(tmp_path, "0001-planning.json", first)
+    _write_history(tmp_path, "0002-creating_worktree.json", second)
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert [(entry.seq, entry.counters["revision_count"]) for entry in loaded.entries] == [
+        (1, 2),
+        (2, 0),
+    ]
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert any(
+        "counter regression for revision_count" in diagnostic.reason
+        for diagnostic in loaded.diagnostics
+    )
 
 
 def test_load_history_retains_validated_detail_and_round_trippable_raw_json(tmp_path):
