@@ -34,6 +34,10 @@ class RunBrowserApp(App[None]):
     _VERIFICATION_TRUNCATION_MARKER = (
         "Verification output truncated: rendered-output limit reached."
     )
+    _LOG_VIEWER_TRUNCATION_MARKER = (
+        "Verification log viewer truncated: rendered-output limit reached."
+    )
+    _SENSITIVE_LOG_WARNING = "WARNING: Verification output is unredacted and potentially sensitive."
 
     TITLE = "Loop Supervisor"
     SUB_TITLE = "Run browser"
@@ -53,14 +57,19 @@ class RunBrowserApp(App[None]):
         self._snapshot = snapshot
         self._selected_run_id: str | None = None
         self._selected_record_index: int | None = None
+        self._selected_log_reference: verification.LogReference | None = None
+        self._opened_log: verification.LogContent | None = None
         self._raw_json_expanded = False
         self._detail_records: tuple[CurrentRun | HistoryEntry, ...] = ()
+        self._openable_logs: tuple[verification.LogReference, ...] = ()
         self._run_id_by_row_index = tuple(summary.run_id for summary in snapshot.runs)
 
     def compose(self) -> ComposeResult:
         yield Header()
         if self._selected_run_id is None:
             yield from self._compose_browser()
+        elif self._selected_log_reference is not None:
+            yield from self._compose_log_viewer()
         elif self._selected_record_index is None:
             yield from self._compose_detail(self._selected_run_id)
         else:
@@ -117,12 +126,28 @@ class RunBrowserApp(App[None]):
                 markup=False,
                 classes="run-detail-verification",
             )
+            self._openable_logs = tuple(
+                attempt.log
+                for attempt in discovered_verification.attempts
+                if attempt.log is not None
+            )
             self._detail_records = (current, *history.entries)
             record_rows = (
                 ListItem(Static(self._record_label(record), markup=False))
                 for record in self._detail_records
             )
             yield ListView(*record_rows, id="record-list")
+            if self._openable_logs:
+                log_rows = (
+                    ListItem(
+                        Static(
+                            f"Attempt {reference.ordinal} log (open; unredacted sensitive output)",
+                            markup=False,
+                        )
+                    )
+                    for reference in self._openable_logs
+                )
+                yield ListView(*log_rows, id="verification-log-list")
 
     def _compose_record_detail(self) -> ComposeResult:
         record = self._detail_records[self._selected_record_index or 0]
@@ -135,6 +160,46 @@ class RunBrowserApp(App[None]):
                     markup=False,
                     classes="record-detail-raw-json",
                 )
+
+    def _compose_log_viewer(self) -> ComposeResult:
+        """Render one explicitly requested log through Textual's literal-text path."""
+        assert self._opened_log is not None
+        with VerticalScroll(id="verification-log-viewer"):
+            yield Static("Verification log — press b to return to the run detail.", markup=False)
+            yield Static(
+                self._render_log_content(self._opened_log),
+                markup=False,
+                classes="verification-log-viewer",
+            )
+
+    @classmethod
+    def _render_log_content(cls, content: verification.LogContent) -> str:
+        """Render the explicit, unredacted bounded-read result with its evidence markers."""
+        lines = [cls._SENSITIVE_LOG_WARNING]
+        if not content.available:
+            lines.append(f"Verification log: unavailable ({content.diagnostic or 'unavailable'}).")
+            return "\n".join(lines)
+        if content.byte_truncated:
+            lines.append("Verification log byte truncated: read limit reached.")
+        if content.render_truncated:
+            lines.append("Verification log render truncated: rendered-output limit reached.")
+        if content.changed_during_read:
+            lines.append("Verification log changed during read: content may be inconsistent.")
+        lines.append(content.text)
+        rendered = "\n".join(lines)
+        if (
+            len(rendered.encode("utf-8")) <= cls._MAX_VERIFICATION_RENDERED_BYTES
+            and len(rendered.splitlines()) <= cls._MAX_VERIFICATION_RENDERED_LINES
+        ):
+            return rendered
+        marker = cls._LOG_VIEWER_TRUNCATION_MARKER
+        payload = cls._truncate_literal(
+            rendered,
+            cls._MAX_VERIFICATION_RENDERED_BYTES - len(marker.encode("utf-8")) - 1,
+            cls._MAX_VERIFICATION_RENDERED_LINES - 1,
+        )
+        separator = "" if cls._ends_with_line_separator(payload) else "\n"
+        return f"{payload}{separator}{marker}"
 
     @classmethod
     def _render_raw_json(cls, record: CurrentRun | HistoryEntry) -> str:
@@ -279,10 +344,16 @@ class RunBrowserApp(App[None]):
         )
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        """Open a selected run or record using only typed read-model values."""
+        """Open a selected run, record, or explicitly requested authorized log."""
         if event.list_view.id == "record-list":
             self._selected_record_index = event.index
             self._raw_json_expanded = False
+        elif event.list_view.id == "verification-log-list":
+            reference = self._openable_logs[event.index]
+            self._selected_log_reference = reference
+            self._opened_log = verification.read_log(
+                self._snapshot.project.git_common_dir, reference
+            )
         else:
             self._selected_run_id = self._run_id_by_row_index[event.index]
         self.call_after_refresh(self._show_selected_run)
@@ -290,7 +361,11 @@ class RunBrowserApp(App[None]):
     def _show_selected_run(self) -> None:
         """Replace the browser widgets after Textual has handled list selection."""
         self.refresh(recompose=True)
-        if self._selected_run_id is not None and self._selected_record_index is None:
+        if (
+            self._selected_run_id is not None
+            and self._selected_record_index is None
+            and self._selected_log_reference is None
+        ):
             self.call_after_refresh(self._focus_record_list)
 
     def _focus_record_list(self) -> None:
@@ -303,6 +378,8 @@ class RunBrowserApp(App[None]):
             self._raw_json_expanded = not self._raw_json_expanded
             self.refresh(recompose=True)
             return
+        self._selected_log_reference = None
+        self._opened_log = None
         selected_run_id = self._selected_run_id
         self._snapshot = build_snapshot(self._snapshot.project)
         self._run_id_by_row_index = tuple(summary.run_id for summary in self._snapshot.runs)
@@ -314,7 +391,12 @@ class RunBrowserApp(App[None]):
 
     async def action_back(self) -> None:
         """Return from a run detail to the immutable browser snapshot."""
-        if self._selected_record_index is not None:
+        if self._selected_log_reference is not None:
+            self._selected_log_reference = None
+            self._opened_log = None
+            self.refresh(recompose=True)
+            self.call_after_refresh(self._focus_record_list)
+        elif self._selected_record_index is not None:
             self._selected_record_index = None
             self._raw_json_expanded = False
             self.refresh(recompose=True)

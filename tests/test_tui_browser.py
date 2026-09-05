@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from textual.widgets import Static
 
 import loop_supervisor.read_model.verification as verification
 from loop_supervisor.read_model import ProjectResolution, build_snapshot, load_current_run
@@ -712,6 +713,84 @@ def test_verification_rendering_bounds_non_newline_line_separators() -> None:
     assert len(rendered.encode("utf-8")) <= 256 * 1024
     assert len(rendered.splitlines()) <= 10_000
     assert "Verification output truncated: rendered-output limit reached." in rendered
+
+
+async def _open_first_verification_log(pilot: Any) -> None:
+    """Move keyboard focus from record detail choices to verification log choices."""
+    await pilot.press("tab", "enter")
+
+
+@pytest.mark.asyncio
+async def test_run_detail_explicitly_opens_available_verification_log_as_literal_sensitive_text(
+    tmp_path: Path,
+) -> None:
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00", phase="auditing")
+    result = _verification_result(tmp_path, run_id)
+    _persist_verification_result(tmp_path, run_id, result)
+    log = tmp_path / "loop-supervisor" / "verification" / run_id / ("a" * 40) / "01.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("[bold]unredacted literal verification output[/bold]")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        await _open_first_verification_log(pilot)
+
+        viewer = cast(Any, app.screen.query_one(".verification-log-viewer").render()).plain
+        heading = cast(
+            Any, app.screen.query_one("#verification-log-viewer").query_one(Static).render()
+        ).plain
+        assert heading == "Verification log — press b to return to the run detail."
+        assert "WARNING: Verification output is unredacted and potentially sensitive." in viewer
+        assert "[bold]unredacted literal verification output[/bold]" in viewer
+
+
+@pytest.mark.asyncio
+async def test_run_detail_shows_unavailable_diagnostic_when_opening_pruned_verification_log(
+    tmp_path: Path,
+) -> None:
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00", phase="auditing")
+    result = _verification_result(tmp_path, run_id)
+    _persist_verification_result(tmp_path, run_id, result)
+    log = tmp_path / "loop-supervisor" / "verification" / run_id / ("a" * 40) / "01.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("will be pruned")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        log.unlink()
+        await _open_first_verification_log(pilot)
+
+        viewer = cast(Any, app.screen.query_one(".verification-log-viewer").render()).plain
+        assert "WARNING: Verification output is unredacted and potentially sensitive." in viewer
+        assert "Verification log: unavailable (log is unavailable)." in viewer
+        assert "will be pruned" not in viewer
+
+
+@pytest.mark.asyncio
+async def test_run_detail_marks_truncated_verification_log_content(tmp_path: Path) -> None:
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00", phase="auditing")
+    result = _verification_result(tmp_path, run_id)
+    _persist_verification_result(tmp_path, run_id, result)
+    log = tmp_path / "loop-supervisor" / "verification" / run_id / ("a" * 40) / "01.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("x" * (verification.LOG_RENDER_BYTE_LIMIT + 1))
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        await _open_first_verification_log(pilot)
+
+        viewer = cast(Any, app.screen.query_one(".verification-log-viewer").render()).plain
+        assert "Verification log render truncated: rendered-output limit reached." in viewer
+        assert "Verification log byte truncated" not in viewer
 
 
 @pytest.mark.asyncio
