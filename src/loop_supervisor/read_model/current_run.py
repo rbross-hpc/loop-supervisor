@@ -120,7 +120,14 @@ def _latest_result(state: RunState) -> dict[str, object] | None:
         "creating_worktree": ("planner_result",),
         "architecting": ("architect_result", "planner_result"),
         "recording_decision": ("architect_result", "planner_result"),
-        "building": ("builder_result", "planner_result"),
+        # REVISE returns directly to building while retaining the preceding
+        # builder result. Its auditor verdict is therefore the latest result
+        # responsible for this lifecycle state, not the superseded build.
+        "building": (
+            ("auditor_result", "builder_result", "planner_result")
+            if _is_revise_result(state.auditor_result)
+            else ("builder_result", "planner_result")
+        ),
         "verifying": ("builder_result", "planner_result"),
         "auditing": (
             "verification_result" if state.verification_result else "builder_result",
@@ -151,6 +158,11 @@ def _latest_result(state: RunState) -> dict[str, object] | None:
             continue
         return value
     return None
+
+
+def _is_revise_result(result: dict[str, object] | None) -> bool:
+    """Whether the retained auditor result caused a return to building."""
+    return result is not None and result.get("disposition") == "REVISE"
 
 
 def _effective_phase(state: RunState) -> str:

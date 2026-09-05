@@ -40,6 +40,7 @@ def _save_state(
     planner_task_id: str = "task-42",
     pending_question: dict[str, object] | None = None,
     last_error: dict[str, object] | None = None,
+    builder_result: dict[str, object] | None = None,
     auditor_result: dict[str, object] | None = None,
 ) -> Path:
     creating_worktree = phase == "creating_worktree"
@@ -71,14 +72,18 @@ def _save_state(
             "acceptance_criteria": ["Map current state"],
         },
         builder_result=(
-            {
-                "task_id": "task-42",
-                "objective": "Build the detail reader",
-                "status": "BLOCKED",
-                "implementation_summary": "Needs guidance.",
-            }
-            if pending_question is not None
-            else None
+            builder_result
+            if builder_result is not None
+            else (
+                {
+                    "task_id": "task-42",
+                    "objective": "Build the detail reader",
+                    "status": "BLOCKED",
+                    "implementation_summary": "Needs guidance.",
+                }
+                if pending_question is not None
+                else None
+            )
         ),
         auditor_result=auditor_result,
         accepted_task_count=4,
@@ -120,6 +125,41 @@ def test_load_current_run_uses_planner_task_while_creating_worktree(tmp_path: Pa
 
     assert current.loadable is True, current.diagnostic
     assert current.current_task_id == "planned-task"
+
+
+def test_load_current_run_uses_auditor_revise_result_when_returned_to_building(
+    tmp_path: Path,
+) -> None:
+    _save_state(
+        tmp_path,
+        phase="building",
+        builder_result={
+            "task_id": "task-42",
+            "objective": "Build the detail reader",
+            "status": "COMPLETE",
+            "implementation_summary": "Superseded builder content.",
+            "commit": "abc123",
+        },
+        auditor_result={
+            "task_id": "task-42",
+            "objective": "Build the detail reader",
+            "disposition": "REVISE",
+            "findings": ["The result needs correction."],
+            "required_changes": ["Correct the result."],
+            "design_observations": [],
+            "decision_required": False,
+            "decision_question": None,
+            "decision_rationale": None,
+        },
+    )
+
+    current = load_current_run(tmp_path, "current")
+
+    assert current.loadable is True, current.diagnostic
+    assert current.result_detail is not None
+    assert '"disposition": "REVISE"' in current.result_detail
+    assert "Correct the result." in current.result_detail
+    assert "Superseded builder content." not in current.result_detail
 
 
 def test_load_current_run_uses_new_planner_result_after_auditor_replan(tmp_path: Path) -> None:
