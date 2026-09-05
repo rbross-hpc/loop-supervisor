@@ -430,6 +430,35 @@ async def test_run_browser_manual_refresh_updates_rows_and_reconciles_removed_se
 
 
 @pytest.mark.asyncio
+async def test_run_browser_refreshes_empty_project_without_lookup_failure(tmp_path: Path) -> None:
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("r")
+        await pilot.press("r")
+
+        empty_state = cast(Any, app.screen.query_one(".empty-runs").render()).plain
+        assert empty_state == "No discovered runs."
+
+
+@pytest.mark.asyncio
+async def test_run_browser_refreshes_to_empty_state_after_only_run_is_deleted(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "only-run", updated_at="2026-01-01T00:00:00+00:00")
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        (tmp_path / "loop-supervisor" / "runs" / "only-run.json").unlink()
+
+        await pilot.press("r")
+        await pilot.press("r")
+
+        empty_state = cast(Any, app.screen.query_one(".empty-runs").render()).plain
+        assert empty_state == "No discovered runs."
+
+
+@pytest.mark.asyncio
 async def test_run_browser_refresh_restores_highlighted_run_id_when_order_changes(
     tmp_path: Path,
 ) -> None:
