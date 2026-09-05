@@ -87,10 +87,11 @@ def _bridge_sigterm_to_keyboard_interrupt() -> Iterator[None]:
     never installed in library code such as `RunSession` or
     `OpenCodeServer`, so importing loop_supervisor does not silently
     change a host application's signal disposition, and never wrapped
-    around `cmd_tui`: the interactive TUI is currently a no-op stub
-    pending a rebuild (see the ADR retiring the in-process Textual TUI),
-    and its eventual replacement will need its own signal-handling UX
-    decision. Deliberately out of scope here (see ADR 0015).
+    around `cmd_tui`: the interactive TUI is a read-only, disk-backed run
+    browser with its own Textual signal-handling UX. It performs no
+    supervisor writes or lock acquisition, and refreshes only on explicit
+    user request rather than by automatic polling. Deliberately out of
+    scope here (see ADR 0015).
     """
     previous = signal.getsignal(signal.SIGTERM)
 

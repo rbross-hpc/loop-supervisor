@@ -3,9 +3,10 @@
 This is the `loop-supervisor` project itself: a headless supervisor that
 drives an OpenCode planner/architect/builder/auditor loop over Git worktrees.
 
-The current objective is to replace the temporary `loop-supervisor tui` stub
-with a production-quality, read-only Textual interface for exploring run data
-captured by the supervisor.
+The read-only `loop-supervisor tui` run browser has shipped. It is a
+production-quality Textual interface for exploring supervisor-captured run data;
+this document records its delivered product contract and the separately deferred
+active-run attribution investigation.
 
 ## Product model
 
@@ -119,28 +120,27 @@ fabricate elapsed-time or stall information.
 
 ## Ordered priorities
 
-1. Define the disk-read boundary, evidence-based status taxonomy, refresh
-   semantics, history validation, log-containment policy, and module
-   boundaries. Record non-obvious decisions in a new ADR that builds on
-   ADRs 0034 and 0035.
-2. Implement and thoroughly test a Textual-independent read model for run
-   discovery, current snapshots, history, verification logs, and
+1. **Delivered.** Define the disk-read boundary, evidence-based status
+   taxonomy, refresh semantics, history validation, log-containment policy, and
+   module boundaries in ADR 0036.
+2. **Delivered.** Implement and thoroughly test a Textual-independent read model
+   for run discovery, current snapshots, history, verification logs, and
    conservative lock observations.
-3. Replace the `cmd_tui` stub with a minimum vertical slice: optional
+3. **Delivered.** Launch the minimum vertical slice from `cmd_tui`: optional
    `--project`, newest-first run browser, run selection, summary, workflow
    timeline, manual refresh, back, and quit.
-4. Add opinionated result/error detail, escaped raw JSON, and the opt-in
-   bounded verification-log viewer.
-5. Harden empty/loading/degraded states, narrow layouts, concurrent
-   filesystem changes, resource cleanup, and keyboard affordances.
-6. Update README, installation, skeleton, skill, and CLI documentation so
-   none describes `tui` as unavailable. Exercise it against realistic
-   persisted fixtures and, where practical, artifacts from a bounded real
-   supervisor run.
-7. After the read-only TUI is complete, investigate reliable active-run
-   attribution or heartbeat persistence (e.g. a PID/liveness field in the
-   lock record) as a separate design task. Do not block the initial
-   explorer on pretending current lock data can answer more than it can.
+4. **Delivered.** Add opinionated result/error detail, escaped raw JSON, and the
+   opt-in bounded verification-log viewer.
+5. **Delivered.** Harden empty/loading/degraded states, narrow layouts,
+   concurrent filesystem changes, resource cleanup, and keyboard affordances.
+6. **Delivered.** Update README, installation, skeleton, skill, and CLI
+   documentation to describe the shipped read-only browser. Read-model and
+   Textual fixtures provide repository-verifiable coverage; exercising a bounded
+   real supervisor run remains optional validation, not an open delivery item.
+7. **Current priority.** Investigate reliable active-run attribution or heartbeat
+   persistence (e.g. a PID/liveness field in the lock record) as a separate
+   design task. Do not alter the shipped explorer by pretending current lock data
+   can answer more than it can.
 
 ## Completion criteria
 
@@ -158,8 +158,8 @@ The objective is complete when:
 - Textual tests cover navigation and rendering;
 - read-model tests cover malformed, partial, missing, pruned, symlinked,
   traversal, oversized, and changing data;
-- CLI tests prove the stub has been replaced and current-directory project
-  resolution works;
+- CLI tests prove the browser launches and current-directory project resolution
+  works;
 - the configured Ruff, formatting, mypy, and pytest gates pass.
 
 ## Out of scope

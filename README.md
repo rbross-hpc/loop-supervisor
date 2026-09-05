@@ -292,14 +292,24 @@ results shown to the auditor). See ADR 0025 for the config format and
 The integration checkout must be a clean Git working tree on a real
 branch (not detached `HEAD`) before a run starts.
 
-## TUI (being rebuilt)
+## TUI run browser
 
-The previous in-process Textual TUI, which drove `RunSession` directly
-and shared live event state with a reducer, has been retired. `loop-
-supervisor tui` is currently a no-op stub that prints a notice and
-exits; use `run`/`resume` in the meantime. A replacement TUI that reads
-run state from disk (per-phase history under `runs/<run_id>/` and
-verification logs) rather than sharing in-process state is planned.
+```bash
+loop-supervisor tui [--project PATH]
+```
+
+`loop-supervisor tui` opens a read-only, disk-backed browser for persisted
+supervisor runs. `--project` selects an integration checkout; when omitted,
+the current directory is used. The browser lists discovered runs newest first.
+Select a run to inspect its current summary, chronological workflow timeline,
+record or escaped raw-JSON detail, and verification summaries. Verification
+logs are opened only on request, are bounded, and may contain unredacted
+sensitive output.
+
+The browser supports keyboard-only selection, manual refresh, back, and quit.
+It performs no writes, acquires no mutating lock, and does no automatic
+polling; refreshes occur only when requested. It is an explorer, not a control
+surface: use `run` or `resume` to start or continue supervisor work.
 
 ### Repository lock
 
@@ -522,5 +532,5 @@ instead:
   (abort request sent); no guarantee of immediate termination.
 - Automatic merge-conflict resolution is out of scope; operator repair is
   always required.
-- The interactive TUI is being rebuilt (see "TUI (being rebuilt)" above)
-  and is currently a no-op stub.
+- The TUI is a read-only run browser; it cannot start, resume, answer,
+  prune, or repair runs.

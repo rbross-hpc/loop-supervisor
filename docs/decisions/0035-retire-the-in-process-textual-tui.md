@@ -116,3 +116,12 @@ work" section, plus a short "Moot" note appended to each of items 16, 17,
   (what it polls or tails, how it presents `runs/<run_id>/NNNN-<phase>.json`
   history and verification logs, whether it still uses Textual) is future
   work and will need its own decision(s) once designed.
+
+## Supersession annotation (2026-09-05)
+
+Current status: `loop-supervisor tui` ships a read-only, disk-backed run browser.
+ADR 0036 supersedes this ADR's interim command status with the shipping design:
+the browser reads persisted supervisor artifacts, supports explicit manual
+refresh, and performs no writes, mutating lock acquisition, or automatic
+polling. The no-op/rebuild language above is retained as the historical record
+of the retired in-process implementation and temporary command behavior.

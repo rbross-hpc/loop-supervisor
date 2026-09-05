@@ -11,7 +11,8 @@ ADR 0034 made outcome-only phase history durable under
 `RunSession` and consumed in-process SSE events, leaving `tui` as a stub pending a
 disk-backed replacement. ADRs 0027 and 0028 locate verification output under the
 Git common directory, keyed by run and commit. ADR 0009 defines the repository lock
-and permits lock-free reads.
+and permits lock-free reads. This ADR is now implemented by the shipping
+`loop-supervisor tui` browser; the preceding stub status is historical context only.
 
 The replacement is an explorer of concurrently changing, supervisor-owned files.
 Those files can be absent, pruned, malformed, from an unsupported schema, or
