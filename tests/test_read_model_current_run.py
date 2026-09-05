@@ -40,6 +40,10 @@ def _save_state(
     planner_task_id: str = "task-42",
     pending_question: dict[str, object] | None = None,
     last_error: dict[str, object] | None = None,
+    builder_result: dict[str, object] | None = None,
+    auditor_result: dict[str, object] | None = None,
+    architect_result: dict[str, object] | None = None,
+    decision_request: dict[str, object] | None = None,
 ) -> Path:
     creating_worktree = phase == "creating_worktree"
     state = RunState(
@@ -70,15 +74,22 @@ def _save_state(
             "acceptance_criteria": ["Map current state"],
         },
         builder_result=(
-            {
-                "task_id": "task-42",
-                "objective": "Build the detail reader",
-                "status": "BLOCKED",
-                "implementation_summary": "Needs guidance.",
-            }
-            if pending_question is not None
-            else None
+            builder_result
+            if builder_result is not None
+            else (
+                {
+                    "task_id": "task-42",
+                    "objective": "Build the detail reader",
+                    "status": "BLOCKED",
+                    "implementation_summary": "Needs guidance.",
+                }
+                if pending_question is not None
+                else None
+            )
         ),
+        auditor_result=auditor_result,
+        architect_result=architect_result,
+        decision_request=decision_request,
         accepted_task_count=4,
         revision_count=3,
         replan_count=2,
@@ -118,6 +129,116 @@ def test_load_current_run_uses_planner_task_while_creating_worktree(tmp_path: Pa
 
     assert current.loadable is True, current.diagnostic
     assert current.current_task_id == "planned-task"
+
+
+def test_load_current_run_uses_auditor_revise_result_when_returned_to_building(
+    tmp_path: Path,
+) -> None:
+    _save_state(
+        tmp_path,
+        phase="building",
+        builder_result={
+            "task_id": "task-42",
+            "objective": "Build the detail reader",
+            "status": "COMPLETE",
+            "implementation_summary": "Superseded builder content.",
+            "commit": "abc123",
+        },
+        auditor_result={
+            "task_id": "task-42",
+            "objective": "Build the detail reader",
+            "disposition": "REVISE",
+            "findings": ["The result needs correction."],
+            "required_changes": ["Correct the result."],
+            "design_observations": [],
+            "decision_required": False,
+            "decision_question": None,
+            "decision_rationale": None,
+        },
+    )
+
+    current = load_current_run(tmp_path, "current")
+
+    assert current.loadable is True, current.diagnostic
+    assert current.result_detail is not None
+    assert "Auditor result" in current.result_detail
+    assert "Disposition: REVISE" in current.result_detail
+    assert "Correct the result." in current.result_detail
+    assert "Superseded builder content." not in current.result_detail
+
+
+def test_load_current_run_uses_new_planner_result_after_auditor_replan(tmp_path: Path) -> None:
+    _save_state(
+        tmp_path,
+        phase="building",
+        planner_task_id="replanned-task",
+        auditor_result={
+            "task_id": "prior-task",
+            "objective": "Prior task objective",
+            "disposition": "REPLAN",
+            "findings": ["The prior plan needs replacement."],
+            "required_changes": [],
+            "design_observations": [],
+            "decision_required": False,
+            "decision_question": None,
+            "decision_rationale": None,
+        },
+    )
+
+    current = load_current_run(tmp_path, "current")
+
+    assert current.loadable is True, current.diagnostic
+    assert current.current_task_id == "replanned-task"
+    assert current.result_detail is not None
+    assert "Planner result" in current.result_detail
+    assert "Task ID: replanned-task" in current.result_detail
+    assert "Prior task objective" not in current.result_detail
+
+
+def test_load_current_run_omits_retained_architect_result_for_new_auditor_replan(
+    tmp_path: Path,
+) -> None:
+    _save_state(
+        tmp_path,
+        phase="architecting",
+        planner_task_id="replanned-task",
+        auditor_result={
+            "task_id": "replanned-task",
+            "objective": "Replacement task",
+            "disposition": "REPLAN",
+            "findings": ["A design decision is required."],
+            "required_changes": [],
+            "design_observations": [],
+            "decision_required": True,
+            "decision_question": "How should the replacement work?",
+            "decision_rationale": "The prior approach cannot proceed.",
+        },
+        architect_result={
+            "status": "DECIDED",
+            "question": "How should the prior task work?",
+            "rationale": "A prior task needed a decision.",
+            "adr": {
+                "title": "Prior design",
+                "context": "Prior task context",
+                "decision": "Prior task decision",
+                "consequences": [],
+            },
+            "input_request": None,
+        },
+        decision_request={
+            "origin": "auditor",
+            "question": "How should the replacement work?",
+            "rationale": "The prior approach cannot proceed.",
+        },
+    )
+
+    current = load_current_run(tmp_path, "current")
+
+    assert current.loadable is True, current.diagnostic
+    assert current.result_detail is not None
+    assert "Auditor result" in current.result_detail
+    assert "Disposition: REPLAN" in current.result_detail
+    assert "Prior task decision" not in current.result_detail
 
 
 def test_load_current_run_maps_validated_state_into_immutable_summary(tmp_path: Path) -> None:

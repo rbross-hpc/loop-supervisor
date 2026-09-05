@@ -22,6 +22,12 @@ class RunBrowserApp(App[None]):
     _MAX_SUMMARY_RENDERED_BYTES = 256 * 1024
     _MAX_SUMMARY_RENDERED_LINES = 10_000
     _SUMMARY_TRUNCATION_MARKER = "Summary output truncated: rendered-output limit reached."
+    _MAX_RECORD_DETAIL_RENDERED_BYTES = 256 * 1024
+    _MAX_RECORD_DETAIL_RENDERED_LINES = 10_000
+    _RECORD_DETAIL_TRUNCATION_MARKER = (
+        "Record detail output truncated: rendered-output limit reached."
+    )
+    _RAW_JSON_TRUNCATION_MARKER = "Raw JSON output truncated: rendered-output limit reached."
 
     TITLE = "Loop Supervisor"
     SUB_TITLE = "Run browser"
@@ -40,14 +46,19 @@ class RunBrowserApp(App[None]):
         super().__init__()
         self._snapshot = snapshot
         self._selected_run_id: str | None = None
+        self._selected_record_index: int | None = None
+        self._raw_json_expanded = False
+        self._detail_records: tuple[CurrentRun | HistoryEntry, ...] = ()
         self._run_id_by_row_index = tuple(summary.run_id for summary in snapshot.runs)
 
     def compose(self) -> ComposeResult:
         yield Header()
         if self._selected_run_id is None:
             yield from self._compose_browser()
-        else:
+        elif self._selected_record_index is None:
             yield from self._compose_detail(self._selected_run_id)
+        else:
+            yield from self._compose_record_detail()
         yield Footer()
 
     def on_mount(self) -> None:
@@ -92,18 +103,144 @@ class RunBrowserApp(App[None]):
                 classes="run-detail-summary",
             )
             yield Static(self._render_history(history), markup=False, classes="run-detail-timeline")
+            self._detail_records = (current, *history.entries)
+            record_rows = (
+                ListItem(Static(self._record_label(record), markup=False))
+                for record in self._detail_records
+            )
+            yield ListView(*record_rows, id="record-list")
+
+    def _compose_record_detail(self) -> ComposeResult:
+        record = self._detail_records[self._selected_record_index or 0]
+        with VerticalScroll(id="record-detail"):
+            yield Static("Record detail — press b to return to the run detail.", markup=False)
+            yield Static(self._render_record_detail(record), markup=False, classes="record-detail")
+            if self._raw_json_expanded:
+                yield Static(
+                    self._render_raw_json(record),
+                    markup=False,
+                    classes="record-detail-raw-json",
+                )
+
+    @classmethod
+    def _render_raw_json(cls, record: CurrentRun | HistoryEntry) -> str:
+        """Render raw JSON and its required marker within the ADR display limits."""
+        raw_json = record.raw_json or "Raw JSON: unavailable."
+        if not record.raw_json_truncated:
+            return raw_json
+        marker = cls._RAW_JSON_TRUNCATION_MARKER
+        payload = cls._truncate_literal(
+            raw_json,
+            cls._MAX_RECORD_DETAIL_RENDERED_BYTES - len(marker.encode("utf-8")) - 1,
+            cls._MAX_RECORD_DETAIL_RENDERED_LINES - 1,
+        )
+        return f"{payload}\n{marker}"
+
+    @staticmethod
+    def _record_label(record: CurrentRun | HistoryEntry) -> str:
+        if isinstance(record, HistoryEntry):
+            return f"Sequence {record.seq}: {record.phase} (open detail)"
+        return "Current state (open detail)"
+
+    def _render_record_detail(self, record: CurrentRun | HistoryEntry) -> str:
+        result = record.result_detail or "unavailable (none recorded)."
+        error = record.error_detail or "unavailable (none recorded)."
+        raw_status = "expanded" if self._raw_json_expanded else "collapsed (press r to expand)"
+        if record.raw_json_truncated:
+            raw_status = f"{raw_status}; output truncated"
+        return self._bound_record_detail(
+            [f"Result: {result}", f"Error: {error}", f"Raw JSON: {raw_status}"]
+        )
+
+    @classmethod
+    def _bound_record_detail(cls, lines: list[str]) -> str:
+        """Bound content while retaining result, error, and raw-view guidance."""
+        result, error, raw_status = lines
+        rendered = "\n".join(lines)
+        if cls._within_record_detail_limits(rendered):
+            return rendered
+
+        marker = cls._RECORD_DETAIL_TRUNCATION_MARKER
+        result_availability = (
+            "Result: unavailable (none recorded)."
+            if result == "unavailable (none recorded)."
+            else "Result: available (detail truncated)."
+        )
+        error_availability = (
+            "Error: unavailable (none recorded)."
+            if error == "unavailable (none recorded)."
+            else "Error: available (detail may be truncated)."
+        )
+        required = (result_availability, error_availability, f"Raw JSON: {raw_status}", marker)
+        available_bytes = (
+            cls._MAX_RECORD_DETAIL_RENDERED_BYTES - len("\n".join(required).encode("utf-8")) - 1
+        )
+        error_detail = cls._truncate_literal(
+            error,
+            available_bytes,
+            cls._MAX_RECORD_DETAIL_RENDERED_LINES - len(required),
+        )
+        return "\n".join(
+            (
+                result_availability,
+                error_availability,
+                error_detail,
+                f"Raw JSON: {raw_status}",
+                marker,
+            )
+        )
+
+    @classmethod
+    def _truncate_literal(cls, text: str, max_bytes: int, max_lines: int) -> str:
+        """Return a Unicode-safe literal prefix within byte and rendered-line limits."""
+        selected: list[str] = []
+        used_bytes = 0
+        used_lines = 1
+        for character in text:
+            character_bytes = len(character.encode("utf-8"))
+            if used_bytes + character_bytes > max_bytes:
+                break
+            if character == "\n":
+                if used_lines == max_lines:
+                    break
+                used_lines += 1
+            selected.append(character)
+            used_bytes += character_bytes
+        return "".join(selected)
+
+    @classmethod
+    def _within_record_detail_limits(cls, rendered: str) -> bool:
+        """Return whether literal record detail fits the ADR display limits."""
+        return (
+            len(rendered.encode("utf-8")) <= cls._MAX_RECORD_DETAIL_RENDERED_BYTES
+            and len(rendered.splitlines()) <= cls._MAX_RECORD_DETAIL_RENDERED_LINES
+        )
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        """Open the selected run using the authoritative current-state reader."""
-        self._selected_run_id = self._run_id_by_row_index[event.index]
+        """Open a selected run or record using only typed read-model values."""
+        if event.list_view.id == "record-list":
+            self._selected_record_index = event.index
+            self._raw_json_expanded = False
+        else:
+            self._selected_run_id = self._run_id_by_row_index[event.index]
         self.call_after_refresh(self._show_selected_run)
 
     def _show_selected_run(self) -> None:
         """Replace the browser widgets after Textual has handled list selection."""
         self.refresh(recompose=True)
+        if self._selected_run_id is not None and self._selected_record_index is None:
+            self.call_after_refresh(self._focus_record_list)
+
+    def _focus_record_list(self) -> None:
+        """Keep the selected run's current and history records keyboard-accessible."""
+        self.query_one("#record-list", ListView).focus()
 
     def action_refresh(self) -> None:
         """Replace the displayed snapshot with a fresh disk scan by selected run ID."""
+        if self._selected_record_index is not None:
+            self._raw_json_expanded = not self._raw_json_expanded
+            self.refresh(recompose=True)
+            return
         selected_run_id = self._selected_run_id
         self._snapshot = build_snapshot(self._snapshot.project)
         self._run_id_by_row_index = tuple(summary.run_id for summary in self._snapshot.runs)
@@ -115,7 +252,12 @@ class RunBrowserApp(App[None]):
 
     async def action_back(self) -> None:
         """Return from a run detail to the immutable browser snapshot."""
-        if self._selected_run_id is not None:
+        if self._selected_record_index is not None:
+            self._selected_record_index = None
+            self._raw_json_expanded = False
+            self.refresh(recompose=True)
+            self.call_after_refresh(self._focus_record_list)
+        elif self._selected_run_id is not None:
             self._selected_run_id = None
             self.refresh(recompose=True)
             self.call_after_refresh(self._focus_run_list)

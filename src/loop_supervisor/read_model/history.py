@@ -26,6 +26,7 @@ from ..state import (
 )
 from ..supervisor import AdvanceStatus
 from .json_reader import BoundedJsonError, read_bounded_json
+from .record_detail import format_opinionated_content, serialize_raw_json
 
 _HISTORY_NAME_RE = re.compile(r"^(?P<seq>[0-9]{4,})-(?P<phase>[a-z_]+)\.json$")
 _MAX_SEQUENCE_DIGITS = 128
@@ -85,6 +86,10 @@ class HistoryEntry:
     original_task_id: str | None
     has_result: bool
     has_error: bool
+    result_detail: str | None
+    error_detail: str | None
+    raw_json: str
+    raw_json_truncated: bool
 
 
 @dataclass(frozen=True)
@@ -336,6 +341,7 @@ def _validate_record(raw: Any, run_id: str, filename_seq: int, filename_phase: s
         if not isinstance(error, dict):
             raise ValueError("error must be an object or null")
         OperationalErrorRecord.from_dict(error)
+    raw_json, raw_json_truncated = serialize_raw_json(raw)
     return HistoryEntry(
         seq=seq,
         phase=phase,
@@ -346,6 +352,10 @@ def _validate_record(raw: Any, run_id: str, filename_seq: int, filename_phase: s
         original_task_id=original_task_id,
         has_result=result is not None,
         has_error=error is not None,
+        result_detail=format_opinionated_content(result) if result is not None else None,
+        error_detail=format_opinionated_content(error) if error is not None else None,
+        raw_json=raw_json,
+        raw_json_truncated=raw_json_truncated,
     )
 
 

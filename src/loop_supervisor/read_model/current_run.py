@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..state import StateError, load_state
+from ..state import RunState, StateError, load_state
+from .record_detail import format_opinionated_content, serialize_raw_json
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,10 @@ class CurrentRun:
     pending_question: str | None
     latest_operational_error: str | None
     diagnostic: str | None
+    result_detail: str | None
+    error_detail: str | None
+    raw_json: str | None
+    raw_json_truncated: bool
 
     @classmethod
     def degraded(cls, run_id: str, diagnostic: str) -> CurrentRun:
@@ -52,6 +57,10 @@ class CurrentRun:
             pending_question=None,
             latest_operational_error=None,
             diagnostic=diagnostic,
+            result_detail=None,
+            error_detail=None,
+            raw_json=None,
+            raw_json_truncated=False,
         )
 
 
@@ -71,6 +80,8 @@ def load_current_run(git_common_dir: Path, run_id: str) -> CurrentRun:
     pending_message = pending_question["message"] if pending_question is not None else None
     last_error = state.last_error
     error_message = last_error["message"] if last_error is not None else None
+    result = _latest_result(state)
+    raw_json, raw_json_truncated = serialize_raw_json(state.to_dict())
     return CurrentRun(
         run_id=state.run_id,
         loadable=True,
@@ -87,7 +98,103 @@ def load_current_run(git_common_dir: Path, run_id: str) -> CurrentRun:
         pending_question=pending_message,
         latest_operational_error=error_message,
         diagnostic=None,
+        result_detail=format_opinionated_content(result) if result is not None else None,
+        error_detail=format_opinionated_content(last_error) if last_error is not None else None,
+        raw_json=raw_json,
+        raw_json_truncated=raw_json_truncated,
     )
+
+
+def _latest_result(state: RunState) -> dict[str, object] | None:
+    """Return the result relevant to the validated state's current lifecycle.
+
+    Role-result fields are retained across transitions for recovery and audit
+    purposes.  They therefore cannot be ranked globally: an auditor's REPLAN
+    result can remain while planning has produced the replacement task.  The
+    current phase identifies which validated result describes the active
+    lifecycle instead.
+    """
+    phase = _effective_phase(state)
+    if phase == "architecting":
+        architect = state.architect_result
+        decision = state.decision_request
+        if _architect_result_answers_active_request(architect, decision):
+            return architect
+        if isinstance(decision, dict) and decision.get("origin") == "auditor":
+            return state.auditor_result
+        return state.planner_result
+
+    field_names = {
+        "planning": ("planner_result",),
+        "creating_worktree": ("planner_result",),
+        "recording_decision": ("architect_result", "planner_result"),
+        # REVISE returns directly to building while retaining the preceding
+        # builder result. Its auditor verdict is therefore the latest result
+        # responsible for this lifecycle state, not the superseded build.
+        "building": (
+            ("auditor_result", "builder_result", "planner_result")
+            if _is_revise_result(state.auditor_result)
+            else ("builder_result", "planner_result")
+        ),
+        "verifying": ("builder_result", "planner_result"),
+        "auditing": (
+            "verification_result" if state.verification_result else "builder_result",
+            "builder_result",
+            "planner_result",
+        ),
+        "merging": ("auditor_result", "verification_result", "builder_result", "planner_result"),
+        "cleanup_worktree": ("auditor_result", "verification_result", "builder_result"),
+        "cleanup_branch": ("auditor_result", "verification_result", "builder_result"),
+        "done": ("planner_result",),
+    }.get(phase, ())
+    if phase == "awaiting_input":
+        pending_question = state.pending_question
+        kind = pending_question.get("kind") if isinstance(pending_question, dict) else None
+        field_names = (
+            ("builder_result", "planner_result")
+            if kind in {"builder_guidance", "builder_escalation"}
+            else ("architect_result", "planner_result")
+        )
+
+    current_task_id = _current_task_id(state.planner_result)
+    for field_name in field_names:
+        value = getattr(state, field_name)
+        if not isinstance(value, dict):
+            continue
+        task_id = value.get("task_id")
+        if isinstance(task_id, str) and task_id != current_task_id:
+            continue
+        return value
+    return None
+
+
+def _architect_result_answers_active_request(
+    architect_result: dict[str, object] | None, decision_request: dict[str, object] | None
+) -> bool:
+    """Whether the retained answer belongs to the architecting request in progress."""
+    return (
+        architect_result is not None
+        and decision_request is not None
+        and architect_result.get("question") == decision_request.get("question")
+    )
+
+
+def _is_revise_result(result: dict[str, object] | None) -> bool:
+    """Whether the retained auditor result caused a return to building."""
+    return result is not None and result.get("disposition") == "REVISE"
+
+
+def _effective_phase(state: RunState) -> str:
+    """Use a failure's validated retry target when it retains lifecycle context."""
+    if state.phase not in {"operational_failure", "failed"}:
+        return state.phase
+    if state.last_error is None:
+        return state.phase
+    retry_phase = state.last_error.get("retry_phase")
+    failed_phase = state.last_error.get("failed_phase")
+    if isinstance(retry_phase, str):
+        return retry_phase
+    return failed_phase if isinstance(failed_phase, str) else state.phase
 
 
 def _current_task_id(planner_result: dict[str, object] | None) -> str | None:
