@@ -40,6 +40,12 @@ on-disk run state starts from a clean slate rather than inheriting this
 backlog. Left in place, unedited, as the historical record of what was
 found against the removed implementation.
 
+**Current-status correction (2026-09-05):** Current status: `loop-supervisor tui` ships a read-only, disk-backed run browser. ADR 0036 defines the replacement,
+which supports newest-first run selection, summaries, workflow timelines,
+record/raw-JSON detail, verification summaries, opt-in bounded log viewing,
+manual refresh, back, and quit without writes, a mutating lock, or automatic
+polling. The preceding stub statement records the retired implementation only.
+
 ## Corrections to prior commit messages
 
 Commit messages in this project are treated as part of the durable
@@ -591,8 +597,13 @@ after the fact get written down.
     status.** `src/loop_supervisor/cli.py:234-250`. Deferred alongside
     item 16; see the note at the top of this file.
 
-    **Moot: `cmd_tui` is now a no-op stub that always returns 0** (see
-    the "Deferred: TUI work" note's update).
+     **Moot: `cmd_tui` is now a no-op stub that always returns 0** (see
+     the "Deferred: TUI work" note's update).
+
+     **Current-status correction (2026-09-05):** Current status: `loop-supervisor tui` ships a read-only, disk-backed run browser. This historical item concerns only the retired in-process implementation; see
+     ADR 0036 and the correction in "Deferred: TUI work" for the shipping
+     browser's scope.
+
 
 19. **Add parser event-size limits and reconnect/backoff acceptance
     coverage** for the SSE client.
