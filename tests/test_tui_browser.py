@@ -11,7 +11,9 @@ from typing import Any, cast
 import pytest
 from textual.widgets import Static
 
+import loop_supervisor.read_model.snapshot as snapshot_reader
 import loop_supervisor.read_model.verification as verification
+import loop_supervisor.tui.browser as browser
 from loop_supervisor.read_model import ProjectResolution, build_snapshot, load_current_run
 from loop_supervisor.read_model.history import (
     HistoryDiagnostic,
@@ -408,6 +410,50 @@ async def test_run_browser_opens_authoritative_detail_and_returns_to_browser(
 
         reopened_detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
         assert "Run ID: selected" in reopened_detail
+
+
+@pytest.mark.asyncio
+async def test_run_detail_navigation_uses_snapshot_metadata_until_explicit_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _persist_run(tmp_path, "selected", updated_at="2026-01-02T00:00:00+00:00")
+    counts = {"current": 0, "history": 0, "verification": 0}
+    original_current = snapshot_reader.load_current_run
+    original_history = snapshot_reader.load_history
+    original_verification = snapshot_reader.discover_verification
+
+    def count_current(git_common_dir: Path, run_id: str) -> object:
+        counts["current"] += 1
+        return original_current(git_common_dir, run_id)
+
+    def count_history(git_common_dir: Path, run_id: str) -> object:
+        counts["history"] += 1
+        return original_history(git_common_dir, run_id)
+
+    def count_verification(
+        git_common_dir: Path, run_id: str, verification_result: object
+    ) -> object:
+        counts["verification"] += 1
+        return original_verification(git_common_dir, run_id, verification_result)
+
+    monkeypatch.setattr(snapshot_reader, "load_current_run", count_current, raising=False)
+    monkeypatch.setattr(snapshot_reader, "load_history", count_history, raising=False)
+    monkeypatch.setattr(snapshot_reader, "discover_verification", count_verification, raising=False)
+    monkeypatch.setattr(browser, "load_current_run", count_current, raising=False)
+    monkeypatch.setattr(browser, "load_history", count_history, raising=False)
+    monkeypatch.setattr(browser.verification, "discover_verification", count_verification)
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    scan_counts = counts.copy()
+
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter", "enter", "b", "b", "enter")
+
+        assert counts == scan_counts
+
+        await pilot.press("r")
+
+        assert counts == {name: count + 1 for name, count in scan_counts.items()}
 
 
 @pytest.mark.asyncio

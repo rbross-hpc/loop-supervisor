@@ -12,6 +12,9 @@ from loop_supervisor.read_model import (
     ProjectSnapshot,
     build_snapshot,
 )
+from loop_supervisor.read_model.current_run import CurrentRun
+from loop_supervisor.read_model.history import HistoryLoad, HistoryStatus
+from loop_supervisor.read_model.verification import VerificationDiscovery
 from loop_supervisor.state import STATE_SCHEMA_VERSION, RunOptions, RunState, save_state
 
 
@@ -82,6 +85,26 @@ def test_build_snapshot_rereads_disk_without_reusing_prior_artifact_values(tmp_p
 
     assert first.runs == ()
     assert [run.run_id for run in second.runs] == ["new"]
+
+
+def test_build_snapshot_carries_per_run_detail_metadata_for_loadable_and_degraded_runs(
+    tmp_path: Path,
+) -> None:
+    _save_state(tmp_path, "loadable", updated_at="2026-01-02T00:00:00+00:00")
+    (tmp_path / "loop-supervisor" / "runs" / "degraded.json").write_text("not JSON")
+
+    snapshot = build_snapshot(_project(tmp_path))
+
+    metadata_by_run = {item.summary.run_id: item for item in snapshot.run_details}
+    assert isinstance(metadata_by_run["loadable"].current, CurrentRun)
+    assert metadata_by_run["loadable"].current.loadable is True
+    assert isinstance(metadata_by_run["loadable"].history, HistoryLoad)
+    assert metadata_by_run["loadable"].history.completeness is HistoryStatus.ABSENT
+    assert isinstance(metadata_by_run["loadable"].verification, VerificationDiscovery)
+    assert metadata_by_run["loadable"].verification.attempts == ()
+    assert metadata_by_run["degraded"].current.loadable is False
+    assert metadata_by_run["degraded"].history.completeness is HistoryStatus.ABSENT
+    assert metadata_by_run["degraded"].verification.attempts == ()
 
 
 def test_build_snapshot_preserves_degraded_rows_and_orders_loadable_runs_newest_first(

@@ -53,7 +53,8 @@ responsibilities are separated as follows:
 - lock observation returns a repository-level `LockObservation` and derived
   per-run activity labels without ever returning the ownership token; and
 - a snapshot coordinator returns one immutable `ProjectSnapshot` containing the
-  runs, diagnostics, and lock observation consumed by the presentation layer.
+  runs, per-run current-state, history, and verification-discovery metadata,
+  diagnostics, and lock observation consumed by the presentation layer.
 
 The package has no Textual, Rich, or `RunSession` dependency. The UI does not list,
 open, parse, or classify files itself. Existing validators may be promoted to public
