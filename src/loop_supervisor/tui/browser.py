@@ -116,10 +116,25 @@ class RunBrowserApp(App[None]):
             yield Static("Record detail — press b to return to the run detail.", markup=False)
             yield Static(self._render_record_detail(record), markup=False, classes="record-detail")
             if self._raw_json_expanded:
-                raw_json = record.raw_json or "Raw JSON: unavailable."
-                if record.raw_json_truncated:
-                    raw_json = f"{raw_json}\n{self._RAW_JSON_TRUNCATION_MARKER}"
-                yield Static(raw_json, markup=False, classes="record-detail-raw-json")
+                yield Static(
+                    self._render_raw_json(record),
+                    markup=False,
+                    classes="record-detail-raw-json",
+                )
+
+    @classmethod
+    def _render_raw_json(cls, record: CurrentRun | HistoryEntry) -> str:
+        """Render raw JSON and its required marker within the ADR display limits."""
+        raw_json = record.raw_json or "Raw JSON: unavailable."
+        if not record.raw_json_truncated:
+            return raw_json
+        marker = cls._RAW_JSON_TRUNCATION_MARKER
+        payload = cls._truncate_literal(
+            raw_json,
+            cls._MAX_RECORD_DETAIL_RENDERED_BYTES - len(marker.encode("utf-8")) - 1,
+            cls._MAX_RECORD_DETAIL_RENDERED_LINES - 1,
+        )
+        return f"{payload}\n{marker}"
 
     @staticmethod
     def _record_label(record: CurrentRun | HistoryEntry) -> str:
@@ -139,26 +154,67 @@ class RunBrowserApp(App[None]):
 
     @classmethod
     def _bound_record_detail(cls, lines: list[str]) -> str:
-        """Bound literal opinionated content before it reaches the presentation layer."""
+        """Bound content while retaining result, error, and raw-view guidance."""
+        result, error, raw_status = lines
         rendered = "\n".join(lines)
-        if (
-            len(rendered.encode("utf-8")) <= cls._MAX_RECORD_DETAIL_RENDERED_BYTES
-            and len(rendered.splitlines()) <= cls._MAX_RECORD_DETAIL_RENDERED_LINES
-        ):
+        if cls._within_record_detail_limits(rendered):
             return rendered
 
         marker = cls._RECORD_DETAIL_TRUNCATION_MARKER
-        available_bytes = cls._MAX_RECORD_DETAIL_RENDERED_BYTES - len(marker.encode("utf-8")) - 1
-        available_lines = cls._MAX_RECORD_DETAIL_RENDERED_LINES - 1
+        result_availability = (
+            "Result: unavailable (none recorded)."
+            if result == "unavailable (none recorded)."
+            else "Result: available (detail truncated)."
+        )
+        error_availability = (
+            "Error: unavailable (none recorded)."
+            if error == "unavailable (none recorded)."
+            else "Error: available (detail may be truncated)."
+        )
+        required = (result_availability, error_availability, f"Raw JSON: {raw_status}", marker)
+        available_bytes = (
+            cls._MAX_RECORD_DETAIL_RENDERED_BYTES - len("\n".join(required).encode("utf-8")) - 1
+        )
+        error_detail = cls._truncate_literal(
+            error,
+            available_bytes,
+            cls._MAX_RECORD_DETAIL_RENDERED_LINES - len(required),
+        )
+        return "\n".join(
+            (
+                result_availability,
+                error_availability,
+                error_detail,
+                f"Raw JSON: {raw_status}",
+                marker,
+            )
+        )
+
+    @classmethod
+    def _truncate_literal(cls, text: str, max_bytes: int, max_lines: int) -> str:
+        """Return a Unicode-safe literal prefix within byte and rendered-line limits."""
         selected: list[str] = []
         used_bytes = 0
-        for line in rendered.splitlines():
-            line_bytes = len(line.encode("utf-8")) + 1
-            if len(selected) == available_lines or used_bytes + line_bytes > available_bytes:
+        used_lines = 1
+        for character in text:
+            character_bytes = len(character.encode("utf-8"))
+            if used_bytes + character_bytes > max_bytes:
                 break
-            selected.append(line)
-            used_bytes += line_bytes
-        return "\n".join((*selected, marker))
+            if character == "\n":
+                if used_lines == max_lines:
+                    break
+                used_lines += 1
+            selected.append(character)
+            used_bytes += character_bytes
+        return "".join(selected)
+
+    @classmethod
+    def _within_record_detail_limits(cls, rendered: str) -> bool:
+        """Return whether literal record detail fits the ADR display limits."""
+        return (
+            len(rendered.encode("utf-8")) <= cls._MAX_RECORD_DETAIL_RENDERED_BYTES
+            and len(rendered.splitlines()) <= cls._MAX_RECORD_DETAIL_RENDERED_LINES
+        )
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Open a selected run or record using only typed read-model values."""

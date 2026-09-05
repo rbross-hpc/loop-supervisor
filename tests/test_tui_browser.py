@@ -397,6 +397,48 @@ async def test_run_detail_opens_escaped_record_detail_and_expandable_raw_json(
 
 
 @pytest.mark.asyncio
+async def test_expanded_raw_json_widget_including_marker_stays_within_render_limits(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "selected", updated_at="2026-01-04T00:00:00+00:00", phase="planning")
+    _persist_history(tmp_path, "selected", "0001-planning.json", seq=1)
+    record_path = tmp_path / "loop-supervisor" / "runs" / "selected" / "0001-planning.json"
+    record = json.loads(record_path.read_text())
+    record["result"]["objective"] = "x" * (300 * 1024)
+    record_path.write_text(json.dumps(record))
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter", "down", "enter", "r")
+
+        raw_json = cast(Any, app.screen.query_one(".record-detail-raw-json").render()).plain
+        assert len(raw_json.encode("utf-8")) <= 256 * 1024
+        assert len(raw_json.splitlines()) <= 10_000
+        assert "Raw JSON output truncated: rendered-output limit reached." in raw_json
+
+
+@pytest.mark.asyncio
+async def test_oversized_result_preserves_error_and_raw_json_affordance(tmp_path: Path) -> None:
+    _persist_run(tmp_path, "selected", updated_at="2026-01-04T00:00:00+00:00", phase="planning")
+    _persist_history(tmp_path, "selected", "0001-planning.json", seq=1, has_error=True)
+    record_path = tmp_path / "loop-supervisor" / "runs" / "selected" / "0001-planning.json"
+    record = json.loads(record_path.read_text())
+    record["result"]["objective"] = "x" * (300 * 1024)
+    record_path.write_text(json.dumps(record))
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter", "down", "enter")
+
+        detail = cast(Any, app.screen.query_one(".record-detail").render()).plain
+        assert "Operational error" in detail
+        assert "Message: recorded failure" in detail
+        assert "Raw JSON: collapsed (press r to expand); output truncated" in detail
+
+
+@pytest.mark.asyncio
 async def test_run_detail_renders_ordered_incomplete_history_timeline(tmp_path: Path) -> None:
     _persist_run(tmp_path, "selected", updated_at="2026-01-04T00:00:00+00:00")
     _persist_history(
