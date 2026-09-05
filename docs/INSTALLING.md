@@ -155,8 +155,24 @@ loop-supervisor run --project .
 ```
 
 for a full unattended run. See the main [README](../README.md) for the
-full run/resume model. (`loop-supervisor tui` exists but is currently a
-no-op stub while the interactive TUI is rebuilt.)
+full run/resume model.
+
+## Browse persisted runs
+
+```bash
+loop-supervisor tui [--project PATH]
+```
+
+This opens a read-only, disk-backed run browser. `--project` selects the
+integration checkout; when omitted, the current directory is used. Runs are
+listed newest first; select one to inspect its summary, workflow timeline,
+record or escaped raw-JSON detail, verification summaries, and an explicitly
+opened bounded verification log viewer. Use the keyboard to select, refresh
+manually, go back, or quit.
+
+The browser performs no writes, acquires no mutating lock, and does no
+automatic polling. It cannot start, resume, answer, prune, or repair runs;
+use `run` or `resume` for supervisor operations.
 
 ## Troubleshooting
 

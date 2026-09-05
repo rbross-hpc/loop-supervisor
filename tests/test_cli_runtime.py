@@ -1,7 +1,7 @@
 """Tests that cmd_run/cmd_resume normalize expected application
 failures into a single sanitized stderr line and exit code 1, and never
 let a traceback escape for failures the runtime is documented to raise.
-Also covers cmd_tui, which is currently a no-op stub (see ADR 0035)."""
+Also covers cmd_tui's read-only disk-backed browser launch path."""
 
 import argparse
 import json

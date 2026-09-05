@@ -80,8 +80,22 @@ detached `HEAD`) before a run starts.
 See the `loop-supervisor` package's own documentation for the full
 run/resume/lock/retry model — that behavior is unchanged from the tool
 this project depends on, not something this project redefines.
-(`loop-supervisor tui` exists but is currently a no-op stub while the
-interactive TUI is rebuilt.)
+
+### Browse persisted runs
+
+```bash
+loop-supervisor tui [--project PATH]
+```
+
+This read-only, disk-backed run browser lists persisted runs newest first.
+Select a run to inspect its summary, workflow timeline, record or escaped
+raw-JSON detail, verification summaries, and an explicitly opened bounded
+verification log viewer. Use the keyboard to select, refresh manually, go
+back, or quit. Omitting `--project` uses the current directory.
+
+The browser performs no writes, acquires no mutating lock, and does no
+automatic polling. It cannot start, resume, answer, prune, or repair runs;
+use `run` or `resume` for supervisor operations.
 
 ## Testing and quality checks
 
