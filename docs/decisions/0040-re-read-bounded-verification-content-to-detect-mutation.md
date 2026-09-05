@@ -10,18 +10,21 @@ ADR 0036 defines explicit verification-log opening as a bounded,
 descriptor-relative, no-follow read and describes mutation reporting as
 best-effort. The shipped post-read check compares the opened descriptor's
 inode, size, and modification time before and after its first bounded read,
-then reopens the authorized name to detect replacement by a different inode.
+then reopens the authorized name and compares only its numeric inode number
+(`st_ino`) with the opened descriptor.
 
-That check detects an inode-replacing rewrite that is present when the name
-is reopened, including a replacement with the same size and modification
-time. It also detects an in-place rewrite of the opened inode that changes
-its size or `mtime_ns` before the post-read descriptor observation. It does
-not detect a genuine same-size, same-`mtime_ns` in-place rewrite of the
-opened inode. A supported filesystem can provide timestamp behavior coarse
-enough to miss an ordinary concurrent rewrite in that shape, and a rewrite
-that restores the original modification timestamp is also missed. Nor does
-this finite observation detect a mutation that occurs only after the relevant
-final observation.
+That check detects a replacement whose reopened target has a changed
+`st_ino`, including one with the same size and modification time. It does
+not detect a replacement whose reopened target has the same numeric `st_ino`
+but a different device (`st_dev`), such as one reached after a directory or
+mount-namespace change. It also detects an in-place rewrite of the opened
+inode that changes its size or `mtime_ns` before the post-read descriptor
+observation. It does not detect a genuine same-size, same-`mtime_ns`
+in-place rewrite of the opened inode. A supported filesystem can provide
+timestamp behavior coarse enough to miss an ordinary concurrent rewrite in
+that shape, and a rewrite that restores the original modification timestamp
+is also missed. Nor does this finite observation detect a mutation that
+occurs only after the relevant final observation.
 
 The existing test changes the file size and therefore overstates the scope
 implied by its in-place-mutation name.

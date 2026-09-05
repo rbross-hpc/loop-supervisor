@@ -238,20 +238,21 @@ mypy/pytest gates, as all prior priorities.
     Skip the adjacent-record comparison whenever the two records are not
     truly sequence-adjacent (`following.seq != preceding.seq + 1`).
 23. ADR 0040 records the verification-log post-read mutation-check scope.
-    The shipped metadata and reopen-by-name check detects replacement by a
-    different inode and an in-place rewrite of the opened inode when its
-    size or `mtime_ns` changes between observations. It does **not** detect
-    a genuine same-size, same-`mtime_ns` in-place rewrite of that inode;
-    coarse filesystem timestamp behavior can produce that shape for an
-    ordinary concurrent rewrite, and a rewrite that restores the original
-    timestamp can deliberately produce it. The ADR declines to treat that
-    metadata-only scope as the finished contract while keeping this
-    documentation-and-test-correction slice separately mergeable. Its
-    follow-on implementation will use a stronger, explicit, bounded,
-    descriptor-relative content comparison and a genuine same-size,
+    The shipped metadata and reopen-by-name check detects a replacement only
+    when the reopened target's numeric inode number (`st_ino`) changed, and
+    detects an in-place rewrite of the opened inode when its size or
+    `mtime_ns` changes between observations. It does **not** detect a
+    replacement whose reopened target has the same `st_ino` but a different
+    device (`st_dev`), or a genuine same-size, same-`mtime_ns` in-place
+    rewrite of that inode; coarse filesystem timestamp behavior can produce
+    the latter shape for an ordinary concurrent rewrite, and a rewrite that
+    restores the original timestamp can deliberately produce it. The ADR
+    declines to treat that metadata-only scope as the finished contract while
+    keeping this documentation-and-test-correction slice separately
+    mergeable. Its follow-on implementation will use a stronger, explicit,
+    bounded, descriptor-relative content comparison and a genuine same-size,
     same-`mtime_ns` in-place-rewrite test. That future check remains an
-    observational warning and does not change current `RunState`'s
-    authority.
+    observational warning and does not change current `RunState`'s authority.
 24. Diagnostic-hygiene cleanup, each independently mergeable:
     - Apply the verification read model's existing bounded-name helper to
       every diagnostic site that includes an untrusted filename, not only
@@ -385,10 +386,11 @@ The objective is complete when:
   overriding current `RunState`, and a sequence gap does not also produce a
   spurious adjacent-record contradiction;
 - ADR 0040 records the verification-log mutation-detection scope: the
-  shipped check detects replacement and size- or `mtime_ns`-changing
-  in-place rewrites, but not same-size, same-`mtime_ns` in-place rewrites;
-  the stronger bounded content comparison remains a separately scheduled
-  follow-on;
+  shipped reopen check detects only a changed numeric inode number (`st_ino`),
+  while the descriptor check detects size- or `mtime_ns`-changing in-place
+  rewrites; it does not detect a same-`st_ino`, different-`st_dev`
+  replacement or a same-size, same-`mtime_ns` in-place rewrite; the stronger
+  bounded content comparison remains a separately scheduled follow-on;
 - the distribution version is bumped to `0.2.0` and observable at runtime
   via both `loop-supervisor --version` and `doctor`, sourced from package
   metadata rather than duplicated in source; the release tag itself is
