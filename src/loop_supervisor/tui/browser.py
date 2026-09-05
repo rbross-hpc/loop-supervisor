@@ -291,6 +291,18 @@ class RunBrowserApp(App[None]):
             return f"Sequence {record.seq}: {record.phase} (open detail)"
         return "Current state (open detail)"
 
+    @staticmethod
+    def _record_identity(record: CurrentRun | HistoryEntry) -> tuple[str, int | None]:
+        """Return the snapshot-stable identity for a selectable detail record."""
+        if isinstance(record, HistoryEntry):
+            return ("history", record.seq)
+        return ("current", None)
+
+    def _records_for_run(self, run_id: str) -> tuple[CurrentRun | HistoryEntry, ...]:
+        """Return the current record followed by its sequence-identified history."""
+        detail = self._snapshot.detail_for(run_id)
+        return (detail.current, *detail.history.entries)
+
     def _render_record_detail(self, record: CurrentRun | HistoryEntry) -> str:
         result = record.result_detail or "unavailable (none recorded)."
         error = record.error_detail or "unavailable (none recorded)."
@@ -389,6 +401,8 @@ class RunBrowserApp(App[None]):
             )
         else:
             self._selected_run_id = self._run_id_by_row_index[event.index]
+            self._selected_record_index = None
+            self._raw_json_expanded = False
             self._browser_highlighted_run_id = self._selected_run_id
         self.call_after_refresh(self._show_selected_run)
 
@@ -419,6 +433,11 @@ class RunBrowserApp(App[None]):
         self._selected_log_reference = None
         self._opened_log = None
         selected_run_id = self._selected_run_id
+        selected_record_identity = (
+            self._record_identity(self._detail_records[self._selected_record_index])
+            if self._selected_record_index is not None
+            else None
+        )
         browser_highlighted_run_id = self._browser_highlighted_run_id
         try:
             refreshed_snapshot = build_snapshot(self._snapshot.project)
@@ -436,6 +455,21 @@ class RunBrowserApp(App[None]):
             self._browser_highlighted_run_id = None
         if selected_run_id not in self._run_id_by_row_index:
             self._selected_run_id = None
+            self._selected_record_index = None
+            self._raw_json_expanded = False
+        elif selected_record_identity is not None:
+            refreshed_records = self._records_for_run(selected_run_id)
+            self._detail_records = refreshed_records
+            self._selected_record_index = next(
+                (
+                    index
+                    for index, record in enumerate(refreshed_records)
+                    if self._record_identity(record) == selected_record_identity
+                ),
+                None,
+            )
+            if self._selected_record_index is None:
+                self._raw_json_expanded = False
         self.refresh(recompose=True)
         if self._selected_run_id is None and self._snapshot.runs:
             self.call_after_refresh(self._focus_run_list)
