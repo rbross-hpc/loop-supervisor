@@ -414,7 +414,7 @@ class RunBrowserApp(App[None]):
 
     def action_refresh(self) -> None:
         """Replace the displayed snapshot with a fresh disk scan by selected run ID."""
-        if self._selected_run_id is None:
+        if self._selected_run_id is None and self._snapshot.runs:
             self._remember_browser_highlight()
         self._selected_log_reference = None
         self._opened_log = None
