@@ -6,6 +6,7 @@ from textual.app import App, ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Footer, Header, ListItem, ListView, Static
 
+from ..read_model import verification
 from ..read_model.current_run import CurrentRun, load_current_run
 from ..read_model.discovery import RunSummary
 from ..read_model.history import HistoryEntry, HistoryLoad, HistoryStatus, load_history
@@ -28,6 +29,11 @@ class RunBrowserApp(App[None]):
         "Record detail output truncated: rendered-output limit reached."
     )
     _RAW_JSON_TRUNCATION_MARKER = "Raw JSON output truncated: rendered-output limit reached."
+    _MAX_VERIFICATION_RENDERED_BYTES = 256 * 1024
+    _MAX_VERIFICATION_RENDERED_LINES = 10_000
+    _VERIFICATION_TRUNCATION_MARKER = (
+        "Verification output truncated: rendered-output limit reached."
+    )
 
     TITLE = "Loop Supervisor"
     SUB_TITLE = "Run browser"
@@ -103,6 +109,14 @@ class RunBrowserApp(App[None]):
                 classes="run-detail-summary",
             )
             yield Static(self._render_history(history), markup=False, classes="run-detail-timeline")
+            discovered_verification = verification.discover_verification(
+                self._snapshot.project.git_common_dir, run_id, current.verification_result
+            )
+            yield Static(
+                self._render_verification(discovered_verification),
+                markup=False,
+                classes="run-detail-verification",
+            )
             self._detail_records = (current, *history.entries)
             record_rows = (
                 ListItem(Static(self._record_label(record), markup=False))
@@ -135,6 +149,58 @@ class RunBrowserApp(App[None]):
             cls._MAX_RECORD_DETAIL_RENDERED_LINES - 1,
         )
         return f"{payload}\n{marker}"
+
+    @classmethod
+    def _render_verification(cls, discovery: verification.VerificationDiscovery) -> str:
+        """Render discovery metadata only; logs remain explicitly unopened."""
+        if not discovery.attempts:
+            lines = ["Verification: no verification evidence."]
+        else:
+            lines = ["Verification:"]
+            for attempt in discovery.attempts:
+                lines.extend(
+                    (
+                        f"Attempt {attempt.ordinal}",
+                        f"  Commit: {attempt.commit or 'unavailable'}",
+                        f"  Command: {attempt.command}",
+                        "  OK: "
+                        f"{attempt.ok}; Return code: {attempt.returncode}; "
+                        f"Timed out: {attempt.timed_out}; Duration: {attempt.duration}",
+                        f"  Summary: {attempt.summary}",
+                        "  Log: available (openable; not opened)"
+                        if attempt.log is not None
+                        else "  Log: unavailable (not openable)",
+                    )
+                )
+        if discovery.diagnostics:
+            lines.append("Verification diagnostics:")
+            lines.extend(f"  {item.artifact}: {item.reason}" for item in discovery.diagnostics)
+        return cls._bound_verification_lines(lines)
+
+    @classmethod
+    def _bound_verification_lines(cls, lines: list[str]) -> str:
+        """Bound literal verification output and retain an explicit marker."""
+        rendered = "\n".join(lines)
+        if (
+            len(rendered.encode("utf-8")) <= cls._MAX_VERIFICATION_RENDERED_BYTES
+            and len(rendered.splitlines()) <= cls._MAX_VERIFICATION_RENDERED_LINES
+        ):
+            return rendered
+
+        marker = cls._VERIFICATION_TRUNCATION_MARKER
+        available_bytes = cls._MAX_VERIFICATION_RENDERED_BYTES - len(marker.encode("utf-8")) - 1
+        payload = cls._truncate_literal(
+            rendered, available_bytes, cls._MAX_VERIFICATION_RENDERED_LINES - 1
+        )
+        separator = "" if cls._ends_with_line_separator(payload) else "\n"
+        return f"{payload}{separator}{marker}"
+
+    @staticmethod
+    def _ends_with_line_separator(text: str) -> bool:
+        """Return whether ``text`` already ends with a ``str.splitlines`` separator."""
+        return text.endswith(
+            ("\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
+        )
 
     @staticmethod
     def _record_label(record: CurrentRun | HistoryEntry) -> str:
@@ -192,20 +258,16 @@ class RunBrowserApp(App[None]):
 
     @classmethod
     def _truncate_literal(cls, text: str, max_bytes: int, max_lines: int) -> str:
-        """Return a Unicode-safe literal prefix within byte and rendered-line limits."""
+        """Return a Unicode-safe literal prefix within byte and ``splitlines`` limits."""
         selected: list[str] = []
         used_bytes = 0
-        used_lines = 1
-        for character in text:
-            character_bytes = len(character.encode("utf-8"))
-            if used_bytes + character_bytes > max_bytes:
-                break
-            if character == "\n":
-                if used_lines == max_lines:
-                    break
-                used_lines += 1
-            selected.append(character)
-            used_bytes += character_bytes
+        for line in text.splitlines(keepends=True)[:max_lines]:
+            for character in line:
+                character_bytes = len(character.encode("utf-8"))
+                if used_bytes + character_bytes > max_bytes:
+                    return "".join(selected)
+                selected.append(character)
+                used_bytes += character_bytes
         return "".join(selected)
 
     @classmethod
