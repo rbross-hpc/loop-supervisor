@@ -333,6 +333,8 @@ def _append_adjacent_contradiction_diagnostics(
 ) -> None:
     """Report contradictions between successive valid records without omitting either."""
     for preceding, following in zip(entries, entries[1:], strict=False):
+        if following.seq != preceding.seq + 1:
+            continue
         if preceding.phase_after != following.phase:
             diagnostics.append(
                 HistoryDiagnostic(

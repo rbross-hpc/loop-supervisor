@@ -271,6 +271,30 @@ def test_load_history_reports_sequence_gaps_without_filling_them(tmp_path):
     assert any("gap" in diagnostic.reason for diagnostic in loaded.diagnostics)
 
 
+def test_load_history_does_not_compare_records_across_sequence_gap(tmp_path):
+    first = _record("run-1", 1)
+    first_counters = first["counters"]
+    assert isinstance(first_counters, dict)
+    first_counters["revision_count"] = 2
+    following = _record("run-1", 3, "awaiting_input")
+    following["phase_after"] = "planning"
+    following["recorded_at"] = "2025-12-31T23:59:59+00:00"
+    following["result"] = None
+    following_counters = following["counters"]
+    assert isinstance(following_counters, dict)
+    following_counters["revision_count"] = 1
+    _write_history(tmp_path, "0001-planning.json", first)
+    _write_history(tmp_path, "0003-awaiting_input.json", following)
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert [entry.seq for entry in loaded.entries] == [1, 3]
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert [(diagnostic.seq, diagnostic.reason) for diagnostic in loaded.diagnostics] == [
+        (2, "sequence gap at 2")
+    ]
+
+
 def test_load_history_excludes_all_duplicate_sequence_records(tmp_path):
     _write_history(tmp_path, "0001-planning.json", _record("run-1", 1))
     _write_history(tmp_path, "0001-building.json", _record("run-1", 1, "building"))
