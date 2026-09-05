@@ -21,6 +21,8 @@ from loop_supervisor.locking import (
     _guard_path,
     _lock_path,
     _pid_is_alive,
+    _read_boot_id,
+    _read_process_start,
     classify_local_owner_identity,
 )
 
@@ -1021,6 +1023,108 @@ def test_bind_run_id_fails_closed_on_owner_identity_mismatch(tmp_path):
         assert json.loads(_lock_path(tmp_path).read_text())["run_id"] is None
     finally:
         lock.release()
+
+
+# -- kernel owner identity reads ------------------------------------------------
+
+
+def test_read_process_start_parses_parentheses_in_process_name(monkeypatch):
+    stat_text = "123 (name with ) parentheses) S " + " ".join(str(index) for index in range(1, 25))
+
+    monkeypatch.setattr(locking_mod.Path, "read_text", lambda path: stat_text)
+
+    assert _read_process_start(123) == "19"
+
+
+def test_read_process_start_normalizes_malformed_stat_content(monkeypatch):
+    monkeypatch.setattr(locking_mod.Path, "read_text", lambda path: "123 malformed")
+
+    with pytest.raises(LockError, match="cannot read process start ticks for PID 123"):
+        _read_process_start(123)
+
+
+def test_read_boot_id_rejects_empty_value(monkeypatch):
+    monkeypatch.setattr(locking_mod.Path, "read_text", lambda path: "  \n")
+
+    with pytest.raises(LockError, match="kernel boot ID: value is empty"):
+        _read_boot_id()
+
+
+def test_read_process_start_normalizes_unexpected_os_error(monkeypatch):
+    def _raise_permission_error(path: Path) -> str:
+        raise PermissionError("simulated procfs failure")
+
+    monkeypatch.setattr(locking_mod.Path, "read_text", _raise_permission_error)
+
+    with pytest.raises(LockError, match="cannot read process start ticks for PID 123") as caught:
+        _read_process_start(123)
+
+    assert isinstance(caught.value.__cause__, PermissionError)
+
+
+def test_read_process_start_normalizes_non_utf8_comm_field(monkeypatch):
+    def _raise_decode_error(path: Path) -> str:
+        raise UnicodeDecodeError("utf-8", b"\\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(locking_mod.Path, "read_text", _raise_decode_error)
+
+    with pytest.raises(LockError, match="cannot read process start ticks for PID 123") as caught:
+        _read_process_start(123)
+
+    assert isinstance(caught.value.__cause__, UnicodeDecodeError)
+
+
+def test_classify_local_owner_identity_stale_when_process_lookup_reports_absent(monkeypatch):
+    monkeypatch.setattr(locking_mod, "_read_boot_id", lambda: "boot-1")
+
+    def _raise_process_lookup_error(path: Path) -> str:
+        raise ProcessLookupError("simulated procfs disappearance")
+
+    monkeypatch.setattr(locking_mod.Path, "read_text", _raise_process_lookup_error)
+
+    status = classify_local_owner_identity(123, "boot-1", "start-1")
+
+    assert status is IdentityStatus.STALE
+
+
+def test_acquire_normalizes_non_utf8_process_start_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(locking_mod, "_read_boot_id", lambda: "boot-1")
+
+    def _raise_decode_error(path: Path) -> str:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(locking_mod.Path, "read_text", _raise_decode_error)
+
+    with pytest.raises(LockError, match="cannot read process start ticks") as caught:
+        _make_lock(tmp_path).acquire()
+
+    assert not isinstance(caught.value, UnicodeDecodeError)
+
+
+def test_stale_lock_recovery_normalizes_non_utf8_process_start_read(tmp_path, monkeypatch):
+    _write_lock_record_v2(
+        tmp_path,
+        pid=123,
+        hostname=socket.gethostname(),
+        token="unreadable-owner-token",
+        boot_id="boot-1",
+        process_start="start-1",
+    )
+    monkeypatch.setattr(locking_mod, "_read_boot_id", lambda: "boot-1")
+    stat_text = "999 (supervisor) S " + " ".join(str(index) for index in range(1, 25))
+
+    def _read_process_stat(path: Path) -> str:
+        if str(path) == "/proc/123/stat":
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        return stat_text
+
+    monkeypatch.setattr(locking_mod.Path, "read_text", _read_process_stat)
+
+    with pytest.raises(LockError, match="identity could not be verified") as caught:
+        _make_lock(tmp_path, recover_stale=True).acquire()
+
+    assert not isinstance(caught.value, UnicodeDecodeError)
+    assert json.loads(_lock_path(tmp_path).read_bytes())["token"] == "unreadable-owner-token"
 
 
 # -- classify_local_owner_identity (ADR 0037 identity-chain test) -------------
