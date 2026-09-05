@@ -8,6 +8,7 @@ from textual.widgets import Footer, Header, ListItem, ListView, Static
 
 from ..read_model.current_run import CurrentRun, load_current_run
 from ..read_model.discovery import RunSummary
+from ..read_model.history import HistoryLoad, HistoryStatus, load_history
 from ..read_model.snapshot import ProjectSnapshot
 
 
@@ -70,11 +71,13 @@ class RunBrowserApp(App[None]):
 
     def _compose_detail(self, run_id: str) -> ComposeResult:
         current = load_current_run(self._snapshot.project.git_common_dir, run_id)
+        history = load_history(self._snapshot.project.git_common_dir, run_id)
         with VerticalScroll(id="run-detail"):
             yield Static("Run detail — press b to return to the browser.", markup=False)
             yield Static(
                 self._render_current_run(current), markup=False, classes="run-detail-summary"
             )
+            yield Static(self._render_history(history), markup=False, classes="run-detail-timeline")
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Open the selected run using the authoritative current-state reader."""
@@ -105,6 +108,40 @@ class RunBrowserApp(App[None]):
             f"{summary.run_id} — {summary.phase or 'unknown'} — "
             f"updated {summary.updated_at or 'unavailable'}"
         )
+
+    @staticmethod
+    def _render_history(history: HistoryLoad) -> str:
+        """Render best-effort workflow evidence without inferring missing transitions."""
+        if history.completeness is HistoryStatus.ABSENT:
+            return "Workflow timeline: unavailable (no recorded history)."
+
+        lines = [f"Workflow timeline: {history.completeness.value}"]
+        for entry in history.entries:
+            counters = entry.counters
+            lines.extend(
+                (
+                    f"Sequence {entry.seq}",
+                    f"  Phase: {entry.phase} → {entry.phase_after}",
+                    f"  Outcome: {entry.status.value}",
+                    f"  Recorded: {entry.recorded_at}",
+                    "  Counters: "
+                    f"accepted tasks={counters['accepted_task_count']}, "
+                    f"revisions={counters['revision_count']}, "
+                    f"replans={counters['replan_count']}, "
+                    f"architect retries={counters['architect_retry_count']}, "
+                    f"builder guidance={counters['builder_guidance_count']}",
+                    "  Result: "
+                    f"{'available' if entry.has_result else 'unavailable'}; "
+                    f"Error: {'available' if entry.has_error else 'unavailable'}",
+                )
+            )
+        if history.diagnostics:
+            lines.append("Timeline diagnostics:")
+            lines.extend(
+                f"  {diagnostic.artifact}: {diagnostic.reason}"
+                for diagnostic in history.diagnostics
+            )
+        return "\n".join(lines)
 
     @staticmethod
     def _render_current_run(current: CurrentRun) -> str:
