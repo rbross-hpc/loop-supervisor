@@ -867,6 +867,29 @@ def test_cmd_tui_contains_replaced_state_directory_before_starting_app(
     assert "Traceback" not in captured.err
 
 
+def test_cmd_tui_contains_enumeration_oserror_before_starting_app(tmp_path, monkeypatch, capsys):
+    """A mid-enumeration filesystem failure is sanitized before Textual starts."""
+    raw_error = "permission changed at /sensitive/project/.git/loop-supervisor/runs"
+
+    def fail_scan(*args, **kwargs):
+        raise OSError(raw_error)
+
+    def fake_app(*args, **kwargs):
+        raise AssertionError("the app must not start when project scanning fails")
+
+    monkeypatch.setattr(cli_mod, "scan_project", fail_scan)
+    monkeypatch.setattr(cli_mod, "RunBrowserApp", fake_app)
+
+    rc = cli_mod.cmd_tui(argparse.Namespace(project=str(tmp_path)))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: cannot scan supervisor run state for this project\n"
+    assert raw_error not in captured.err
+    assert "Traceback" not in captured.err
+
+
 # -- SIGTERM-to-KeyboardInterrupt bridge (backlog item 22a / ADR 0015) --
 #
 # These are in-process unit tests of the bridge's own hygiene (handler
