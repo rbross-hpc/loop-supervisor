@@ -56,9 +56,15 @@ print('task:', d['original_task_id'])
   signal that a builder invocation is actively writing files, not
   hung.
 - The supervisor process itself still existing (`ps aux | grep
-  loop-supervisor`) is the actual ground truth: if it's gone and the
+  loop-supervisor`) is the strongest local signal: if it's gone and the
   run state's `phase` is not `done`/`failed`, the process died
-  mid-phase — see `recovering-an-interrupted-run.md`.
+  mid-phase — see `recovering-an-interrupted-run.md`. Bare PID existence
+  is not proof by itself, though: after a crash and reboot (or simply
+  enough process churn), the recorded PID number can be reused by an
+  unrelated process. `<git-common-dir>/loop-supervisor/supervisor.lock`
+  additionally records `owner_boot_id` and `owner_process_start`
+  (schema version 2) precisely so that case can be told apart from a
+  still-live supervisor — see ADR 0037 for the exact comparison.
 - Do not `git status`/edit inside the task worktree while a run is
   actively using it "just to look" — if the builder is mid-edit, you
   will observe (and could misinterpret) genuinely transient

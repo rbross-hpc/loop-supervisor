@@ -480,3 +480,12 @@ than re-executing blindly.
   retry may issue more `server.stop()` attempts than it did before this
   ADR's original TUI text was written; total attempts across a stuck
   shutdown sequence rose accordingly.
+
+## Field-set correction (2026-09-05)
+
+ADR 0037 introduces lock schema version 2, which adds `owner_boot_id` and
+`owner_process_start` alongside the fields listed in this ADR's "Repository
+execution lock" section. That section's field list describes schema version 1
+only and is retained as historical record of the original design; see ADR 0037
+for the current field set, its PID-reuse-resistant stale-lock recovery
+behavior, and the deferred read-model/TUI work that still consumes it.

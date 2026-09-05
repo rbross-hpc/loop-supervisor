@@ -30,6 +30,7 @@ import stat
 import time
 import uuid
 from collections.abc import Iterator
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -73,23 +74,116 @@ _LOCK_RECORD_FIELDS = _LEGACY_LOCK_RECORD_FIELDS | frozenset(
 )
 
 
+def _read_boot_id() -> str:
+    """Read Linux's stable per-boot identifier as an opaque string.
+
+    Raises ``LockError`` (never a bare ``OSError``) so every caller
+    (acquisition and stale-owner identity classification alike) can rely
+    on one exception type for "cannot read local kernel identity".
+    """
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError as exc:
+        raise LockError(f"cannot read kernel boot ID: {exc}") from exc
+    if not boot_id:
+        raise LockError("cannot read kernel boot ID: value is empty")
+    return boot_id
+
+
+def _read_process_start(pid: int) -> str:
+    """Read ``pid``'s process-start ticks from ``/proc/<pid>/stat``.
+
+    Deliberately opaque: compared exactly, never converted to a wall-clock
+    timestamp. Raises ``FileNotFoundError`` verbatim when ``pid`` does not
+    currently exist -- callers distinguish "no such process" (stale
+    evidence, including PID reuse of the *recorded* PID once it exits) from
+    "process exists but its identity could not be read" (unverifiable,
+    never treated as proof of either liveness or staleness). Any other
+    read failure raises ``LockError``.
+    """
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise LockError(f"cannot read process start ticks for PID {pid}: {exc}") from exc
+    _, separator, remainder = stat_text.rpartition(")")
+    fields = remainder.split()
+    try:
+        process_start = fields[19]
+    except IndexError as exc:
+        raise LockError(f"cannot read process start ticks for PID {pid}: {exc}") from exc
+    if not separator or not process_start:
+        raise LockError(f"cannot read process start ticks for PID {pid}")
+    return process_start
+
+
 def _read_kernel_owner_identity(pid: int) -> tuple[str, str]:
     """Read Linux's stable boot and process-start identifiers for ``pid``.
 
     Values are deliberately opaque strings: callers compare them exactly and
-    never turn the process-start ticks into a wall-clock timestamp.
+    never turn the process-start ticks into a wall-clock timestamp. Used
+    only by ``acquire()`` for the acquiring process's own identity, where
+    ``pid`` is always ``os.getpid()`` and therefore always exists.
+    """
+    boot_id = _read_boot_id()
+    try:
+        process_start = _read_process_start(pid)
+    except FileNotFoundError as exc:
+        raise LockError(f"cannot read kernel owner identity for PID {pid}: {exc}") from exc
+    return boot_id, process_start
+
+
+class IdentityStatus(StrEnum):
+    """The result of comparing a schema-2 lock's immutable owner identity
+    against the current local kernel state.
+
+    Only meaningful once a lock record's hostname has already been
+    confirmed local; boot ID and process-start ticks are host-local
+    identifiers with no cross-host meaning.
+    """
+
+    MATCHING = "matching"
+    """The named PID exists and both boot ID and process-start ticks
+    exactly match the recorded owner identity: the same process that
+    wrote this record is still running."""
+
+    STALE = "stale"
+    """A boot mismatch, absent PID, or process-start mismatch (including
+    PID reuse): the recorded owner cannot still be running."""
+
+    UNVERIFIABLE = "unverifiable"
+    """Local kernel identity could not be read or compared. Never treated
+    as proof of either liveness or staleness."""
+
+
+def classify_local_owner_identity(
+    pid: int, owner_boot_id: str, owner_process_start: str
+) -> IdentityStatus:
+    """Classify a schema-2 lock's recorded owner identity against the
+    current local kernel state, per ADR 0037's identity-chain test.
+
+    Compares boot ID and process-start ticks as opaque exact values, never
+    wall-clock time or recency. Shared by both the writer's stale-lock
+    recovery decision and the read-only lock observer's activity
+    classification, so "is this owner demonstrably gone" can never drift
+    between the two.
     """
     try:
-        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        stat_text = Path(f"/proc/{pid}/stat").read_text()
-        _, separator, remainder = stat_text.rpartition(")")
-        fields = remainder.split()
-        process_start = fields[19]
-    except (IndexError, OSError) as exc:
-        raise LockError(f"cannot read kernel owner identity for PID {pid}: {exc}") from exc
-    if not separator or not boot_id or not process_start:
-        raise LockError(f"cannot read kernel owner identity for PID {pid}")
-    return boot_id, process_start
+        current_boot_id = _read_boot_id()
+    except LockError:
+        return IdentityStatus.UNVERIFIABLE
+    if current_boot_id != owner_boot_id:
+        return IdentityStatus.STALE
+    try:
+        current_process_start = _read_process_start(pid)
+    except FileNotFoundError:
+        return IdentityStatus.STALE
+    except LockError:
+        return IdentityStatus.UNVERIFIABLE
+    if current_process_start != owner_process_start:
+        return IdentityStatus.STALE
+    return IdentityStatus.MATCHING
 
 
 # Matches time.strftime("%Y-%m-%dT%H:%M:%SZ", ...): a fixed-width UTC
@@ -243,6 +337,14 @@ def _validate_lock_record(data: Any) -> dict[str, Any]:
         raise MalformedLockError("lock record must be a JSON object")
 
     schema_version = data.get("schema_version")
+    # Strict integer identity, not equality: bool is an int subclass and
+    # float(1.0) == 1, so plain `==` would accept `schema_version: true` or
+    # `schema_version: 2.0` as a valid version. A written or read lock
+    # record must always carry a real integer schema version.
+    if type(schema_version) is not int:
+        raise MalformedLockError(
+            f"lock record field 'schema_version' must be an integer, got {schema_version!r}"
+        )
     if schema_version == 1:
         expected_fields = _LEGACY_LOCK_RECORD_FIELDS
     elif schema_version == _SCHEMA_VERSION:
@@ -591,7 +693,15 @@ class SupervisorLock:
         if not isinstance(holder_pid, int) or isinstance(holder_pid, bool):
             return MalformedLockError(f"lock at {self._path} has invalid pid {holder_pid!r}")
 
-        if _pid_is_alive(holder_pid):
+        is_stale = self._is_holder_stale(data, holder_pid)
+        if is_stale is None:
+            return LockError(
+                f"lock names local process {holder_pid} "
+                f"(started {started_at}, operation={operation!r}), but its identity "
+                "could not be verified against the current kernel state; refusing to "
+                "guess whether it is alive or stale"
+            )
+        if not is_stale:
             return LockError(
                 f"lock is held by local process {holder_pid} "
                 f"(started {started_at}, operation={operation!r}); "
@@ -618,6 +728,30 @@ class SupervisorLock:
             pass
 
         return None
+
+    @staticmethod
+    def _is_holder_stale(data: dict[str, Any], holder_pid: int) -> bool | None:
+        """Decide whether ``data``'s recorded owner is demonstrably dead.
+
+        Returns True (stale), False (still alive), or None (unverifiable
+        -- never treated as proof of either). Schema-1 records retain the
+        original PID-only liveness check for backward compatibility, since
+        they carry no immutable owner identity to compare. Schema-2
+        records use the full identity chain (ADR 0037): a live PID whose
+        boot ID or process-start ticks no longer match the recorded owner
+        (including PID reuse) is stale, not live, even though
+        ``os.kill(pid, 0)`` would otherwise succeed.
+        """
+        if data.get("schema_version") != _SCHEMA_VERSION:
+            return not _pid_is_alive(holder_pid)
+
+        owner_boot_id = data.get("owner_boot_id")
+        owner_process_start = data.get("owner_process_start")
+        assert isinstance(owner_boot_id, str) and isinstance(owner_process_start, str)
+        status = classify_local_owner_identity(holder_pid, owner_boot_id, owner_process_start)
+        if status is IdentityStatus.UNVERIFIABLE:
+            return None
+        return status is IdentityStatus.STALE
 
     def release(self) -> None:
         """Release the lock. No-op if the lock was never acquired.

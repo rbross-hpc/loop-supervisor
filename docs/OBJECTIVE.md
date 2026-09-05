@@ -66,9 +66,10 @@ Activity labels must be evidence-based:
   unknown run association.
 
 The first release may expose only the distinctions supported safely by
-current lock data. A later priority is to investigate durable active-run
-identity or a heartbeat so fresh runs and PID reuse can be classified more
-reliably (see "Ordered priorities" item 7). That work must not be
+current lock data. Durable active-run identity has since been decided (ADR
+0037) and its writer-side schema and stale-lock recovery are shipped so PID
+reuse cannot be recovered as a live owner; classifying reads against that
+identity remains open (see "Ordered priorities" item 8). That work must not be
 approximated by recency heuristics.
 
 Selecting a run opens a run-detail screen containing:
@@ -137,10 +138,18 @@ fabricate elapsed-time or stall information.
    documentation to describe the shipped read-only browser. Read-model and
    Textual fixtures provide repository-verifiable coverage; exercising a bounded
    real supervisor run remains optional validation, not an open delivery item.
-7. **Current priority.** Investigate reliable active-run attribution or heartbeat
-   persistence (e.g. a PID/liveness field in the lock record) as a separate
-   design task. Do not alter the shipped explorer by pretending current lock data
-   can answer more than it can.
+7. **Delivered (design and writer).** ADR 0037 decides PID-reuse-resistant lock
+   ownership. Lock schema version 2 (`owner_boot_id`, `owner_process_start`) and
+   the writer-side identity chain are shipped: acquisition fails closed if it
+   cannot read local kernel identity, and schema-2 stale-lock recovery correctly
+   treats a live PID with mismatched boot/start identity (PID reuse) as stale,
+   not as a live owner.
+8. **Current priority.** Update the read model's `observe_lock` and the TUI to
+   consume the schema-2 identity chain: `running` must require the complete
+   match (hostname, boot ID, PID, process-start ticks, integration path, and an
+   associated loadable `RunState`), per ADR 0037. Schema-1 locks must never
+   satisfy `running`. Do not alter the shipped explorer's classification by
+   pretending current lock data can answer more than it can until this lands.
 
 ## Completion criteria
 

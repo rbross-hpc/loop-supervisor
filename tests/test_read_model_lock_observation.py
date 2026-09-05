@@ -55,6 +55,18 @@ def _write_lock(tmp_path: Path, record: dict[str, object]) -> Path:
     return path
 
 
+@pytest.mark.parametrize("bad_schema_version", [True, False, 2.0, 1.0, "2", None, [2]])
+def test_observe_lock_rejects_non_integer_schema_version(tmp_path, bad_schema_version):
+    """Mirrors the writer's strict integer check in locking.py: bool is an
+    int subclass and float(1.0) == 1, so plain equality would wrongly
+    accept a boolean or float schema_version."""
+    _write_lock(tmp_path, _lock_record(tmp_path) | {"schema_version": bad_schema_version})
+
+    observation = observe_lock(tmp_path, tmp_path, (_summary(),))
+
+    assert observation.activity is LockActivity.MALFORMED
+
+
 @pytest.mark.parametrize(
     ("prepare", "expected"),
     [
