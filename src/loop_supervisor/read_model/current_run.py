@@ -115,10 +115,18 @@ def _latest_result(state: RunState) -> dict[str, object] | None:
     lifecycle instead.
     """
     phase = _effective_phase(state)
+    if phase == "architecting":
+        architect = state.architect_result
+        decision = state.decision_request
+        if _architect_result_answers_active_request(architect, decision):
+            return architect
+        if isinstance(decision, dict) and decision.get("origin") == "auditor":
+            return state.auditor_result
+        return state.planner_result
+
     field_names = {
         "planning": ("planner_result",),
         "creating_worktree": ("planner_result",),
-        "architecting": ("architect_result", "planner_result"),
         "recording_decision": ("architect_result", "planner_result"),
         # REVISE returns directly to building while retaining the preceding
         # builder result. Its auditor verdict is therefore the latest result
@@ -158,6 +166,17 @@ def _latest_result(state: RunState) -> dict[str, object] | None:
             continue
         return value
     return None
+
+
+def _architect_result_answers_active_request(
+    architect_result: dict[str, object] | None, decision_request: dict[str, object] | None
+) -> bool:
+    """Whether the retained answer belongs to the architecting request in progress."""
+    return (
+        architect_result is not None
+        and decision_request is not None
+        and architect_result.get("question") == decision_request.get("question")
+    )
 
 
 def _is_revise_result(result: dict[str, object] | None) -> bool:

@@ -91,9 +91,15 @@ def test_load_history_retains_validated_detail_and_round_trippable_raw_json(tmp_
     entry = load_history(tmp_path, "run-1").entries[0]
 
     assert entry.result_detail is not None
-    assert "[bold]literal objective[/bold]" in entry.result_detail
+    assert "Planner result" in entry.result_detail
+    assert "Status: COMPLETE" in entry.result_detail
+    assert "Objective: [bold]literal objective[/bold]" in entry.result_detail
+    assert '"objective":' not in entry.result_detail
     assert entry.error_detail is not None
-    assert "[red]literal error[/red]" in entry.error_detail
+    assert "Operational error" in entry.error_detail
+    assert "Kind: operational" in entry.error_detail
+    assert "Message: [red]literal error[/red]" in entry.error_detail
+    assert '"message":' not in entry.error_detail
     assert entry.raw_json_truncated is False
     assert json.loads(entry.raw_json) == record
 

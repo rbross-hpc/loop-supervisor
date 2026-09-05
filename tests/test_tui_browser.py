@@ -359,7 +359,9 @@ async def test_run_detail_opens_escaped_record_detail_and_expandable_raw_json(
         await pilot.press("enter")
 
         current_detail = cast(Any, app.screen.query_one(".record-detail").render()).plain
-        assert "[bold]current result[/bold]" in current_detail
+        assert "Planner result" in current_detail
+        assert "Objective: [bold]current result[/bold]" in current_detail
+        assert '"objective":' not in current_detail
         assert "Error: unavailable (none recorded)." in current_detail
         assert "Raw JSON: collapsed (press r to expand)" in current_detail
 
@@ -372,8 +374,12 @@ async def test_run_detail_opens_escaped_record_detail_and_expandable_raw_json(
         await pilot.press("b", "down", "enter")
 
         detail = cast(Any, app.screen.query_one(".record-detail").render()).plain
-        assert "[bold]literal result[/bold]" in detail
-        assert "[red]literal error[/red]" in detail
+        assert "Planner result" in detail
+        assert "Objective: [bold]literal result[/bold]" in detail
+        assert '"objective":' not in detail
+        assert "Operational error" in detail
+        assert "Message: [red]literal error[/red]" in detail
+        assert '"message":' not in detail
         assert "Raw JSON: collapsed (press r to expand)" in detail
 
         await pilot.press("r")
