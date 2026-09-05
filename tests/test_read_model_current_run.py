@@ -40,6 +40,7 @@ def _save_state(
     planner_task_id: str = "task-42",
     pending_question: dict[str, object] | None = None,
     last_error: dict[str, object] | None = None,
+    auditor_result: dict[str, object] | None = None,
 ) -> Path:
     creating_worktree = phase == "creating_worktree"
     state = RunState(
@@ -79,6 +80,7 @@ def _save_state(
             if pending_question is not None
             else None
         ),
+        auditor_result=auditor_result,
         accepted_task_count=4,
         revision_count=3,
         replan_count=2,
@@ -118,6 +120,33 @@ def test_load_current_run_uses_planner_task_while_creating_worktree(tmp_path: Pa
 
     assert current.loadable is True, current.diagnostic
     assert current.current_task_id == "planned-task"
+
+
+def test_load_current_run_uses_new_planner_result_after_auditor_replan(tmp_path: Path) -> None:
+    _save_state(
+        tmp_path,
+        phase="building",
+        planner_task_id="replanned-task",
+        auditor_result={
+            "task_id": "prior-task",
+            "objective": "Prior task objective",
+            "disposition": "REPLAN",
+            "findings": ["The prior plan needs replacement."],
+            "required_changes": [],
+            "design_observations": [],
+            "decision_required": False,
+            "decision_question": None,
+            "decision_rationale": None,
+        },
+    )
+
+    current = load_current_run(tmp_path, "current")
+
+    assert current.loadable is True, current.diagnostic
+    assert current.current_task_id == "replanned-task"
+    assert current.result_detail is not None
+    assert '"task_id": "replanned-task"' in current.result_detail
+    assert "Prior task objective" not in current.result_detail
 
 
 def test_load_current_run_maps_validated_state_into_immutable_summary(tmp_path: Path) -> None:

@@ -10,14 +10,14 @@ from typing import Any, cast
 
 import pytest
 
-from loop_supervisor.read_model import ProjectResolution, build_snapshot
+from loop_supervisor.read_model import ProjectResolution, build_snapshot, load_current_run
 from loop_supervisor.read_model.history import (
     HistoryDiagnostic,
     HistoryEntry,
     HistoryLoad,
     HistoryStatus,
 )
-from loop_supervisor.state import STATE_SCHEMA_VERSION, RunOptions, RunState, save_state
+from loop_supervisor.state import STATE_SCHEMA_VERSION, RunOptions, RunState, load_state, save_state
 from loop_supervisor.supervisor import AdvanceStatus
 from loop_supervisor.tui import RunBrowserApp
 
@@ -42,7 +42,9 @@ def _options() -> RunOptions:
     )
 
 
-def _persist_run(git_common_dir: Path, run_id: str, *, updated_at: str) -> None:
+def _persist_run(
+    git_common_dir: Path, run_id: str, *, updated_at: str, phase: str = "done"
+) -> None:
     save_state(
         git_common_dir,
         RunState(
@@ -55,7 +57,7 @@ def _persist_run(git_common_dir: Path, run_id: str, *, updated_at: str) -> None:
             options=_options(),
             integration_expected_head="abc123",
             integration_status_snapshot="",
-            phase="done",
+            phase=phase,
             created_at="2026-01-01T00:00:00+00:00",
             updated_at=updated_at,
         ),
@@ -318,7 +320,7 @@ async def test_run_browser_opens_run_id_with_period(
 async def test_run_detail_opens_escaped_record_detail_and_expandable_raw_json(
     tmp_path: Path,
 ) -> None:
-    _persist_run(tmp_path, "selected", updated_at="2026-01-04T00:00:00+00:00")
+    _persist_run(tmp_path, "selected", updated_at="2026-01-04T00:00:00+00:00", phase="planning")
     _persist_history(tmp_path, "selected", "0001-planning.json", seq=1, has_error=True)
     _persist_history(tmp_path, "selected", "0002-planning.json", seq=2, has_result=False)
     record_path = tmp_path / "loop-supervisor" / "runs" / "selected" / "0001-planning.json"
@@ -326,11 +328,48 @@ async def test_run_detail_opens_escaped_record_detail_and_expandable_raw_json(
     record["result"]["objective"] = "[bold]literal result[/bold]"
     record["error"]["message"] = "[red]literal error[/red]"
     record_path.write_text(json.dumps(record))
+    state_path = tmp_path / "loop-supervisor" / "runs" / "selected.json"
+    state = json.loads(state_path.read_text())
+    state["planner_result"] = {
+        "status": "READY",
+        "task_id": "current-task",
+        "objective": "[bold]current result[/bold]",
+        "rationale": "[italic]literal rationale[/italic]",
+        "acceptance_criteria": ["[green]literal criterion[/green]"],
+        "relevant_files": [],
+        "design_questions": [],
+        "decision_required": False,
+        "decision_question": None,
+        "decision_rationale": None,
+    }
+    state_path.write_text(json.dumps(state))
+
+    loaded_state = load_state(tmp_path, "selected")
+    assert loaded_state.planner_result is not None
+    current = load_current_run(tmp_path, "selected")
+    assert current.loadable is True, current.diagnostic
+    assert current.result_detail is not None
+    assert "[bold]current result[/bold]" in current.result_detail
 
     snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
     app = RunBrowserApp(snapshot)
     async with app.run_test() as pilot:
-        await pilot.press("enter", "down", "enter")
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")
+
+        current_detail = cast(Any, app.screen.query_one(".record-detail").render()).plain
+        assert "[bold]current result[/bold]" in current_detail
+        assert "Error: unavailable (none recorded)." in current_detail
+        assert "Raw JSON: collapsed (press r to expand)" in current_detail
+
+        await pilot.press("r")
+
+        current_raw_json = cast(Any, app.screen.query_one(".record-detail-raw-json").render()).plain
+        assert '"task_id": "current-task"' in current_raw_json
+        assert '"objective": "[bold]current result[/bold]"' in current_raw_json
+
+        await pilot.press("b", "down", "enter")
 
         detail = cast(Any, app.screen.query_one(".record-detail").render()).plain
         assert "[bold]literal result[/bold]" in detail

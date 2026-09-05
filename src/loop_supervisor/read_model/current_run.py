@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..state import StateError, load_state
+from ..state import RunState, StateError, load_state
 from .record_detail import format_opinionated_content, serialize_raw_json
 
 
@@ -105,19 +105,65 @@ def load_current_run(git_common_dir: Path, run_id: str) -> CurrentRun:
     )
 
 
-def _latest_result(state: object) -> dict[str, object] | None:
-    """Return the validated latest phase result exposed by the current state."""
-    for name in (
-        "auditor_result",
-        "verification_result",
-        "builder_result",
-        "architect_result",
-        "planner_result",
-    ):
-        value = getattr(state, name)
-        if value is not None:
-            return value
+def _latest_result(state: RunState) -> dict[str, object] | None:
+    """Return the result relevant to the validated state's current lifecycle.
+
+    Role-result fields are retained across transitions for recovery and audit
+    purposes.  They therefore cannot be ranked globally: an auditor's REPLAN
+    result can remain while planning has produced the replacement task.  The
+    current phase identifies which validated result describes the active
+    lifecycle instead.
+    """
+    phase = _effective_phase(state)
+    field_names = {
+        "planning": ("planner_result",),
+        "creating_worktree": ("planner_result",),
+        "architecting": ("architect_result", "planner_result"),
+        "recording_decision": ("architect_result", "planner_result"),
+        "building": ("builder_result", "planner_result"),
+        "verifying": ("builder_result", "planner_result"),
+        "auditing": (
+            "verification_result" if state.verification_result else "builder_result",
+            "builder_result",
+            "planner_result",
+        ),
+        "merging": ("auditor_result", "verification_result", "builder_result", "planner_result"),
+        "cleanup_worktree": ("auditor_result", "verification_result", "builder_result"),
+        "cleanup_branch": ("auditor_result", "verification_result", "builder_result"),
+        "done": ("planner_result",),
+    }.get(phase, ())
+    if phase == "awaiting_input":
+        pending_question = state.pending_question
+        kind = pending_question.get("kind") if isinstance(pending_question, dict) else None
+        field_names = (
+            ("builder_result", "planner_result")
+            if kind in {"builder_guidance", "builder_escalation"}
+            else ("architect_result", "planner_result")
+        )
+
+    current_task_id = _current_task_id(state.planner_result)
+    for field_name in field_names:
+        value = getattr(state, field_name)
+        if not isinstance(value, dict):
+            continue
+        task_id = value.get("task_id")
+        if isinstance(task_id, str) and task_id != current_task_id:
+            continue
+        return value
     return None
+
+
+def _effective_phase(state: RunState) -> str:
+    """Use a failure's validated retry target when it retains lifecycle context."""
+    if state.phase not in {"operational_failure", "failed"}:
+        return state.phase
+    if state.last_error is None:
+        return state.phase
+    retry_phase = state.last_error.get("retry_phase")
+    failed_phase = state.last_error.get("failed_phase")
+    if isinstance(retry_phase, str):
+        return retry_phase
+    return failed_phase if isinstance(failed_phase, str) else state.phase
 
 
 def _current_task_id(planner_result: dict[str, object] | None) -> str | None:
