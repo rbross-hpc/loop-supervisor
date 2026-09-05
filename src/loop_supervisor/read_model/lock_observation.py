@@ -192,6 +192,13 @@ def _read_lock_record(git_common_dir: Path) -> dict[str, object]:
 
 def _validate_lock_record(data: dict[str, Any]) -> None:
     schema_version = data.get("schema_version")
+    # Strict integer identity, not equality: bool is an int subclass and
+    # float(1.0) == 1, so plain `==` would accept `schema_version: true` or
+    # `schema_version: 2.0` as a valid version. Kept identical to the
+    # writer's _validate_lock_record in locking.py so read and write rules
+    # can never drift.
+    if type(schema_version) is not int:
+        raise LockObservationError("lock record has an unsupported schema version")
     if schema_version == 1:
         expected_fields = _LEGACY_LOCK_FIELDS
     elif schema_version == 2:

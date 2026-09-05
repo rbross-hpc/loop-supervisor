@@ -100,3 +100,27 @@ deferred to follow-on task or tasks. It changes no shipped explorer behavior.
 - Implementation is intentionally deferred: a later task must update the lock
   writer, readers, TUI, and tests together while preserving ADR 0009's canonical
   lock ownership and release semantics.
+
+## Implementation status (2026-09-05)
+
+Writer-side schema and binding were already shipped before this status note:
+schema-2 acquisition records immutable `owner_boot_id`/`owner_process_start`
+and fails closed if it cannot read them, and `bind_run_id` publishes the
+run-ID replacement atomically at mode 0600 under the existing guard and
+ownership-token check. Stale-lock recovery (`_inspect_existing_lock`) is now
+also schema-aware: a schema-2 record's staleness is decided by the complete
+identity chain (`classify_local_owner_identity`), so a live PID whose
+recorded boot ID or process-start ticks no longer match the current kernel
+state -- PID reuse -- is stale and recoverable, exactly as this ADR's Decision
+section requires; a schema-2 record whose identity cannot be read or compared
+is unverifiable and acquisition/recovery fails closed rather than guessing.
+Schema-1 records are unaffected: their staleness is still decided by PID
+liveness alone, since they carry no immutable identity to compare.
+
+Read-model activity classification (`observe_lock`'s `running` label), the
+TUI, and their tests remain deferred to a follow-on task, per this ADR's
+original Decision section. Until that lands, the read-only explorer still
+classifies a live-PID schema-1 or schema-2 lock as `local_live_associated`
+without the full identity-chain comparison described above -- the writer-side
+identity fields exist and are exposed in `LockObservation`, but the reader
+does not yet compare them against current kernel state.

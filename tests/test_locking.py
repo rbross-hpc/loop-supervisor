@@ -12,6 +12,7 @@ import pytest
 
 import loop_supervisor.locking as locking_mod
 from loop_supervisor.locking import (
+    IdentityStatus,
     LockError,
     MalformedLockError,
     RemoteLockError,
@@ -20,6 +21,7 @@ from loop_supervisor.locking import (
     _guard_path,
     _lock_path,
     _pid_is_alive,
+    classify_local_owner_identity,
 )
 
 
@@ -1019,3 +1021,272 @@ def test_bind_run_id_fails_closed_on_owner_identity_mismatch(tmp_path):
         assert json.loads(_lock_path(tmp_path).read_text())["run_id"] is None
     finally:
         lock.release()
+
+
+# -- classify_local_owner_identity (ADR 0037 identity-chain test) -------------
+
+
+def test_classify_local_owner_identity_matching_when_boot_and_start_agree(monkeypatch):
+    monkeypatch.setattr(locking_mod, "_read_boot_id", lambda: "boot-1")
+    monkeypatch.setattr(locking_mod, "_read_process_start", lambda pid: "start-1")
+
+    status = classify_local_owner_identity(os.getpid(), "boot-1", "start-1")
+
+    assert status is IdentityStatus.MATCHING
+
+
+def test_classify_local_owner_identity_stale_on_boot_id_mismatch(monkeypatch):
+    monkeypatch.setattr(locking_mod, "_read_boot_id", lambda: "current-boot")
+
+    def _unexpected_process_start(pid: int) -> str:
+        raise AssertionError("must not read process-start ticks after a boot mismatch")
+
+    monkeypatch.setattr(locking_mod, "_read_process_start", _unexpected_process_start)
+
+    status = classify_local_owner_identity(os.getpid(), "recorded-boot", "start-1")
+
+    assert status is IdentityStatus.STALE
+
+
+def test_classify_local_owner_identity_stale_when_pid_no_longer_exists(monkeypatch):
+    """PID reuse and plain process exit both surface the same way here:
+    the *recorded* PID no longer names any process at inspection time."""
+    monkeypatch.setattr(locking_mod, "_read_boot_id", lambda: "boot-1")
+
+    def _no_such_process(pid: int) -> str:
+        raise FileNotFoundError(f"/proc/{pid}/stat")
+
+    monkeypatch.setattr(locking_mod, "_read_process_start", _no_such_process)
+
+    status = classify_local_owner_identity(999_999, "boot-1", "start-1")
+
+    assert status is IdentityStatus.STALE
+
+
+def test_classify_local_owner_identity_stale_on_process_start_mismatch(monkeypatch):
+    """A live PID whose process-start ticks differ from the recorded value
+    is PID reuse: a different process now holds that PID number."""
+    monkeypatch.setattr(locking_mod, "_read_boot_id", lambda: "boot-1")
+    monkeypatch.setattr(locking_mod, "_read_process_start", lambda pid: "a-different-start-value")
+
+    status = classify_local_owner_identity(os.getpid(), "boot-1", "start-1")
+
+    assert status is IdentityStatus.STALE
+
+
+def test_classify_local_owner_identity_unverifiable_when_boot_id_unreadable(monkeypatch):
+    def _unavailable_boot_id() -> str:
+        raise LockError("cannot read kernel boot ID: simulated failure")
+
+    monkeypatch.setattr(locking_mod, "_read_boot_id", _unavailable_boot_id)
+
+    status = classify_local_owner_identity(os.getpid(), "boot-1", "start-1")
+
+    assert status is IdentityStatus.UNVERIFIABLE
+
+
+def test_classify_local_owner_identity_unverifiable_when_process_start_unreadable(monkeypatch):
+    monkeypatch.setattr(locking_mod, "_read_boot_id", lambda: "boot-1")
+
+    def _unreadable_process_start(pid: int) -> str:
+        raise LockError(f"cannot read process start ticks for PID {pid}: simulated failure")
+
+    monkeypatch.setattr(locking_mod, "_read_process_start", _unreadable_process_start)
+
+    status = classify_local_owner_identity(os.getpid(), "boot-1", "start-1")
+
+    assert status is IdentityStatus.UNVERIFIABLE
+
+
+# -- schema-aware stale-lock recovery (ADR 0037) ------------------------------
+
+
+def _write_lock_record_v2(
+    tmp_path: Path, *, pid: int, hostname: str, token: str, boot_id: str, process_start: str
+) -> None:
+    lock_path = _lock_path(tmp_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "schema_version": 2,
+        "token": token,
+        "pid": pid,
+        "owner_boot_id": boot_id,
+        "owner_process_start": process_start,
+        "hostname": hostname,
+        "started_at": "2026-01-01T00:00:00Z",
+        "operation": "run",
+        "run_id": None,
+        "integration_path": str(tmp_path),
+    }
+    lock_path.write_text(json.dumps(data))
+    os.chmod(str(lock_path), 0o600)
+
+
+def test_v2_lock_with_reused_pid_is_recovered_as_stale(tmp_path, monkeypatch):
+    """A live local PID whose recorded boot/start identity no longer
+    matches the current kernel state is PID reuse, not a live owner --
+    schema 2's whole point per ADR 0037. Recovery must succeed even
+    though the named PID is alive."""
+    _write_lock_record_v2(
+        tmp_path,
+        pid=os.getpid(),
+        hostname=socket.gethostname(),
+        token="reused-pid-token",
+        boot_id="stale-boot-id",
+        process_start="stale-start-ticks",
+    )
+    monkeypatch.setattr(locking_mod, "_read_boot_id", lambda: "current-boot-id")
+    monkeypatch.setattr(locking_mod, "_read_process_start", lambda pid: "current-start-ticks")
+
+    lock = _make_lock(tmp_path, recover_stale=True)
+    lock.acquire()
+    try:
+        data = json.loads(_lock_path(tmp_path).read_text())
+        assert data["pid"] == os.getpid()
+        assert data["token"] != "reused-pid-token"
+    finally:
+        lock.release()
+
+
+def test_v2_lock_with_reused_pid_rejected_without_recover_flag(tmp_path, monkeypatch):
+    _write_lock_record_v2(
+        tmp_path,
+        pid=os.getpid(),
+        hostname=socket.gethostname(),
+        token="reused-pid-token",
+        boot_id="stale-boot-id",
+        process_start="stale-start-ticks",
+    )
+    monkeypatch.setattr(locking_mod, "_read_boot_id", lambda: "current-boot-id")
+    monkeypatch.setattr(locking_mod, "_read_process_start", lambda pid: "current-start-ticks")
+
+    lock = _make_lock(tmp_path, recover_stale=False)
+    with pytest.raises(StaleLockError):
+        lock.acquire()
+
+
+def test_v2_lock_with_matching_identity_cannot_be_force_recovered(tmp_path, monkeypatch):
+    """The exact-identity match case: the same process still holds the
+    lock, so recovery must be refused exactly as PID-only schema 1 would
+    refuse a live owner."""
+    monkeypatch.setattr(locking_mod, "_read_boot_id", lambda: "current-boot-id")
+    monkeypatch.setattr(locking_mod, "_read_process_start", lambda pid: "current-start-ticks")
+    _write_lock_record_v2(
+        tmp_path,
+        pid=os.getpid(),
+        hostname=socket.gethostname(),
+        token="live-token",
+        boot_id="current-boot-id",
+        process_start="current-start-ticks",
+    )
+
+    lock = _make_lock(tmp_path, recover_stale=True)
+    with pytest.raises(LockError):
+        lock.acquire()
+
+    assert json.loads(_lock_path(tmp_path).read_text())["token"] == "live-token"
+
+
+def test_v2_lock_recovered_when_pid_has_exited(tmp_path, monkeypatch):
+    """Ordinary dead-owner recovery must still work for schema 2, not only
+    the PID-reuse case: an exited PID is stale regardless of what boot/
+    start identity was recorded for it."""
+    dead_pid = _get_dead_pid()
+    _write_lock_record_v2(
+        tmp_path,
+        pid=dead_pid,
+        hostname=socket.gethostname(),
+        token="dead-owner-token",
+        boot_id="whatever-boot-id",
+        process_start="whatever-start-ticks",
+    )
+    monkeypatch.setattr(locking_mod, "_read_boot_id", lambda: "whatever-boot-id")
+
+    lock = _make_lock(tmp_path, recover_stale=True)
+    lock.acquire()
+    try:
+        data = json.loads(_lock_path(tmp_path).read_text())
+        assert data["pid"] == os.getpid()
+    finally:
+        lock.release()
+
+
+def test_v2_lock_recovery_refused_when_boot_id_unverifiable(tmp_path, monkeypatch):
+    """Unverifiable identity must never be treated as proof of staleness:
+    acquisition fails closed rather than guessing."""
+    _write_lock_record_v2(
+        tmp_path,
+        pid=os.getpid(),
+        hostname=socket.gethostname(),
+        token="unverifiable-token",
+        boot_id="some-boot-id",
+        process_start="some-start-ticks",
+    )
+
+    def _unavailable_boot_id() -> str:
+        raise LockError("cannot read kernel boot ID: simulated failure")
+
+    monkeypatch.setattr(locking_mod, "_read_boot_id", _unavailable_boot_id)
+
+    lock = _make_lock(tmp_path, recover_stale=True)
+    with pytest.raises(LockError):
+        lock.acquire()
+
+    assert json.loads(_lock_path(tmp_path).read_text())["token"] == "unverifiable-token"
+
+
+def test_v1_lock_stale_recovery_remains_pid_only(tmp_path, monkeypatch):
+    """Schema-1 records carry no immutable owner identity to compare, so
+    the *staleness decision* for an old v1 record must remain governed
+    solely by PID liveness -- unaffected by ADR 0037's schema-2 identity
+    chain. (acquire() separately reads kernel identity for the *new*
+    schema-2 record it is about to write; that is unrelated to how the
+    old v1 holder's staleness is decided and is not what this asserts.)"""
+
+    def _unexpected_classification(*args: object, **kwargs: object) -> IdentityStatus:
+        raise AssertionError("v1 recovery must not classify identity via kernel comparison")
+
+    monkeypatch.setattr(locking_mod, "classify_local_owner_identity", _unexpected_classification)
+
+    dead_pid = _get_dead_pid()
+    _write_lock_record(tmp_path, pid=dead_pid, hostname=socket.gethostname(), token="v1-token")
+
+    lock = _make_lock(tmp_path, recover_stale=True)
+    lock.acquire()
+    try:
+        data = json.loads(_lock_path(tmp_path).read_text())
+        assert data["pid"] == os.getpid()
+    finally:
+        lock.release()
+
+
+def test_v1_live_local_owner_still_cannot_be_force_recovered(tmp_path):
+    """Unchanged v1 behavior: a live local PID is never recoverable,
+    regardless of the schema-2 identity machinery added alongside it."""
+    lock1 = _make_lock(tmp_path)
+    lock1.acquire()
+    try:
+        record = json.loads(_lock_path(tmp_path).read_text())
+        record["schema_version"] = 1
+        del record["owner_boot_id"]
+        del record["owner_process_start"]
+        _write_raw_lock(tmp_path, record)
+
+        lock2 = _make_lock(tmp_path, recover_stale=True)
+        with pytest.raises(LockError):
+            lock2.acquire()
+    finally:
+        lock1.release()
+
+
+# -- strict schema_version type validation ------------------------------------
+
+
+@pytest.mark.parametrize("bad_schema_version", [True, False, 2.0, 1.0, "2", None, [2]])
+def test_malformed_lock_rejects_non_integer_schema_version(tmp_path, bad_schema_version):
+    record = dict(_VALID_RECORD, hostname=socket.gethostname())
+    record["schema_version"] = bad_schema_version
+    _write_raw_lock(tmp_path, record)
+    lock = _make_lock(tmp_path, recover_stale=True)
+    with pytest.raises(MalformedLockError, match="schema_version"):
+        lock.acquire()
