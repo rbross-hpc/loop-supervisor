@@ -81,6 +81,8 @@ _LEGACY_LOCK_FIELDS = frozenset(
 _LOCK_FIELDS = _LEGACY_LOCK_FIELDS | frozenset({"owner_boot_id", "owner_process_start"})
 _VALID_OPERATIONS = frozenset({"run", "resume", "tui"})
 _TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_SELECTED_PATH_CANONICALIZATION_DIAGNOSTIC = "Selected integration path could not be canonicalized."
+_LOCK_READ_DIAGNOSTIC = "Supervisor lock could not be read or validated."
 
 
 def observe_lock(
@@ -94,15 +96,19 @@ def observe_lock(
     run_list = tuple(runs)
     try:
         selected_path = _canonicalize(integration_path)
-    except OSError as exc:
-        return _observation(LockActivity.MISMATCHED, run_list, diagnostic=str(exc))
+    except OSError:
+        return _observation(
+            LockActivity.MISMATCHED,
+            run_list,
+            diagnostic=_SELECTED_PATH_CANONICALIZATION_DIAGNOSTIC,
+        )
 
     try:
         record = _read_lock_record(git_common_dir)
     except FileNotFoundError:
         return _observation(LockActivity.ABSENT, run_list)
-    except (BoundedJsonError, LockObservationError, OSError) as exc:
-        return _observation(LockActivity.MALFORMED, run_list, diagnostic=str(exc))
+    except (BoundedJsonError, LockObservationError, OSError):
+        return _observation(LockActivity.MALFORMED, run_list, diagnostic=_LOCK_READ_DIAGNOSTIC)
 
     # ``_read_lock_record`` has removed token before returning this mapping.
     hostname = record["hostname"]

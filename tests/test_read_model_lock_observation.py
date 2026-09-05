@@ -88,7 +88,31 @@ def test_observe_lock_rejects_float_schema_version_on_genuine_v2_record(tmp_path
     observation = observe_lock(tmp_path, tmp_path, (_summary(),))
 
     assert observation.activity is LockActivity.MALFORMED
-    assert observation.diagnostic == "lock record has an unsupported schema version"
+    assert observation.diagnostic == "Supervisor lock could not be read or validated."
+
+
+def test_observe_lock_sanitizes_selected_path_canonicalization_failure(tmp_path):
+    missing_integration_path = tmp_path / "missing-selected-integration"
+
+    observation = observe_lock(tmp_path, missing_integration_path, ())
+
+    assert observation.activity is LockActivity.MISMATCHED
+    assert observation.diagnostic == "Selected integration path could not be canonicalized."
+    assert str(missing_integration_path) not in observation.diagnostic
+    assert "No such file or directory" not in observation.diagnostic
+
+
+def test_observe_lock_sanitizes_malformed_lock_parser_failure(tmp_path):
+    lock_path = tmp_path / "loop-supervisor" / "supervisor.lock"
+    lock_path.parent.mkdir()
+    lock_path.write_text("{")
+
+    observation = observe_lock(tmp_path, tmp_path, ())
+
+    assert observation.activity is LockActivity.MALFORMED
+    assert observation.diagnostic == "Supervisor lock could not be read or validated."
+    assert str(lock_path) not in observation.diagnostic
+    assert "Expecting property name enclosed in double quotes" not in observation.diagnostic
 
 
 @pytest.mark.parametrize(
