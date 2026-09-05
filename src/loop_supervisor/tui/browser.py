@@ -7,9 +7,9 @@ from textual.containers import VerticalScroll
 from textual.widgets import Footer, Header, ListItem, ListView, Static
 
 from ..read_model import verification
-from ..read_model.current_run import CurrentRun, load_current_run
+from ..read_model.current_run import CurrentRun
 from ..read_model.discovery import RunSummary
-from ..read_model.history import HistoryEntry, HistoryLoad, HistoryStatus, load_history
+from ..read_model.history import HistoryEntry, HistoryLoad, HistoryStatus
 from ..read_model.lock_observation import ActivityLabel, LockActivity, LockObservation
 from ..read_model.snapshot import ProjectSnapshot, build_snapshot
 
@@ -108,8 +108,10 @@ class RunBrowserApp(App[None]):
                 yield Static(diagnostic.message, markup=False, classes="snapshot-diagnostic")
 
     def _compose_detail(self, run_id: str) -> ComposeResult:
-        current = load_current_run(self._snapshot.project.git_common_dir, run_id)
-        history = load_history(self._snapshot.project.git_common_dir, run_id)
+        detail = self._snapshot.detail_for(run_id)
+        current = detail.current
+        history = detail.history
+        discovered_verification = detail.verification
         with VerticalScroll(id="run-detail"):
             yield Static("Run detail — press b to return to the browser.", markup=False)
             yield Static(
@@ -118,9 +120,6 @@ class RunBrowserApp(App[None]):
                 classes="run-detail-summary",
             )
             yield Static(self._render_history(history), markup=False, classes="run-detail-timeline")
-            discovered_verification = verification.discover_verification(
-                self._snapshot.project.git_common_dir, run_id, current.verification_result
-            )
             yield Static(
                 self._render_verification(discovered_verification),
                 markup=False,
