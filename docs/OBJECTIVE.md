@@ -152,7 +152,8 @@ it is not an open work item.
 Items 1 through 15 (the initial vertical slice, ADR 0036/0037, the
 Textual-independent read model, and the writer/reader lock-identity
 hardening) are delivered. A post-delivery audit of that work found the
-defects and gap addressed by items 16 through 25 below. Each is
+defects and gap addressed by items 16 through 25 below; item 26 closes
+this objective's run with an observable version bump. Each is
 independently mergeable and subject to the same task-sizing,
 one-mergeable-slice-at-a-time discipline, and the same Ruff/formatting/
 mypy/pytest gates, as all prior priorities.
@@ -279,10 +280,34 @@ mypy/pytest gates, as all prior priorities.
     which has drifted out of sync with the live prompt, and restore
     parity test coverage for it in `tests/test_cli_init.py` (currently
     disabled pending this sync; see the comment marking why).
+26. Bump the distribution version and make it observable at runtime.
+    **This item must be selected last, after every other item in
+    "Ordered priorities" above is complete**, so the version names the
+    finished state of this objective.
+
+    `pyproject.toml`'s `version` is still `0.1.0`, which predates the
+    entire read-only TUI browser, ADRs 0035-0038, and lock schema v2. The
+    version is not exposed anywhere in the package or the CLI today --
+    there is no `__version__`, no `--version` flag, and `doctor` reports
+    only the Python version -- so an installed copy cannot be
+    distinguished from any earlier build at runtime.
+
+    - Bump `version` to `0.2.0` in `pyproject.toml`.
+    - Expose `__version__` sourced from installed package metadata
+      (`importlib.metadata`), not hardcoded a second time, so the number
+      lives in exactly one place.
+    - Add a `--version` flag to the CLI.
+    - Report the version in `doctor` output alongside the existing
+      Python-version check.
+
+    Do not create a Git tag. A release tag must name the post-merge
+    commit on `main`, which does not exist while this task is being
+    built in a worktree; tagging is a human step after this objective's
+    run completes.
 
 ## Deferred work (not yet scheduled)
 
-Priorities 16 through 25 above are the current active work. The following
+Priorities 16 through 26 above are the current active work. The following
 is captured so it is not lost, but it is deliberately **not** part of
 "Ordered priorities" yet: the planner must not select it, and it is not
 part of this objective's completion criteria, until a human promotes it
@@ -296,7 +321,7 @@ the objective COMPLETE without the deferred slice ever being scheduled,
 because the deferral existed only in commit prose the planner never reads
 and has no instruction to look for.
 
-26. Give the planner a narrow, mechanical way to carry a just-completed
+27. Give the planner a narrow, mechanical way to carry a just-completed
     task's stated rationale into its next invocation, and require it to
     check that rationale for a named, still-unresolved deferral before
     considering the objective complete. Two independently mergeable
@@ -365,6 +390,10 @@ The objective is complete when:
   spurious adjacent-record contradiction;
 - the verification log mutation-detection scope is recorded in an ADR and
   this objective's wording matches what is actually implemented;
+- the distribution version is bumped to `0.2.0` and observable at runtime
+  via both `loop-supervisor --version` and `doctor`, sourced from package
+  metadata rather than duplicated in source; the release tag itself is
+  left for a human to create against the merged `main` commit;
 - the configured Ruff, formatting, mypy, and pytest gates pass.
 
 ## Out of scope
