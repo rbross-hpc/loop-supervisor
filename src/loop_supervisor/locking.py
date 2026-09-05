@@ -94,18 +94,21 @@ def _read_process_start(pid: int) -> str:
     """Read ``pid``'s process-start ticks from ``/proc/<pid>/stat``.
 
     Deliberately opaque: compared exactly, never converted to a wall-clock
-    timestamp. Raises ``FileNotFoundError`` verbatim when ``pid`` does not
-    currently exist -- callers distinguish "no such process" (stale
-    evidence, including PID reuse of the *recorded* PID once it exits) from
-    "process exists but its identity could not be read" (unverifiable,
-    never treated as proof of either liveness or staleness). Any other
-    read failure raises ``LockError``.
+    timestamp. Raises ``FileNotFoundError`` when ``pid`` does not currently
+    exist; a mid-read ``ProcessLookupError`` is normalized to that same
+    absent-PID signal. Callers distinguish "no such process" (stale evidence,
+    including PID reuse of the *recorded* PID once it exits) from "process
+    exists but its identity could not be read" (unverifiable, never treated
+    as proof of either liveness or staleness). Any other read failure raises
+    ``LockError``.
     """
     try:
         stat_text = Path(f"/proc/{pid}/stat").read_text()
     except FileNotFoundError:
         raise
-    except OSError as exc:
+    except ProcessLookupError as exc:
+        raise FileNotFoundError(f"/proc/{pid}/stat") from exc
+    except Exception as exc:
         raise LockError(f"cannot read process start ticks for PID {pid}: {exc}") from exc
     _, separator, remainder = stat_text.rpartition(")")
     fields = remainder.split()
