@@ -106,6 +106,26 @@ async def test_run_browser_opens_authoritative_detail_and_returns_to_browser(
 
         assert app.screen.query_one("#run-browser")
 
+        await pilot.press("enter")
+
+        reopened_detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert "Run ID: selected" in reopened_detail
+
+
+@pytest.mark.asyncio
+async def test_run_browser_opens_run_id_with_period(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "old.run", updated_at="2026-01-02T00:00:00+00:00")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+
+        detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert "Run ID: old.run" in detail
+
 
 @pytest.mark.asyncio
 async def test_run_browser_opens_unloadable_run_as_safe_unavailable_detail_and_quits(

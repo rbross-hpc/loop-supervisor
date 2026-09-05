@@ -31,6 +31,7 @@ class RunBrowserApp(App[None]):
         super().__init__()
         self._snapshot = snapshot
         self._selected_run_id: str | None = None
+        self._run_id_by_row_index = tuple(summary.run_id for summary in snapshot.runs)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -59,7 +60,6 @@ class RunBrowserApp(App[None]):
                     *(
                         ListItem(
                             Static(self._render_run(summary), markup=False, classes="run-row"),
-                            id=f"run-{summary.run_id}",
                         )
                         for summary in self._snapshot.runs
                     ),
@@ -78,10 +78,8 @@ class RunBrowserApp(App[None]):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Open the selected run using the authoritative current-state reader."""
-        run_item_id = event.item.id
-        if run_item_id is not None:
-            self._selected_run_id = run_item_id.removeprefix("run-")
-            self.call_after_refresh(self._show_selected_run)
+        self._selected_run_id = self._run_id_by_row_index[event.index]
+        self.call_after_refresh(self._show_selected_run)
 
     def _show_selected_run(self) -> None:
         """Replace the browser widgets after Textual has handled list selection."""
@@ -92,6 +90,11 @@ class RunBrowserApp(App[None]):
         if self._selected_run_id is not None:
             self._selected_run_id = None
             self.refresh(recompose=True)
+            self.call_after_refresh(self._focus_run_list)
+
+    def _focus_run_list(self) -> None:
+        """Restore keyboard navigation after the browser has been recomposed."""
+        self.query_one(ListView).focus()
 
     @staticmethod
     def _render_run(summary: RunSummary) -> str:
