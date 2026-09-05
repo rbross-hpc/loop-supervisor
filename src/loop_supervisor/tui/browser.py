@@ -192,7 +192,15 @@ class RunBrowserApp(App[None]):
         payload = cls._truncate_literal(
             rendered, available_bytes, cls._MAX_VERIFICATION_RENDERED_LINES - 1
         )
-        return f"{payload}\n{marker}"
+        separator = "" if cls._ends_with_line_separator(payload) else "\n"
+        return f"{payload}{separator}{marker}"
+
+    @staticmethod
+    def _ends_with_line_separator(text: str) -> bool:
+        """Return whether ``text`` already ends with a ``str.splitlines`` separator."""
+        return text.endswith(
+            ("\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
+        )
 
     @staticmethod
     def _record_label(record: CurrentRun | HistoryEntry) -> str:
@@ -250,20 +258,16 @@ class RunBrowserApp(App[None]):
 
     @classmethod
     def _truncate_literal(cls, text: str, max_bytes: int, max_lines: int) -> str:
-        """Return a Unicode-safe literal prefix within byte and rendered-line limits."""
+        """Return a Unicode-safe literal prefix within byte and ``splitlines`` limits."""
         selected: list[str] = []
         used_bytes = 0
-        used_lines = 1
-        for character in text:
-            character_bytes = len(character.encode("utf-8"))
-            if used_bytes + character_bytes > max_bytes:
-                break
-            if character == "\n":
-                if used_lines == max_lines:
-                    break
-                used_lines += 1
-            selected.append(character)
-            used_bytes += character_bytes
+        for line in text.splitlines(keepends=True)[:max_lines]:
+            for character in line:
+                character_bytes = len(character.encode("utf-8"))
+                if used_bytes + character_bytes > max_bytes:
+                    return "".join(selected)
+                selected.append(character)
+                used_bytes += character_bytes
         return "".join(selected)
 
     @classmethod

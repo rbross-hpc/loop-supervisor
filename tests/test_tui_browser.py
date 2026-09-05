@@ -692,6 +692,28 @@ def test_verification_rendering_stays_within_output_limits() -> None:
     assert "Verification output truncated: rendered-output limit reached." in rendered
 
 
+def test_verification_rendering_bounds_non_newline_line_separators() -> None:
+    attempt = VerificationAttempt(
+        commit="a" * 40,
+        ordinal=1,
+        command="command\r" * 100_001,
+        ok=True,
+        returncode=0,
+        timed_out=False,
+        duration=0.1,
+        summary="summary",
+        log=None,
+    )
+
+    rendered = RunBrowserApp._render_verification(
+        VerificationDiscovery(attempts=(attempt,), diagnostics=())
+    )
+
+    assert len(rendered.encode("utf-8")) <= 256 * 1024
+    assert len(rendered.splitlines()) <= 10_000
+    assert "Verification output truncated: rendered-output limit reached." in rendered
+
+
 @pytest.mark.asyncio
 async def test_run_browser_opens_unloadable_run_as_safe_unavailable_detail_and_quits(
     tmp_path: Path,
