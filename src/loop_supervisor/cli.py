@@ -651,6 +651,13 @@ def cmd_tui(args: argparse.Namespace) -> int:
     except ProjectResolutionError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except StateError:
+        # A scan-wide state-storage failure (unlike one malformed run leaf)
+        # means there is no safe initial snapshot for Textual to display.
+        # Keep this fixed diagnostic independent of the filesystem exception:
+        # its raw text can contain unbounded or sensitive path information.
+        print("error: cannot scan supervisor run state for this project", file=sys.stderr)
+        return 1
     RunBrowserApp(snapshot).run()
     return 0
 
