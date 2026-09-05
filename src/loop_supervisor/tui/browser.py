@@ -9,7 +9,7 @@ from textual.widgets import Footer, Header, ListItem, ListView, Static
 from ..read_model.current_run import CurrentRun, load_current_run
 from ..read_model.discovery import RunSummary
 from ..read_model.history import HistoryEntry, HistoryLoad, HistoryStatus, load_history
-from ..read_model.snapshot import ProjectSnapshot
+from ..read_model.snapshot import ProjectSnapshot, build_snapshot
 
 
 class RunBrowserApp(App[None]):
@@ -21,7 +21,7 @@ class RunBrowserApp(App[None]):
 
     TITLE = "Loop Supervisor"
     SUB_TITLE = "Run browser"
-    BINDINGS = [("q", "quit", "Quit"), ("b", "back", "Back")]
+    BINDINGS = [("q", "quit", "Quit"), ("b", "back", "Back"), ("r", "refresh", "Refresh")]
     CSS = """
     #run-browser, #run-detail {
         padding: 1 2;
@@ -91,6 +91,17 @@ class RunBrowserApp(App[None]):
     def _show_selected_run(self) -> None:
         """Replace the browser widgets after Textual has handled list selection."""
         self.refresh(recompose=True)
+
+    def action_refresh(self) -> None:
+        """Replace the displayed snapshot with a fresh disk scan by selected run ID."""
+        selected_run_id = self._selected_run_id
+        self._snapshot = build_snapshot(self._snapshot.project)
+        self._run_id_by_row_index = tuple(summary.run_id for summary in self._snapshot.runs)
+        if selected_run_id not in self._run_id_by_row_index:
+            self._selected_run_id = None
+        self.refresh(recompose=True)
+        if self._selected_run_id is None and self._snapshot.runs:
+            self.call_after_refresh(self._focus_run_list)
 
     async def action_back(self) -> None:
         """Return from a run detail to the immutable browser snapshot."""

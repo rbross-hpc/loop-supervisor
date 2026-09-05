@@ -151,6 +151,43 @@ async def test_run_browser_lists_newest_loadable_runs_and_degraded_rows_then_qui
 
 
 @pytest.mark.asyncio
+async def test_run_browser_manual_refresh_updates_rows_and_reconciles_removed_selection(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "older", updated_at="2026-01-01T00:00:00+00:00")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        _persist_run(tmp_path, "newer", updated_at="2026-01-02T00:00:00+00:00")
+
+        await pilot.press("r")
+
+        refreshed_rows = [cast(Any, row.render()).plain for row in app.screen.query(".run-row")]
+        assert ["newer" in row for row in refreshed_rows] == [True, False]
+        assert ["older" in row for row in refreshed_rows] == [False, True]
+
+        await pilot.press("enter")
+        detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert "Run ID: newer" in detail
+
+        _persist_run(tmp_path, "newer", updated_at="2026-01-03T00:00:00+00:00")
+        await pilot.press("r")
+
+        refreshed_detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert "Run ID: newer" in refreshed_detail
+        assert "Updated: 2026-01-03T00:00:00+00:00" in refreshed_detail
+
+        (tmp_path / "loop-supervisor" / "runs" / "newer.json").unlink()
+
+        await pilot.press("r")
+
+        assert app.screen.query_one("#run-browser")
+        remaining_rows = [cast(Any, row.render()).plain for row in app.screen.query(".run-row")]
+        assert ["older" in row for row in remaining_rows] == [True]
+
+
+@pytest.mark.asyncio
 async def test_run_browser_opens_authoritative_detail_and_returns_to_browser(
     tmp_path: Path,
 ) -> None:
