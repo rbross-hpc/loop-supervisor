@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Any
 
 import loop_supervisor.read_model.verification as verification
 from loop_supervisor.read_model import discover_verification, read_log
@@ -155,6 +156,39 @@ def test_discovery_reports_malformed_metadata_without_raising(tmp_path):
     assert discovered.diagnostics == (
         verification.VerificationDiagnostic("run-1", "invalid verification metadata"),
     )
+
+
+def test_discovery_and_read_log_reject_oversized_filename_ordinal(tmp_path, monkeypatch):
+    directory = _directory(tmp_path)
+    (directory / "01.log").write_text("expected")
+    oversized_name = f"{'9' * 129}.log"
+    (directory / oversized_name).write_text("oversized ordinal")
+    original_isinstance = isinstance
+
+    class GuardedIntMeta(type):
+        def __instancecheck__(self, value: object) -> bool:
+            return original_isinstance(value, int)
+
+    class GuardedInt(int, metaclass=GuardedIntMeta):
+        def __new__(cls, value: Any = 0) -> "GuardedInt":
+            if value == oversized_name[:-4]:
+                raise AssertionError("oversized ordinal was converted")
+            return super().__new__(cls, value)
+
+    monkeypatch.setattr(verification, "int", GuardedInt, raising=False)
+    discovered = discover_verification(tmp_path, "run-1", _result(tmp_path))
+
+    assert discovered.attempts[0].log is not None
+    assert any(
+        item.artifact == oversized_name and item.reason == "log ordinal is too large"
+        for item in discovered.diagnostics
+    )
+    unavailable = read_log(
+        tmp_path,
+        verification.LogReference("run-1", COMMIT, 9, oversized_name),
+    )
+    assert not unavailable.available
+    assert unavailable.diagnostic == "invalid log reference"
 
 
 def test_discovery_reports_bounded_scans(tmp_path, monkeypatch):
