@@ -556,6 +556,33 @@ async def test_run_browser_opens_run_id_with_period(
 
 
 @pytest.mark.asyncio
+async def test_record_detail_refreshes_with_r_and_toggles_raw_json_with_e(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _persist_run(tmp_path, "selected", updated_at="2026-01-04T00:00:00+00:00", phase="planning")
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    refresh_calls: list[ProjectResolution] = []
+
+    def refreshed(project: ProjectResolution) -> ProjectSnapshot:
+        refresh_calls.append(project)
+        return snapshot
+
+    monkeypatch.setattr(browser, "build_snapshot", refreshed)
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter", "enter", "r")
+
+        assert refresh_calls == [snapshot.project]
+        assert not app.screen.query(".record-detail-raw-json")
+
+        await pilot.press("e")
+
+        assert app.screen.query_one(".record-detail-raw-json")
+
+    assert ("e", "toggle_raw_json", "Toggle raw JSON") in RunBrowserApp.BINDINGS
+
+
+@pytest.mark.asyncio
 async def test_run_detail_opens_escaped_record_detail_and_expandable_raw_json(
     tmp_path: Path,
 ) -> None:
@@ -602,9 +629,9 @@ async def test_run_detail_opens_escaped_record_detail_and_expandable_raw_json(
         assert "Objective: [bold]current result[/bold]" in current_detail
         assert '"objective":' not in current_detail
         assert "Error: unavailable (none recorded)." in current_detail
-        assert "Raw JSON: collapsed (press r to expand)" in current_detail
+        assert "Raw JSON: collapsed (press e to expand)" in current_detail
 
-        await pilot.press("r")
+        await pilot.press("e")
 
         current_raw_json = cast(Any, app.screen.query_one(".record-detail-raw-json").render()).plain
         assert '"task_id": "current-task"' in current_raw_json
@@ -619,9 +646,9 @@ async def test_run_detail_opens_escaped_record_detail_and_expandable_raw_json(
         assert "Operational error" in detail
         assert "Message: [red]literal error[/red]" in detail
         assert '"message":' not in detail
-        assert "Raw JSON: collapsed (press r to expand)" in detail
+        assert "Raw JSON: collapsed (press e to expand)" in detail
 
-        await pilot.press("r")
+        await pilot.press("e")
 
         raw_json = cast(Any, app.screen.query_one(".record-detail-raw-json").render()).plain
         assert '"objective": "[bold]literal result[/bold]"' in raw_json
@@ -649,7 +676,7 @@ async def test_expanded_raw_json_widget_including_marker_stays_within_render_lim
     snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
     app = RunBrowserApp(snapshot)
     async with app.run_test() as pilot:
-        await pilot.press("enter", "down", "enter", "r")
+        await pilot.press("enter", "down", "enter", "e")
 
         raw_json = cast(Any, app.screen.query_one(".record-detail-raw-json").render()).plain
         assert len(raw_json.encode("utf-8")) <= 256 * 1024
@@ -674,7 +701,7 @@ async def test_oversized_result_preserves_error_and_raw_json_affordance(tmp_path
         detail = cast(Any, app.screen.query_one(".record-detail").render()).plain
         assert "Operational error" in detail
         assert "Message: recorded failure" in detail
-        assert "Raw JSON: collapsed (press r to expand); output truncated" in detail
+        assert "Raw JSON: collapsed (press e to expand); output truncated" in detail
 
 
 @pytest.mark.asyncio
