@@ -653,11 +653,11 @@ def cmd_tui(args: argparse.Namespace) -> int:
         # pre-TUI diagnostic fixed, as with scan-wide state-storage failures.
         print("error: cannot resolve project for this TUI", file=sys.stderr)
         return 1
-    except StateError:
-        # A scan-wide state-storage failure (unlike one malformed run leaf)
-        # means there is no safe initial snapshot for Textual to display.
-        # Keep this fixed diagnostic independent of the filesystem exception:
-        # its raw text can contain unbounded or sensitive path information.
+    except (StateError, OSError):
+        # A scan-wide state-storage or filesystem failure (unlike one malformed
+        # run leaf) means there is no safe initial snapshot for Textual to
+        # display. Keep this fixed diagnostic independent of the exception: its
+        # raw text can contain unbounded or sensitive path information.
         print("error: cannot scan supervisor run state for this project", file=sys.stderr)
         return 1
     RunBrowserApp(snapshot).run()
