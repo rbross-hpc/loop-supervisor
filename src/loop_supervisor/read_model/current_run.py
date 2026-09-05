@@ -37,6 +37,7 @@ class CurrentRun:
     error_detail: str | None
     raw_json: str | None
     raw_json_truncated: bool
+    verification_result: dict[str, object] | None
 
     @classmethod
     def degraded(cls, run_id: str, diagnostic: str) -> CurrentRun:
@@ -61,6 +62,7 @@ class CurrentRun:
             error_detail=None,
             raw_json=None,
             raw_json_truncated=False,
+            verification_result=None,
         )
 
 
@@ -102,6 +104,7 @@ def load_current_run(git_common_dir: Path, run_id: str) -> CurrentRun:
         error_detail=format_opinionated_content(last_error) if last_error is not None else None,
         raw_json=raw_json,
         raw_json_truncated=raw_json_truncated,
+        verification_result=state.verification_result,
     )
 
 

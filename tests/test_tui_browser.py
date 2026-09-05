@@ -10,12 +10,18 @@ from typing import Any, cast
 
 import pytest
 
+import loop_supervisor.read_model.verification as verification
 from loop_supervisor.read_model import ProjectResolution, build_snapshot, load_current_run
 from loop_supervisor.read_model.history import (
     HistoryDiagnostic,
     HistoryEntry,
     HistoryLoad,
     HistoryStatus,
+)
+from loop_supervisor.read_model.verification import (
+    VerificationAttempt,
+    VerificationDiagnostic,
+    VerificationDiscovery,
 )
 from loop_supervisor.state import STATE_SCHEMA_VERSION, RunOptions, RunState, load_state, save_state
 from loop_supervisor.supervisor import AdvanceStatus
@@ -85,6 +91,76 @@ def _persist_lock(git_common_dir: Path, *, run_id: str | None, hostname: str | N
             }
         )
     )
+
+
+def _verification_result(
+    git_common_dir: Path, run_id: str, *, command: str = "pytest"
+) -> dict[str, object]:
+    commit = "a" * 40
+    log = git_common_dir / "loop-supervisor" / "verification" / run_id / commit / "01.log"
+    return {
+        "ok": True,
+        "commands": [
+            {
+                "command": command,
+                "ok": True,
+                "returncode": 0,
+                "timed_out": False,
+                "duration": 0.1,
+                "output_path": str(log),
+                "summary": "[green]literal summary[/green]",
+            }
+        ],
+    }
+
+
+def _persist_verification_result(
+    git_common_dir: Path, run_id: str, result: dict[str, object]
+) -> Path:
+    state_path = git_common_dir / "loop-supervisor" / "runs" / f"{run_id}.json"
+    state = json.loads(state_path.read_text())
+    state.update(
+        phase="auditing",
+        original_task_id="task-1",
+        task_worktree_path="/tmp/wt/task-1",
+        task_branch="loop/task-1",
+        task_base_commit="abc123",
+        task_expected_head="d" * 40,
+        task_status_snapshot="",
+        last_task_head="d" * 40,
+        planner_result={
+            "status": "READY",
+            "task_id": "task-1",
+            "objective": "Implement the task",
+            "rationale": "It is next",
+            "acceptance_criteria": ["It works"],
+            "relevant_files": [],
+            "design_questions": [],
+            "decision_required": False,
+            "decision_question": None,
+            "decision_rationale": None,
+        },
+        builder_result={
+            "task_id": "task-1",
+            "objective": "Implement the task",
+            "status": "COMPLETE",
+            "implementation_summary": "Implemented it",
+            "implementation_strategy": [],
+            "tests_run": [],
+            "test_results": [],
+            "files_changed": [],
+            "commit": "d" * 40,
+            "open_concerns": [],
+        },
+        verification_result=result,
+    )
+    commands = result["commands"]
+    assert isinstance(commands, list)
+    command = commands[0]
+    assert isinstance(command, dict)
+    state["options"]["verify_commands"] = [command["command"]]
+    state_path.write_text(json.dumps(state))
+    return state_path
 
 
 def _persist_history(
@@ -518,6 +594,102 @@ def test_timeline_rendering_reserves_incomplete_diagnostic_within_output_limits(
     assert "Workflow timeline: incomplete" in timeline
     assert "Timeline diagnostics:" in timeline
     assert "0002-planning.json: malformed history record" in timeline
+
+
+@pytest.mark.asyncio
+async def test_run_detail_renders_verification_attempt_as_openable_without_reading_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00", phase="auditing")
+    result = _verification_result(tmp_path, run_id, command="[bold]pytest[/bold]")
+    _persist_verification_result(tmp_path, run_id, result)
+    log = tmp_path / "loop-supervisor" / "verification" / run_id / ("a" * 40) / "01.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("unredacted log body must remain unopened")
+    calls = 0
+
+    def count_read_log(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        return None
+
+    monkeypatch.setattr(verification, "read_log", count_read_log)
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+
+        rendered = cast(Any, app.screen.query_one(".run-detail-verification").render()).plain
+        assert "Verification:" in rendered
+        assert "Attempt 1" in rendered
+        assert f"Commit: {'a' * 40}" in rendered
+        assert "Command: [bold]pytest[/bold]" in rendered
+        assert "OK: True; Return code: 0; Timed out: False; Duration: 0.1" in rendered
+        assert "Summary: [green]literal summary[/green]" in rendered
+        assert "Log: available (openable; not opened)" in rendered
+        assert "unredacted log body must remain unopened" not in rendered
+
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_run_detail_renders_verification_diagnostics_and_no_attempts(
+    tmp_path: Path,
+) -> None:
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00", phase="auditing")
+    result = _verification_result(tmp_path, run_id)
+    state_path = _persist_verification_result(tmp_path, run_id, result)
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+
+        diagnostic = cast(Any, app.screen.query_one(".run-detail-verification").render()).plain
+        assert "Attempt 1" in diagnostic
+        assert "Log: unavailable (not openable)" in diagnostic
+        assert "Verification diagnostics:" in diagnostic
+        assert "01.log: authorized log is unavailable" in diagnostic
+
+    state = json.loads(state_path.read_text())
+    state["verification_result"] = {"ok": True, "commands": []}
+    state_path.write_text(json.dumps(state))
+    empty_snapshot = build_snapshot(
+        ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path)
+    )
+    empty_app = RunBrowserApp(empty_snapshot)
+    async with empty_app.run_test() as pilot:
+        await pilot.press("enter")
+
+        empty = cast(Any, empty_app.screen.query_one(".run-detail-verification").render()).plain
+        assert empty == "Verification: no verification evidence."
+
+
+def test_verification_rendering_stays_within_output_limits() -> None:
+    attempt = VerificationAttempt(
+        commit="a" * 40,
+        ordinal=1,
+        command="command\n" * 100_001,
+        ok=True,
+        returncode=0,
+        timed_out=False,
+        duration=0.1,
+        summary="summary",
+        log=None,
+    )
+
+    rendered = RunBrowserApp._render_verification(
+        VerificationDiscovery(
+            attempts=(attempt,),
+            diagnostics=(VerificationDiagnostic("01.log", "authorized log is unavailable"),),
+        )
+    )
+
+    assert len(rendered.encode("utf-8")) <= 256 * 1024
+    assert len(rendered.splitlines()) <= 10_000
+    assert "Verification output truncated: rendered-output limit reached." in rendered
 
 
 @pytest.mark.asyncio
