@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from loop_supervisor.locking import IdentityStatus
 from loop_supervisor.read_model import (
     ActivityLabel,
     LockActivity,
@@ -30,13 +31,14 @@ def _summary(run_id: str = "run-1", *, loadable: bool = True) -> RunSummary:
 def _lock_record(
     tmp_path: Path,
     *,
+    schema_version: int = 1,
     hostname: str | None = None,
     pid: int | None = None,
     run_id: str | None = "run-1",
     integration_path: str | None = None,
 ) -> dict[str, object]:
-    return {
-        "schema_version": 1,
+    record: dict[str, object] = {
+        "schema_version": schema_version,
         "token": TOKEN,
         "pid": os.getpid() if pid is None else pid,
         "hostname": socket.gethostname() if hostname is None else hostname,
@@ -45,6 +47,9 @@ def _lock_record(
         "run_id": run_id,
         "integration_path": str(tmp_path) if integration_path is None else integration_path,
     }
+    if schema_version == 2:
+        record |= {"owner_boot_id": "boot-id", "owner_process_start": "12345"}
+    return record
 
 
 def _write_lock(tmp_path: Path, record: dict[str, object]) -> Path:
@@ -100,21 +105,21 @@ def test_observe_lock_rejects_float_schema_version_on_genuine_v2_record(tmp_path
         ),
         (
             lambda tmp_path: _write_lock(tmp_path, _lock_record(tmp_path, pid=999_999_999)),
-            LockActivity.STALE,
+            LockActivity.LEGACY_UNVERIFIED,
         ),
         (
             lambda tmp_path: _write_lock(
                 tmp_path, _lock_record(tmp_path) | {"integration_path": None}
             ),
-            LockActivity.MISMATCHED,
+            LockActivity.LEGACY_UNVERIFIED,
         ),
         (
             lambda tmp_path: _write_lock(tmp_path, _lock_record(tmp_path, run_id=None)),
-            LockActivity.FRESH_RUN_UNASSOCIATED,
+            LockActivity.LEGACY_UNVERIFIED,
         ),
         (
             lambda tmp_path: _write_lock(tmp_path, _lock_record(tmp_path, run_id="unknown")),
-            LockActivity.UNASSOCIATED,
+            LockActivity.LEGACY_UNVERIFIED,
         ),
     ],
 )
@@ -132,13 +137,17 @@ def test_observe_lock_classifies_non_running_taxonomy(tmp_path, prepare, expecte
     assert "token" not in observation.__dataclass_fields__
 
 
-def test_observe_lock_accepts_live_version_2_lock_without_upgrading_running(tmp_path, monkeypatch):
-    record = _lock_record(tmp_path) | {
-        "schema_version": 2,
-        "owner_boot_id": "boot-id",
-        "owner_process_start": "12345",
-    }
-    _write_lock(tmp_path, record)
+@pytest.mark.parametrize(
+    ("identity_status", "expected_activity"),
+    [
+        (IdentityStatus.STALE, LockActivity.STALE),
+        (IdentityStatus.UNVERIFIABLE, LockActivity.LOCAL_UNVERIFIABLE),
+    ],
+)
+def test_observe_lock_reports_nonmatching_schema_2_identity_without_running(
+    tmp_path, monkeypatch, identity_status, expected_activity
+):
+    _write_lock(tmp_path, _lock_record(tmp_path, schema_version=2))
     import loop_supervisor.read_model.lock_observation as lock_observation
 
     class State:
@@ -146,13 +155,52 @@ def test_observe_lock_accepts_live_version_2_lock_without_upgrading_running(tmp_
         integration_path = str(tmp_path)
 
     monkeypatch.setattr(lock_observation, "load_state", lambda *_: State())
+    monkeypatch.setattr(
+        lock_observation,
+        "classify_local_owner_identity",
+        lambda *_: identity_status,
+        raising=False,
+    )
 
     observation = observe_lock(tmp_path, tmp_path, (_summary(),))
 
-    assert observation.activity is LockActivity.LOCAL_LIVE_ASSOCIATED
+    assert observation.activity is expected_activity
+    assert observation.activities == (
+        RunActivity(run_id="run-1", label=ActivityLabel.NOT_EVIDENCED_RUNNING),
+    )
+    assert TOKEN not in repr(observation)
+
+
+def test_observe_lock_labels_matching_schema_2_identity_as_running(tmp_path, monkeypatch):
+    _write_lock(tmp_path, _lock_record(tmp_path, schema_version=2))
+    import loop_supervisor.read_model.lock_observation as lock_observation
+
+    class State:
+        run_id = "run-1"
+        integration_path = str(tmp_path)
+
+    monkeypatch.setattr(lock_observation, "load_state", lambda *_: State())
+    monkeypatch.setattr(
+        lock_observation, "classify_local_owner_identity", lambda *_: IdentityStatus.MATCHING
+    )
+
+    observation = observe_lock(tmp_path, tmp_path, (_summary(),))
+
+    assert observation.activity is LockActivity.LOCAL_IDENTITY_ASSOCIATED
     assert observation.owner_boot_id == "boot-id"
     assert observation.owner_process_start == "12345"
     assert observation.activities == (RunActivity(run_id="run-1", label=ActivityLabel.RUNNING),)
+
+
+def test_observe_lock_reports_live_schema_1_lock_as_legacy_unverified(tmp_path):
+    _write_lock(tmp_path, _lock_record(tmp_path))
+
+    observation = observe_lock(tmp_path, tmp_path, (_summary(),))
+
+    assert observation.activity is LockActivity.LEGACY_UNVERIFIED
+    assert observation.activities == (
+        RunActivity(run_id="run-1", label=ActivityLabel.NOT_EVIDENCED_RUNNING),
+    )
 
 
 def test_observe_lock_reports_absent_when_verified_directory_has_no_lock_leaf(tmp_path):
@@ -189,11 +237,11 @@ def test_observe_lock_mismatch_precedes_null_or_unknown_run_association(tmp_path
 
     observation = observe_lock(tmp_path, tmp_path, (_summary(),))
 
-    assert observation.activity is LockActivity.MISMATCHED
+    assert observation.activity is LockActivity.LEGACY_UNVERIFIED
 
 
 def test_observe_lock_reports_identity_mismatched_named_run(tmp_path, monkeypatch):
-    _write_lock(tmp_path, _lock_record(tmp_path))
+    _write_lock(tmp_path, _lock_record(tmp_path, schema_version=2))
     import loop_supervisor.read_model.lock_observation as lock_observation
 
     class State:
@@ -201,14 +249,17 @@ def test_observe_lock_reports_identity_mismatched_named_run(tmp_path, monkeypatc
         integration_path = str(tmp_path)
 
     monkeypatch.setattr(lock_observation, "load_state", lambda *_: State())
+    monkeypatch.setattr(
+        lock_observation, "classify_local_owner_identity", lambda *_: IdentityStatus.MATCHING
+    )
 
     observation = observe_lock(tmp_path, tmp_path, (_summary(),))
 
     assert observation.activity is LockActivity.MISMATCHED
 
 
-def test_observe_lock_labels_only_identity_agreeing_named_run_as_running(tmp_path, monkeypatch):
-    _write_lock(tmp_path, _lock_record(tmp_path))
+def test_observe_lock_labels_only_identity_agreeing_schema_2_run_as_running(tmp_path, monkeypatch):
+    _write_lock(tmp_path, _lock_record(tmp_path, schema_version=2))
     import loop_supervisor.read_model.lock_observation as lock_observation
 
     class State:
@@ -216,10 +267,13 @@ def test_observe_lock_labels_only_identity_agreeing_named_run_as_running(tmp_pat
         integration_path = str(tmp_path)
 
     monkeypatch.setattr(lock_observation, "load_state", lambda *_: State())
+    monkeypatch.setattr(
+        lock_observation, "classify_local_owner_identity", lambda *_: IdentityStatus.MATCHING
+    )
 
     observation = observe_lock(tmp_path, tmp_path, (_summary(), _summary("other")))
 
-    assert observation.activity is LockActivity.LOCAL_LIVE_ASSOCIATED
+    assert observation.activity is LockActivity.LOCAL_IDENTITY_ASSOCIATED
     assert observation.activities == (
         RunActivity(run_id="run-1", label=ActivityLabel.RUNNING),
         RunActivity(run_id="other", label=ActivityLabel.NOT_EVIDENCED_RUNNING),

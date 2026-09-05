@@ -19,6 +19,12 @@ from loop_supervisor.read_model.history import (
     HistoryLoad,
     HistoryStatus,
 )
+from loop_supervisor.read_model.lock_observation import (
+    ActivityLabel,
+    LockActivity,
+    LockObservation,
+    RunActivity,
+)
 from loop_supervisor.read_model.verification import (
     VerificationAttempt,
     VerificationDiagnostic,
@@ -264,14 +270,14 @@ async def test_run_browser_displays_evidence_based_activity_and_safe_lock_detail
         rendered_rows = [cast(Any, row.render()).plain for row in app.screen.query(".run-row")]
         associated_row = next(row for row in rendered_rows if row.startswith("associated"))
         other_row = next(row for row in rendered_rows if row.startswith("other"))
-        assert "Activity: running" in associated_row
+        assert "Activity: not evidenced running" in associated_row
         assert "Activity: not evidenced running" in other_row
 
         await pilot.press("enter")
 
         detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
-        assert "Activity: running" in detail
-        assert "Lock observation: local live associated" in detail
+        assert "Activity: not evidenced running" in detail
+        assert "Lock observation: legacy unverified" in detail
         assert "Lock started: 2026-01-03T00:00:00Z" in detail
         assert f"Lock hostname: {socket.gethostname()}" in detail
         assert f"Lock PID: {os.getpid()}" in detail
@@ -289,6 +295,32 @@ async def test_run_browser_displays_evidence_based_activity_and_safe_lock_detail
             "Activity: not evidenced running (inactive at inspection time)" in row
             for row in absent_rows
         )
+
+
+def test_run_browser_renders_legacy_stale_and_unverifiable_lock_categories() -> None:
+    """Repository-level evidence stays explicit while each run remains non-running."""
+    run = RunActivity(run_id="run-1", label=ActivityLabel.NOT_EVIDENCED_RUNNING)
+    for activity, expected in (
+        (LockActivity.LEGACY_UNVERIFIED, "legacy unverified"),
+        (LockActivity.STALE, "stale"),
+        (LockActivity.LOCAL_UNVERIFIABLE, "local unverifiable"),
+    ):
+        lock = LockObservation(
+            activity=activity,
+            activities=(run,),
+            pid=None,
+            hostname=None,
+            owner_boot_id=None,
+            owner_process_start=None,
+            started_at=None,
+            operation=None,
+            run_id=None,
+            integration_path=None,
+            diagnostic=None,
+        )
+
+        assert RunBrowserApp._activity_label("run-1", lock) == "not evidenced running"
+        assert RunBrowserApp._render_lock_observation(lock) == (f"Lock observation: {expected}",)
 
 
 @pytest.mark.asyncio

@@ -120,9 +120,9 @@ def test_build_snapshot_reflects_lock_observation_for_its_discovered_runs(tmp_pa
 
     snapshot = build_snapshot(_project(tmp_path))
 
-    assert snapshot.lock.activity is LockActivity.LOCAL_LIVE_ASSOCIATED
+    assert snapshot.lock.activity is LockActivity.LEGACY_UNVERIFIED
     assert snapshot.lock.activities[0].run_id == snapshot.runs[0].run_id == "active"
-    assert snapshot.lock.activities[0].label == "running"
+    assert snapshot.lock.activities[0].label == "not_evidenced_running"
 
 
 def test_build_snapshot_reports_incomplete_diagnostic_after_10000_candidates(
