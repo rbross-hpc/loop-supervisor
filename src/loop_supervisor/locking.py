@@ -167,10 +167,10 @@ def classify_local_owner_identity(
     current local kernel state, per ADR 0037's identity-chain test.
 
     Compares boot ID and process-start ticks as opaque exact values, never
-    wall-clock time or recency. Shared by both the writer's stale-lock
-    recovery decision and the read-only lock observer's activity
-    classification, so "is this owner demonstrably gone" can never drift
-    between the two.
+    wall-clock time or recency. Currently used only by the writer's
+    stale-lock recovery decision. Read-model activity classification does not
+    yet consume this helper or perform the identity-chain comparison; that
+    sharing is deferred until objective item 9.
     """
     try:
         current_boot_id = _read_boot_id()
@@ -206,7 +206,7 @@ def _guard_path(git_common_dir: Path) -> Path:
 def lock_is_present(git_common_dir: Path) -> bool:
     """True if a lock file exists at all, valid or not, live or stale.
 
-    Deliberately coarser than `SupervisorLock.acquire`'s stale/dead-pid
+    Deliberately coarser than `SupervisorLock.acquire`'s stale-owner
     recovery logic: a caller that only wants to know "is it safe to
     delete run history right now" (e.g. `loop-supervisor runs prune`)
     should refuse whenever *any* lock record is present, rather than
@@ -417,7 +417,7 @@ def _read_lock(path: Path, *, directory_fd: int | None = None) -> dict[str, Any]
     Raises MalformedLockError on any problem: missing/unknown fields,
     wrong types, an unsupported schema version, an invalid operation, an
     invalid run_id, or a non-absolute integration_path. A record that
-    fails this validation is never treated as a recoverable dead-owner
+    fails this validation is never treated as a recoverable stale-owner
     lock (see _inspect_existing_lock) — it always fails closed, exactly
     like invalid JSON or a non-object body already did.
     """
@@ -508,8 +508,11 @@ class SupervisorLock:
     integration_path:
         Absolute path to the integration worktree.
     recover_stale:
-        If True and the lock is held by a demonstrably dead local PID, remove
-        the stale lock and retry. Never auto-recovers remote or malformed locks.
+        If True and the recorded owner is demonstrably stale, remove the stale
+        lock and retry. For schema-2 locks, the recorded owner can be stale
+        while the numeric PID names a live successor after PID reuse or a
+        reboot that reused the PID. Never auto-recovers remote or malformed
+        locks.
     """
 
     def __init__(
@@ -655,7 +658,10 @@ class SupervisorLock:
         """Inspect the existing lock and decide what to do.
 
         Returns None if the lock disappeared (retry), or a LockError
-        if acquisition should fail.
+        if acquisition should fail. For schema-2 records, stale means the
+        recorded owner no longer matches the current kernel identity; its
+        numeric PID can therefore name a live successor after PID reuse or a
+        reboot that reused the PID. Schema-1 records retain PID-only checks.
 
         Uses os.path.lexists rather than Path.exists: the latter follows
         symlinks and reports False for a dangling symlink at the lock
@@ -708,13 +714,14 @@ class SupervisorLock:
             return LockError(
                 f"lock is held by local process {holder_pid} "
                 f"(started {started_at}, operation={operation!r}); "
-                "pass --recover-stale-lock only for demonstrably dead processes"
+                "pass --recover-stale-lock only for a demonstrably stale recorded owner"
             )
 
         if not self._recover_stale:
             return StaleLockError(
-                f"stale lock from dead process {holder_pid} "
+                f"stale lock whose recorded owner was process {holder_pid} "
                 f"(started {started_at}, operation={operation!r}); "
+                "the PID may now name a live successor after PID reuse or a reboot that reused it; "
                 "pass --recover-stale-lock to remove it and retry"
             )
 
@@ -734,16 +741,17 @@ class SupervisorLock:
 
     @staticmethod
     def _is_holder_stale(data: dict[str, Any], holder_pid: int) -> bool | None:
-        """Decide whether ``data``'s recorded owner is demonstrably dead.
+        """Decide whether ``data``'s recorded owner is demonstrably stale.
 
-        Returns True (stale), False (still alive), or None (unverifiable
-        -- never treated as proof of either). Schema-1 records retain the
-        original PID-only liveness check for backward compatibility, since
-        they carry no immutable owner identity to compare. Schema-2
-        records use the full identity chain (ADR 0037): a live PID whose
-        boot ID or process-start ticks no longer match the recorded owner
-        (including PID reuse) is stale, not live, even though
-        ``os.kill(pid, 0)`` would otherwise succeed.
+        Returns True (stale), False (the recorded owner still matches), or
+        None (unverifiable -- never treated as proof of either). Schema-1
+        records retain the original PID-only liveness check for backward
+        compatibility, since they carry no immutable owner identity to
+        compare. Schema-2 records use the full identity chain (ADR 0037): a
+        live PID whose boot ID or process-start ticks no longer match the
+        recorded owner (including PID reuse or a reboot that reused the PID)
+        is stale, not live, even though ``os.kill(pid, 0)`` would otherwise
+        succeed.
         """
         if data.get("schema_version") != _SCHEMA_VERSION:
             return not _pid_is_alive(holder_pid)

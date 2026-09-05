@@ -185,7 +185,7 @@ def test_hard_crash_leaves_group_and_requires_explicit_stale_lock_recovery(
             timeout=15,
         )
         assert rejected.returncode == 1
-        assert "stale lock from dead process" in rejected.stderr.lower()
+        assert "stale lock whose recorded owner was process" in rejected.stderr.lower()
         assert json.loads(lock_path.read_text()) == stale_record
 
         os.killpg(process_group, signal.SIGKILL)
