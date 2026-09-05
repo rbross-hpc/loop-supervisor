@@ -88,7 +88,7 @@ def _load_summary(git_common_dir: Path, run_id: str) -> RunSummary:
             phase=None,
             created_at=None,
             updated_at=None,
-            diagnostic=f"Run snapshot {run_id!r} is unloadable: {exc}",
+            diagnostic=_safe_diagnostic(exc),
         )
     return RunSummary(
         run_id=state.run_id,
@@ -98,6 +98,28 @@ def _load_summary(git_common_dir: Path, run_id: str) -> RunSummary:
         updated_at=state.updated_at,
         diagnostic=None,
     )
+
+
+def _safe_diagnostic(error: Exception) -> str:
+    """Map authoritative reader failures to fixed, safe run-row text."""
+    reason = str(error).lower()
+    if "symbolic link" in reason:
+        detail = "the snapshot is a symbolic link"
+    elif "not a regular file" in reason:
+        detail = "the snapshot is not a regular file"
+    elif "oversized" in reason or "limit" in reason:
+        detail = "the snapshot exceeds supported input limits"
+    elif "schema_version" in reason or "schema version" in reason:
+        detail = "the snapshot uses an unsupported schema"
+    elif "mismatched identity" in reason:
+        detail = "the snapshot identity does not match its requested run"
+    elif "no such file" in reason or "filenotfounderror" in reason:
+        detail = "the snapshot is unavailable"
+    elif "malformed" in reason or "json" in reason or "does not contain" in reason:
+        detail = "the snapshot is malformed"
+    else:
+        detail = "the snapshot could not be validated"
+    return f"Run row is unloadable because {detail}."
 
 
 def _sort_summaries(summaries: list[RunSummary]) -> list[RunSummary]:
