@@ -341,8 +341,16 @@ def _read_lock(path: Path, *, directory_fd: int | None = None) -> dict[str, Any]
     return _validate_lock_record(data)
 
 
-def _write_lock_file(path: Path, record: dict[str, Any], *, directory_fd: int) -> None:
-    """Atomically write the lock record, enforcing mode 0600."""
+def _write_lock_file(
+    path: Path, record: dict[str, Any], *, directory_fd: int, replace: bool = False
+) -> None:
+    """Atomically create or replace a mode-0600 lock record.
+
+    Creation uses link(2)'s create-if-absent behavior. A guarded owner update
+    uses rename replacement instead, so readers see either the complete old
+    record or the complete new record, never an unlinked interval or partial
+    JSON file.
+    """
     tmp_name = f".tmp-lock-{uuid.uuid4().hex}.json"
     fd = _open_no_follow(
         Path(tmp_name), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=directory_fd
@@ -355,13 +363,16 @@ def _write_lock_file(path: Path, record: dict[str, Any], *, directory_fd: int) -
         with handle:
             json.dump(record, handle, indent=2)
             handle.write("\n")
-        os.link(
-            tmp_name,
-            path.name,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-            follow_symlinks=False,
-        )
+        if replace:
+            os.replace(tmp_name, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        else:
+            os.link(
+                tmp_name,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
     finally:
         try:
             if fd_owned:
@@ -411,6 +422,8 @@ class SupervisorLock:
         self._integration_path = integration_path
         self._recover_stale = recover_stale
         self._token: str | None = None
+        self._owner_boot_id: str | None = None
+        self._owner_process_start: str | None = None
 
     def __enter__(self) -> SupervisorLock:
         self.acquire()
@@ -463,6 +476,8 @@ class SupervisorLock:
                     try:
                         _write_lock_file(self._path, record, directory_fd=directory_fd)
                         self._token = token
+                        self._owner_boot_id = owner_boot_id
+                        self._owner_process_start = owner_process_start
                         return
                     except FileExistsError:
                         pass
@@ -479,6 +494,57 @@ class SupervisorLock:
         except OSError as exc:
             self._token = None
             raise LockError(f"cannot acquire lock {self._path}: {exc}") from exc
+
+    def bind_run_id(self, run_id: str) -> None:
+        """Bind a newly created run to this lock's existing ownership record.
+
+        The binding is deliberately narrow: under the guard, the current
+        record must still name this exact token and immutable kernel identity,
+        and may only change from a null run ID to ``run_id``. Repeating the
+        same binding is harmless; replacing a different bound ID fails closed.
+        """
+        if self._token is None:
+            raise LockError("cannot bind run ID: this lock is not acquired")
+        try:
+            validate_run_id(run_id)
+        except Exception as exc:
+            raise LockError(f"cannot bind invalid run ID {run_id!r}: {exc}") from exc
+
+        token = self._token
+        try:
+            with _guarded(self._path.parent.parent) as directory_fd:
+                try:
+                    record = _read_lock(self._path, directory_fd=directory_fd)
+                except FileNotFoundError as exc:
+                    raise LockError("cannot bind run ID: lock record is absent") from exc
+                except MalformedLockError as exc:
+                    raise LockError(f"cannot bind run ID: lock record is malformed: {exc}") from exc
+
+                if record["token"] != token:
+                    raise LockError("cannot bind run ID: ownership token no longer matches")
+                if (
+                    record.get("owner_boot_id") != self._owner_boot_id
+                    or record.get("owner_process_start") != self._owner_process_start
+                ):
+                    raise LockError(
+                        "cannot bind run ID: immutable owner identity no longer matches"
+                    )
+
+                existing_run_id = record["run_id"]
+                if existing_run_id == run_id:
+                    return
+                if existing_run_id is not None:
+                    raise LockError(
+                        f"cannot bind run ID: lock is already bound to {existing_run_id!r}"
+                    )
+
+                replacement = dict(record)
+                replacement["run_id"] = run_id
+                _write_lock_file(self._path, replacement, directory_fd=directory_fd, replace=True)
+        except LockError:
+            raise
+        except OSError as exc:
+            raise LockError(f"cannot bind run ID into lock {self._path}: {exc}") from exc
 
     def _inspect_existing_lock(self, *, directory_fd: int) -> LockError | None:
         """Inspect the existing lock and decide what to do.

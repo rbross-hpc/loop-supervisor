@@ -950,3 +950,72 @@ def test_release_clears_token_on_ownership_loss(tmp_path):
     assert lock._token is None
     assert _lock_path(tmp_path).exists()
     _lock_path(tmp_path).unlink()
+
+
+# -- guarded run-ID binding ----------------------------------------------------
+
+
+def test_bind_run_id_replaces_null_record_atomically_at_mode_0600(tmp_path):
+    lock = _make_lock(tmp_path)
+    lock.acquire()
+    try:
+        lock.bind_run_id("new-run")
+        record = json.loads(_lock_path(tmp_path).read_text())
+        assert record["run_id"] == "new-run"
+        assert _lock_path(tmp_path).stat().st_mode & 0o777 == 0o600
+    finally:
+        lock.release()
+
+
+def test_bind_run_id_is_idempotent_for_the_same_run_id(tmp_path):
+    lock = _make_lock(tmp_path)
+    lock.acquire()
+    try:
+        lock.bind_run_id("new-run")
+        lock.bind_run_id("new-run")
+        assert json.loads(_lock_path(tmp_path).read_text())["run_id"] == "new-run"
+    finally:
+        lock.release()
+
+
+def test_bind_run_id_rejects_mismatched_ownership_token(tmp_path):
+    lock = _make_lock(tmp_path)
+    lock.acquire()
+    record = json.loads(_lock_path(tmp_path).read_text())
+    record["token"] = "different-owner"
+    _write_raw_lock(tmp_path, record)
+
+    with pytest.raises(LockError, match="ownership token"):
+        lock.bind_run_id("new-run")
+
+    assert json.loads(_lock_path(tmp_path).read_text())["run_id"] is None
+    lock.release()
+    _lock_path(tmp_path).unlink()
+
+
+def test_bind_run_id_rejects_differing_existing_run_id(tmp_path):
+    lock = _make_lock(tmp_path)
+    lock.acquire()
+    try:
+        lock.bind_run_id("first-run")
+        with pytest.raises(LockError, match="already bound"):
+            lock.bind_run_id("different-run")
+        assert json.loads(_lock_path(tmp_path).read_text())["run_id"] == "first-run"
+    finally:
+        lock.release()
+
+
+def test_bind_run_id_fails_closed_on_owner_identity_mismatch(tmp_path):
+    lock = _make_lock(tmp_path)
+    lock.acquire()
+    try:
+        record = json.loads(_lock_path(tmp_path).read_text())
+        record["owner_boot_id"] = "different-boot-id"
+        _write_raw_lock(tmp_path, record)
+
+        with pytest.raises(LockError, match="owner identity"):
+            lock.bind_run_id("new-run")
+
+        assert json.loads(_lock_path(tmp_path).read_text())["run_id"] is None
+    finally:
+        lock.release()

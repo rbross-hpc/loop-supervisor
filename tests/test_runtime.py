@@ -227,6 +227,30 @@ def test_run_new_server_starts_after_state_creation(tmp_path):
     assert call_log.index("start_new_run") < call_log.index("server_start")
 
 
+def test_run_new_binding_failure_aborts_before_server_start_and_releases_lock(
+    tmp_path, monkeypatch
+):
+    """A failed post-persistence binding must not permit OpenCode startup and
+    must take __enter__'s normal releasable-lock cleanup path."""
+    from loop_supervisor.locking import LockError, SupervisorLock, _lock_path
+
+    repo = _init_repo(tmp_path / "repo")
+    call_log: list[str] = []
+
+    def _binding_fails(self, run_id: str) -> None:
+        raise LockError("simulated run binding failure")
+
+    monkeypatch.setattr(SupervisorLock, "bind_run_id", _binding_fails, raising=False)
+
+    with _patch_runtime(repo, call_log=call_log):
+        with pytest.raises(LockError, match="simulated run binding failure"):
+            run_new(tmp_path / "repo", _make_options())
+
+    assert "start_new_run" in call_log
+    assert "server_start" not in call_log
+    assert not _lock_path(repo.common_dir()).exists()
+
+
 def test_run_new_server_stops_before_lock_release(tmp_path):
     repo = _init_repo(tmp_path / "repo")
     call_log: list[str] = []
@@ -4836,8 +4860,8 @@ def test_run_session_resume_lock_operation_is_resume(tmp_path):
 
 def test_run_session_new_run_operation_override_labels_lock_with_override(tmp_path):
     """A new run with an explicit operation= override writes that value
-    to the lock record, and run_id stays None -- proving the override is
-    independent of run_kind."""
+    and binds its validated run ID, proving the override remains independent
+    of run_kind."""
     import json
 
     import loop_supervisor.runtime as rt
@@ -4849,7 +4873,7 @@ def test_run_session_new_run_operation_override_labels_lock_with_override(tmp_pa
         with session:
             record = json.loads(_lock_path(repo.common_dir()).read_text())
             assert record["operation"] == "tui"
-            assert record["run_id"] is None
+            assert record["run_id"] == "fake-run"
 
 
 def test_run_session_resume_operation_override_labels_lock_with_override(tmp_path):
