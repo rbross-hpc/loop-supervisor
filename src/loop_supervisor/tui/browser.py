@@ -8,12 +8,16 @@ from textual.widgets import Footer, Header, ListItem, ListView, Static
 
 from ..read_model.current_run import CurrentRun, load_current_run
 from ..read_model.discovery import RunSummary
-from ..read_model.history import HistoryLoad, HistoryStatus, load_history
+from ..read_model.history import HistoryEntry, HistoryLoad, HistoryStatus, load_history
 from ..read_model.snapshot import ProjectSnapshot
 
 
 class RunBrowserApp(App[None]):
     """Browse one immutable project snapshot and inspect authoritative run details."""
+
+    _MAX_TIMELINE_RENDERED_BYTES = 256 * 1024
+    _MAX_TIMELINE_RENDERED_LINES = 10_000
+    _TIMELINE_TRUNCATION_MARKER = "Timeline output truncated: rendered-output limit reached."
 
     TITLE = "Loop Supervisor"
     SUB_TITLE = "Run browser"
@@ -109,39 +113,73 @@ class RunBrowserApp(App[None]):
             f"updated {summary.updated_at or 'unavailable'}"
         )
 
-    @staticmethod
-    def _render_history(history: HistoryLoad) -> str:
-        """Render best-effort workflow evidence without inferring missing transitions."""
+    @classmethod
+    def _render_history(cls, history: HistoryLoad) -> str:
+        """Render bounded best-effort workflow evidence without inferring transitions."""
         if history.completeness is HistoryStatus.ABSENT:
             return "Workflow timeline: unavailable (no recorded history)."
 
-        lines = [f"Workflow timeline: {history.completeness.value}"]
-        for entry in history.entries:
-            counters = entry.counters
-            lines.extend(
-                (
-                    f"Sequence {entry.seq}",
-                    f"  Phase: {entry.phase} → {entry.phase_after}",
-                    f"  Outcome: {entry.status.value}",
-                    f"  Recorded: {entry.recorded_at}",
-                    "  Counters: "
-                    f"accepted tasks={counters['accepted_task_count']}, "
-                    f"revisions={counters['revision_count']}, "
-                    f"replans={counters['replan_count']}, "
-                    f"architect retries={counters['architect_retry_count']}, "
-                    f"builder guidance={counters['builder_guidance_count']}",
-                    "  Result: "
-                    f"{'available' if entry.has_result else 'unavailable'}; "
-                    f"Error: {'available' if entry.has_error else 'unavailable'}",
-                )
-            )
-        if history.diagnostics:
-            lines.append("Timeline diagnostics:")
-            lines.extend(
-                f"  {diagnostic.artifact}: {diagnostic.reason}"
-                for diagnostic in history.diagnostics
-            )
-        return "\n".join(lines)
+        status_line = f"Workflow timeline: {history.completeness.value}"
+        diagnostic_lines = [
+            f"  {diagnostic.artifact}: {diagnostic.reason}" for diagnostic in history.diagnostics
+        ]
+        entry_lines = [
+            line for entry in history.entries for line in cls._render_history_entry(entry)
+        ]
+        evidence_lines = [
+            *(["Timeline diagnostics:", *diagnostic_lines] if diagnostic_lines else []),
+            *entry_lines,
+        ]
+        return cls._bound_history_lines(status_line, evidence_lines)
+
+    @staticmethod
+    def _render_history_entry(entry: HistoryEntry) -> tuple[str, ...]:
+        """Render one validated history entry as literal timeline lines."""
+        counters = entry.counters
+        return (
+            f"Sequence {entry.seq}",
+            f"  Phase: {entry.phase} → {entry.phase_after}",
+            f"  Outcome: {entry.status.value}",
+            f"  Recorded: {entry.recorded_at}",
+            "  Counters: "
+            f"accepted tasks={counters['accepted_task_count']}, "
+            f"revisions={counters['revision_count']}, "
+            f"replans={counters['replan_count']}, "
+            f"architect retries={counters['architect_retry_count']}, "
+            f"builder guidance={counters['builder_guidance_count']}",
+            "  Result: "
+            f"{'available' if entry.has_result else 'unavailable'}; "
+            f"Error: {'available' if entry.has_error else 'unavailable'}",
+        )
+
+    @classmethod
+    def _bound_history_lines(cls, status_line: str, evidence_lines: list[str]) -> str:
+        """Limit timeline output while retaining the status and bounded evidence."""
+        complete_lines = [status_line, *evidence_lines]
+        if cls._within_history_limits(complete_lines):
+            return "\n".join(complete_lines)
+
+        marker = cls._TIMELINE_TRUNCATION_MARKER
+        available_lines = cls._MAX_TIMELINE_RENDERED_LINES - 2
+        available_bytes = cls._MAX_TIMELINE_RENDERED_BYTES - sum(
+            len(line.encode("utf-8")) + 1 for line in (status_line, marker)
+        )
+        rendered_evidence: list[str] = []
+        for line in evidence_lines:
+            line_bytes = len(line.encode("utf-8")) + 1
+            if len(rendered_evidence) == available_lines or line_bytes > available_bytes:
+                break
+            rendered_evidence.append(line)
+            available_bytes -= line_bytes
+        return "\n".join((status_line, *rendered_evidence, marker))
+
+    @classmethod
+    def _within_history_limits(cls, lines: list[str]) -> bool:
+        """Return whether rendered literal lines fit the ADR display limits."""
+        return len(lines) <= cls._MAX_TIMELINE_RENDERED_LINES and (
+            sum(len(line.encode("utf-8")) for line in lines) + len(lines) - 1
+            <= cls._MAX_TIMELINE_RENDERED_BYTES
+        )
 
     @staticmethod
     def _render_current_run(current: CurrentRun) -> str:

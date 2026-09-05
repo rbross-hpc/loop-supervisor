@@ -9,7 +9,14 @@ from typing import Any, cast
 import pytest
 
 from loop_supervisor.read_model import ProjectResolution, build_snapshot
+from loop_supervisor.read_model.history import (
+    HistoryDiagnostic,
+    HistoryEntry,
+    HistoryLoad,
+    HistoryStatus,
+)
 from loop_supervisor.state import STATE_SCHEMA_VERSION, RunOptions, RunState, save_state
+from loop_supervisor.supervisor import AdvanceStatus
 from loop_supervisor.tui import RunBrowserApp
 
 
@@ -232,6 +239,40 @@ async def test_run_detail_renders_ordered_incomplete_history_timeline(tmp_path: 
         assert "Result: unavailable; Error: available" in timeline
         assert "Workflow timeline: incomplete" in timeline
         assert "0002-planning.json: malformed history record" in timeline
+
+
+def test_timeline_rendering_reserves_incomplete_diagnostic_within_output_limits() -> None:
+    entry = HistoryEntry(
+        seq=1,
+        phase="planning",
+        phase_after="creating_worktree",
+        status=AdvanceStatus.ADVANCED,
+        recorded_at="2026-01-03T00:00:00+00:00",
+        counters={
+            "accepted_task_count": 2,
+            "revision_count": 1,
+            "replan_count": 0,
+            "architect_retry_count": 0,
+            "builder_guidance_count": 0,
+        },
+        original_task_id=None,
+        has_result=True,
+        has_error=False,
+    )
+    history = HistoryLoad(
+        entries=(entry,) * 10_000,
+        completeness=HistoryStatus.INCOMPLETE,
+        diagnostics=(HistoryDiagnostic("0002-planning.json", "malformed history record", 2),),
+    )
+
+    timeline = RunBrowserApp._render_history(history)
+
+    assert len(timeline.encode("utf-8")) <= 256 * 1024
+    assert len(timeline.splitlines()) <= 10_000
+    assert "Timeline output truncated: rendered-output limit reached." in timeline
+    assert "Workflow timeline: incomplete" in timeline
+    assert "Timeline diagnostics:" in timeline
+    assert "0002-planning.json: malformed history record" in timeline
 
 
 @pytest.mark.asyncio
