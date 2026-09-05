@@ -66,7 +66,7 @@ def _persist_run(git_common_dir: Path, run_id: str, *, updated_at: str) -> None:
     state_path.write_text(json.dumps(state))
 
 
-def _persist_lock(git_common_dir: Path, *, run_id: str | None) -> None:
+def _persist_lock(git_common_dir: Path, *, run_id: str | None, hostname: str | None = None) -> None:
     directory = git_common_dir / "loop-supervisor"
     directory.mkdir(exist_ok=True)
     (directory / "supervisor.lock").write_text(
@@ -75,7 +75,7 @@ def _persist_lock(git_common_dir: Path, *, run_id: str | None) -> None:
                 "schema_version": 1,
                 "token": "browser-test-ownership-token",
                 "pid": os.getpid(),
-                "hostname": socket.gethostname(),
+                "hostname": hostname or socket.gethostname(),
                 "started_at": "2026-01-03T00:00:00Z",
                 "operation": "run",
                 "run_id": run_id,
@@ -210,6 +210,24 @@ async def test_run_browser_displays_evidence_based_activity_and_safe_lock_detail
             "Activity: not evidenced running (inactive at inspection time)" in row
             for row in absent_rows
         )
+
+
+@pytest.mark.asyncio
+async def test_run_detail_bounds_oversized_multiline_lock_metadata(tmp_path: Path) -> None:
+    _persist_run(tmp_path, "selected", updated_at="2026-01-02T00:00:00+00:00")
+    _persist_lock(tmp_path, run_id="selected", hostname=("host\n" * 100_001))
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+
+        detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert len(detail.encode("utf-8")) <= 256 * 1024
+        assert len(detail.splitlines()) <= 10_000
+        assert "Summary output truncated: rendered-output limit reached." in detail
+        assert "Activity: not evidenced running" in detail
+        assert "Lock observation: remote" in detail
 
 
 @pytest.mark.asyncio

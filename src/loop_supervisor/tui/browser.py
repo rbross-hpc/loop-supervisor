@@ -19,6 +19,9 @@ class RunBrowserApp(App[None]):
     _MAX_TIMELINE_RENDERED_BYTES = 256 * 1024
     _MAX_TIMELINE_RENDERED_LINES = 10_000
     _TIMELINE_TRUNCATION_MARKER = "Timeline output truncated: rendered-output limit reached."
+    _MAX_SUMMARY_RENDERED_BYTES = 256 * 1024
+    _MAX_SUMMARY_RENDERED_LINES = 10_000
+    _SUMMARY_TRUNCATION_MARKER = "Summary output truncated: rendered-output limit reached."
 
     TITLE = "Loop Supervisor"
     SUB_TITLE = "Run browser"
@@ -233,26 +236,30 @@ class RunBrowserApp(App[None]):
             <= cls._MAX_TIMELINE_RENDERED_BYTES
         )
 
-    @staticmethod
-    def _render_current_run(current: CurrentRun, lock: LockObservation) -> str:
-        """Render validated state separately from safe, evidence-based lock information."""
-        activity = RunBrowserApp._activity_label(current.run_id, lock)
+    @classmethod
+    def _render_current_run(cls, current: CurrentRun, lock: LockObservation) -> str:
+        """Render bounded state and evidence while retaining its essential classification."""
+        activity = cls._activity_label(current.run_id, lock)
+        classification_lines = [
+            f"Run ID: {current.run_id}",
+            f"Activity: {activity}",
+            f"Lock observation: {lock.activity.value.replace('_', ' ')}",
+        ]
+        lock_lines = cls._render_lock_observation(lock)[1:]
         if not current.loadable:
-            return "\n".join(
-                (
-                    f"Run ID: {current.run_id}",
+            return cls._bound_summary_lines(
+                [
+                    *classification_lines,
                     "Details: unavailable",
-                    f"Activity: {activity}",
-                    *RunBrowserApp._render_lock_observation(lock),
+                    *lock_lines,
                     current.diagnostic or "Unavailable.",
-                )
+                ]
             )
-        return "\n".join(
-            (
-                f"Run ID: {current.run_id}",
+        return cls._bound_summary_lines(
+            [
+                *classification_lines,
+                *lock_lines,
                 f"Durable phase: {current.phase}",
-                f"Activity: {activity}",
-                *RunBrowserApp._render_lock_observation(lock),
                 f"Created: {current.created_at}",
                 f"Updated: {current.updated_at}",
                 f"Integration branch: {current.integration_branch}",
@@ -265,5 +272,34 @@ class RunBrowserApp(App[None]):
                 f"  Builder guidance: {current.builder_guidance_count}",
                 f"Pending question: {current.pending_question or 'unavailable'}",
                 f"Latest operational error: {current.latest_operational_error or 'unavailable'}",
-            )
+            ]
+        )
+
+    @classmethod
+    def _bound_summary_lines(cls, lines: list[str]) -> str:
+        """Bound summary output while preserving its activity and lock classification."""
+        rendered = "\n".join(lines)
+        if cls._within_summary_limits(rendered):
+            return rendered
+
+        marker = cls._SUMMARY_TRUNCATION_MARKER
+        classification_lines = lines[:3]
+        reserved = "\n".join((*classification_lines, marker))
+        available_bytes = cls._MAX_SUMMARY_RENDERED_BYTES - len(reserved.encode("utf-8"))
+        available_lines = cls._MAX_SUMMARY_RENDERED_LINES - len(classification_lines) - 1
+        rendered_evidence: list[str] = []
+        for line in "\n".join(lines[3:]).splitlines():
+            line_bytes = len(line.encode("utf-8")) + 1
+            if len(rendered_evidence) == available_lines or line_bytes > available_bytes:
+                break
+            rendered_evidence.append(line)
+            available_bytes -= line_bytes
+        return "\n".join((*classification_lines, *rendered_evidence, marker))
+
+    @classmethod
+    def _within_summary_limits(cls, rendered: str) -> bool:
+        """Return whether literal summary text fits the ADR display limits."""
+        return (
+            len(rendered.encode("utf-8")) <= cls._MAX_SUMMARY_RENDERED_BYTES
+            and len(rendered.splitlines()) <= cls._MAX_SUMMARY_RENDERED_LINES
         )
