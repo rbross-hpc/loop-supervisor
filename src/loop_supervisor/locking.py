@@ -167,10 +167,9 @@ def classify_local_owner_identity(
     current local kernel state, per ADR 0037's identity-chain test.
 
     Compares boot ID and process-start ticks as opaque exact values, never
-    wall-clock time or recency. Currently used only by the writer's
-    stale-lock recovery decision. Read-model activity classification does not
-    yet consume this helper or perform the identity-chain comparison; that
-    sharing is deferred until objective item 9.
+    wall-clock time or recency. Used by stale-lock recovery and the read
+    model's activity classification so both apply ADR 0037's identity-chain
+    test consistently.
     """
     try:
         current_boot_id = _read_boot_id()

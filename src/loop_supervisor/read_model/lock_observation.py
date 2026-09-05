@@ -13,7 +13,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from ..locking import _pid_is_alive
+from ..locking import IdentityStatus, classify_local_owner_identity
 from ..state import StateError, load_state, validate_run_id
 from .discovery import RunSummary
 from .json_reader import BoundedJsonError, read_bounded_json
@@ -29,7 +29,9 @@ class LockActivity(StrEnum):
     MISMATCHED = "mismatched"
     FRESH_RUN_UNASSOCIATED = "fresh_run_unassociated"
     UNASSOCIATED = "unassociated"
-    LOCAL_LIVE_ASSOCIATED = "local_live_associated"
+    LEGACY_UNVERIFIED = "legacy_unverified"
+    LOCAL_UNVERIFIABLE = "local_unverifiable"
+    LOCAL_IDENTITY_ASSOCIATED = "local_identity_associated"
 
 
 class ActivityLabel(StrEnum):
@@ -109,8 +111,18 @@ def observe_lock(
     assert isinstance(pid, int)
     if hostname != socket.gethostname():
         return _observation(LockActivity.REMOTE, run_list, record)
-    if not _pid_is_alive(pid):
+    if record["schema_version"] == 1:
+        return _observation(LockActivity.LEGACY_UNVERIFIED, run_list, record)
+
+    owner_boot_id = record["owner_boot_id"]
+    owner_process_start = record["owner_process_start"]
+    assert isinstance(owner_boot_id, str)
+    assert isinstance(owner_process_start, str)
+    identity_status = classify_local_owner_identity(pid, owner_boot_id, owner_process_start)
+    if identity_status is IdentityStatus.STALE:
         return _observation(LockActivity.STALE, run_list, record)
+    if identity_status is IdentityStatus.UNVERIFIABLE:
+        return _observation(LockActivity.LOCAL_UNVERIFIABLE, run_list, record)
 
     lock_path = record["integration_path"]
     if lock_path is None:
@@ -137,7 +149,7 @@ def observe_lock(
         return _observation(LockActivity.UNASSOCIATED, run_list, record)
     if state.run_id != run_id or state_path != selected_path:
         return _observation(LockActivity.MISMATCHED, run_list, record)
-    return _observation(LockActivity.LOCAL_LIVE_ASSOCIATED, run_list, record, running_id=run_id)
+    return _observation(LockActivity.LOCAL_IDENTITY_ASSOCIATED, run_list, record, running_id=run_id)
 
 
 class LockObservationError(RuntimeError):
@@ -265,7 +277,7 @@ def _observation(
             RunActivity(
                 run_id=run.run_id,
                 label=ActivityLabel.RUNNING
-                if activity is LockActivity.LOCAL_LIVE_ASSOCIATED and run.run_id == running_id
+                if activity is LockActivity.LOCAL_IDENTITY_ASSOCIATED and run.run_id == running_id
                 else ActivityLabel.NOT_EVIDENCED_RUNNING,
             )
             for run in runs
