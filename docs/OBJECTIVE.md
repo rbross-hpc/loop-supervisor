@@ -280,6 +280,54 @@ mypy/pytest gates, as all prior priorities.
     parity test coverage for it in `tests/test_cli_init.py` (currently
     disabled pending this sync; see the comment marking why).
 
+## Deferred work (not yet scheduled)
+
+Priorities 16 through 25 above are the current active work. The following
+is captured so it is not lost, but it is deliberately **not** part of
+"Ordered priorities" yet: the planner must not select it, and it is not
+part of this objective's completion criteria, until a human promotes it
+into "Ordered priorities" by editing this document.
+
+This item exists because the audit that produced items 16-25 was itself
+lost between planner invocations: a builder commit message deferred the
+newest-history/current-`RunState` comparison (item 21) to "a follow-on
+slice," the auditor accepted that framing, and the planner then reported
+the objective COMPLETE without the deferred slice ever being scheduled,
+because the deferral existed only in commit prose the planner never reads
+and has no instruction to look for.
+
+26. Give the planner a narrow, mechanical way to carry a just-completed
+    task's stated rationale into its next invocation, and require it to
+    check that rationale for a named, still-unresolved deferral before
+    considering the objective complete. Two independently mergeable
+    slices:
+    - Add an optional `last_completed_task` field to `RunState`
+      (`task_id`, `objective`, `rationale`; `None` by default, no schema
+      version bump), populated by `_finish_task_cleanup` immediately
+      before it clears `planner_result`, and included by
+      `_build_planner_prompt` on the next planning invocation whenever it
+      is set. This carries forward exactly one task's worth of context
+      across an accepted-task boundary; it does not need to persist
+      beyond that.
+    - Update the planner agent prompt
+      (`.opencode/agents/loop-planner.md`) to: (a) treat a carried-forward
+      rationale that names a deliberately deferred portion as a lead to
+      verify against the current repository state, not as proof, and
+      select that portion first if it is still genuinely absent; (b)
+      require, before returning status COMPLETE, that each bullet of this
+      document's "Completion criteria" be checked against the repository
+      rather than inferred from memory of prior invocations, returning
+      READY for the smallest slice closing any bullet found unmet; and
+      (c) require that a deliberately deferred portion be named in the
+      returned `rationale` field, not only in a worktree commit message,
+      since only `rationale` is ever visible to a future invocation.
+    Note the field above carries context for exactly one task boundary.
+    A deferral that survives more than one accepted task between when it
+    is named and when it is next picked up will not be caught by this
+    mechanism; closing that gap, if it proves necessary in practice, is
+    intentionally left for a later decision rather than solved
+    speculatively here.
+
 ## Completion criteria
 
 The objective is complete when:
