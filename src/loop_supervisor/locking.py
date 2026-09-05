@@ -52,11 +52,11 @@ class MalformedLockError(LockError):
     """Raised when the lock file exists but cannot be parsed."""
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 # "tui" is retained for back-compat with lock records written by the
 # now-retired in-process TUI; nothing currently writes it.
 _VALID_OPERATIONS = frozenset({"run", "resume", "tui"})
-_LOCK_RECORD_FIELDS = frozenset(
+_LEGACY_LOCK_RECORD_FIELDS = frozenset(
     {
         "schema_version",
         "token",
@@ -68,6 +68,30 @@ _LOCK_RECORD_FIELDS = frozenset(
         "integration_path",
     }
 )
+_LOCK_RECORD_FIELDS = _LEGACY_LOCK_RECORD_FIELDS | frozenset(
+    {"owner_boot_id", "owner_process_start"}
+)
+
+
+def _read_kernel_owner_identity(pid: int) -> tuple[str, str]:
+    """Read Linux's stable boot and process-start identifiers for ``pid``.
+
+    Values are deliberately opaque strings: callers compare them exactly and
+    never turn the process-start ticks into a wall-clock timestamp.
+    """
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+        _, separator, remainder = stat_text.rpartition(")")
+        fields = remainder.split()
+        process_start = fields[19]
+    except (IndexError, OSError) as exc:
+        raise LockError(f"cannot read kernel owner identity for PID {pid}: {exc}") from exc
+    if not separator or not boot_id or not process_start:
+        raise LockError(f"cannot read kernel owner identity for PID {pid}")
+    return boot_id, process_start
+
+
 # Matches time.strftime("%Y-%m-%dT%H:%M:%SZ", ...): a fixed-width UTC
 # timestamp, deliberately not full ISO-8601 parsing since this is the
 # exact (and only) format acquire() ever writes.
@@ -218,18 +242,28 @@ def _validate_lock_record(data: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise MalformedLockError("lock record must be a JSON object")
 
-    unknown = set(data) - _LOCK_RECORD_FIELDS
+    schema_version = data.get("schema_version")
+    if schema_version == 1:
+        expected_fields = _LEGACY_LOCK_RECORD_FIELDS
+    elif schema_version == _SCHEMA_VERSION:
+        expected_fields = _LOCK_RECORD_FIELDS
+    else:
+        raise MalformedLockError(
+            "lock record has unsupported schema_version "
+            f"{schema_version!r} (expected 1 or {_SCHEMA_VERSION})"
+        )
+    unknown = set(data) - expected_fields
     if unknown:
         raise MalformedLockError(f"lock record contains unknown fields: {sorted(unknown)}")
-    missing = _LOCK_RECORD_FIELDS - set(data)
+    missing = expected_fields - set(data)
     if missing:
         raise MalformedLockError(f"lock record is missing required fields: {sorted(missing)}")
 
-    if data.get("schema_version") != _SCHEMA_VERSION:
-        raise MalformedLockError(
-            f"lock record has unsupported schema_version {data.get('schema_version')!r} "
-            f"(expected {_SCHEMA_VERSION})"
-        )
+    if schema_version == _SCHEMA_VERSION:
+        for field in ("owner_boot_id", "owner_process_start"):
+            value = data.get(field)
+            if not isinstance(value, str) or not value:
+                raise MalformedLockError(f"lock record field '{field}' must be a non-empty string")
 
     token = data.get("token")
     if not isinstance(token, str) or not token:
@@ -394,10 +428,14 @@ class SupervisorLock:
         mutate the lock path while this call is deciding what to do.
         """
         token = uuid.uuid4().hex
+        pid = os.getpid()
+        owner_boot_id, owner_process_start = _read_kernel_owner_identity(pid)
         record: dict[str, Any] = {
             "schema_version": _SCHEMA_VERSION,
             "token": token,
-            "pid": os.getpid(),
+            "pid": pid,
+            "owner_boot_id": owner_boot_id,
+            "owner_process_start": owner_process_start,
             "hostname": socket.gethostname(),
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "operation": self._operation,

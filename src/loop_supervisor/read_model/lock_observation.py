@@ -55,6 +55,8 @@ class LockObservation:
     activities: tuple[RunActivity, ...]
     pid: int | None
     hostname: str | None
+    owner_boot_id: str | None
+    owner_process_start: str | None
     started_at: str | None
     operation: str | None
     run_id: str | None
@@ -62,7 +64,7 @@ class LockObservation:
     diagnostic: str | None
 
 
-_LOCK_FIELDS = frozenset(
+_LEGACY_LOCK_FIELDS = frozenset(
     {
         "schema_version",
         "token",
@@ -74,6 +76,7 @@ _LOCK_FIELDS = frozenset(
         "integration_path",
     }
 )
+_LOCK_FIELDS = _LEGACY_LOCK_FIELDS | frozenset({"owner_boot_id", "owner_process_start"})
 _VALID_OPERATIONS = frozenset({"run", "resume", "tui"})
 _TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -188,10 +191,19 @@ def _read_lock_record(git_common_dir: Path) -> dict[str, object]:
 
 
 def _validate_lock_record(data: dict[str, Any]) -> None:
-    if set(data) != _LOCK_FIELDS:
-        raise LockObservationError("lock record has missing or unknown fields")
-    if data["schema_version"] != 1:
+    schema_version = data.get("schema_version")
+    if schema_version == 1:
+        expected_fields = _LEGACY_LOCK_FIELDS
+    elif schema_version == 2:
+        expected_fields = _LOCK_FIELDS
+    else:
         raise LockObservationError("lock record has an unsupported schema version")
+    if set(data) != expected_fields:
+        raise LockObservationError("lock record has missing or unknown fields")
+    if schema_version == 2:
+        for field in ("owner_boot_id", "owner_process_start"):
+            if not isinstance(data[field], str) or not data[field]:
+                raise LockObservationError(f"lock record has an invalid {field}")
     if not isinstance(data["token"], str) or not data["token"]:
         raise LockObservationError("lock record has an invalid ownership token")
     pid = data["pid"]
@@ -234,6 +246,8 @@ def _observation(
     values = record or {}
     pid = values.get("pid")
     hostname = values.get("hostname")
+    owner_boot_id = values.get("owner_boot_id")
+    owner_process_start = values.get("owner_process_start")
     started_at = values.get("started_at")
     operation = values.get("operation")
     run_id = values.get("run_id")
@@ -251,6 +265,8 @@ def _observation(
         ),
         pid=pid if isinstance(pid, int) else None,
         hostname=hostname if isinstance(hostname, str) else None,
+        owner_boot_id=owner_boot_id if isinstance(owner_boot_id, str) else None,
+        owner_process_start=owner_process_start if isinstance(owner_process_start, str) else None,
         started_at=started_at if isinstance(started_at, str) else None,
         operation=operation if isinstance(operation, str) else None,
         run_id=run_id if isinstance(run_id, str) else None,
