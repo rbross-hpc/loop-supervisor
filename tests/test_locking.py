@@ -1226,6 +1226,58 @@ def _write_lock_record_v2(
     os.chmod(str(lock_path), 0o600)
 
 
+def test_v2_lock_with_same_boot_reused_pid_requires_explicit_recovery(tmp_path):
+    """A differing process start under the current boot proves that the
+    recorded owner is stale even though its numeric PID is still live."""
+    current_boot_id = _read_boot_id()
+    current_process_start = _read_process_start(os.getpid())
+    stale_token = "same-boot-reused-pid-token"
+    _write_lock_record_v2(
+        tmp_path,
+        pid=os.getpid(),
+        hostname=socket.gethostname(),
+        token=stale_token,
+        boot_id=current_boot_id,
+        process_start=f"{current_process_start}-recorded-owner",
+    )
+
+    with pytest.raises(StaleLockError, match="stale lock"):
+        _make_lock(tmp_path, recover_stale=False).acquire()
+
+    assert json.loads(_lock_path(tmp_path).read_text())["token"] == stale_token
+
+    lock = _make_lock(tmp_path, recover_stale=True)
+    lock.acquire()
+    try:
+        recovered_record = json.loads(_lock_path(tmp_path).read_text())
+        assert recovered_record["pid"] == os.getpid()
+        assert recovered_record["token"] != stale_token
+    finally:
+        lock.release()
+
+
+def test_malformed_lock_rejects_float_schema_version_on_genuine_v2_record(tmp_path):
+    """A float schema version is malformed even when every schema-2-only
+    owner-identity field is valid, isolating strict type validation."""
+    _write_lock_record_v2(
+        tmp_path,
+        pid=os.getpid(),
+        hostname=socket.gethostname(),
+        token="valid-v2-token",
+        boot_id="valid-boot-id",
+        process_start="valid-process-start",
+    )
+    record = json.loads(_lock_path(tmp_path).read_text())
+    assert record["schema_version"] == 2
+    assert record["owner_boot_id"] == "valid-boot-id"
+    assert record["owner_process_start"] == "valid-process-start"
+    record["schema_version"] = 2.0
+    _write_raw_lock(tmp_path, record)
+
+    with pytest.raises(MalformedLockError, match="schema_version"):
+        _make_lock(tmp_path, recover_stale=True).acquire()
+
+
 def test_v2_lock_with_reused_pid_is_recovered_as_stale(tmp_path, monkeypatch):
     """A live local PID whose recorded boot/start identity no longer
     matches the current kernel state is PID reuse, not a live owner --

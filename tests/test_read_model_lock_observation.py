@@ -67,6 +67,24 @@ def test_observe_lock_rejects_non_integer_schema_version(tmp_path, bad_schema_ve
     assert observation.activity is LockActivity.MALFORMED
 
 
+def test_observe_lock_rejects_float_schema_version_on_genuine_v2_record(tmp_path):
+    """A float schema version is malformed even when valid schema-2 owner
+    identity fields are present, isolating strict type validation."""
+    record = _lock_record(tmp_path) | {
+        "schema_version": 2,
+        "owner_boot_id": "valid-boot-id",
+        "owner_process_start": "valid-process-start",
+    }
+    assert record["schema_version"] == 2
+    assert record["owner_boot_id"] == "valid-boot-id"
+    assert record["owner_process_start"] == "valid-process-start"
+    _write_lock(tmp_path, record | {"schema_version": 2.0})
+
+    observation = observe_lock(tmp_path, tmp_path, (_summary(),))
+
+    assert observation.activity is LockActivity.MALFORMED
+
+
 @pytest.mark.parametrize(
     ("prepare", "expected"),
     [
