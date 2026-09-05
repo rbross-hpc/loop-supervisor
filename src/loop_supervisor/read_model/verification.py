@@ -128,7 +128,9 @@ def discover_verification(
         else:
             commit, name = identity
             if leaves.get((commit, ordinal)) != name:
-                diagnostics.append(VerificationDiagnostic(name, "authorized log is unavailable"))
+                diagnostics.append(
+                    VerificationDiagnostic(_safe_name(name), "authorized log is unavailable")
+                )
             else:
                 log = LogReference(validated_run, commit, ordinal, name)
         attempts.append(
@@ -228,14 +230,18 @@ def _discover_leaves(
                     commit_fd = os.open(commit, os.O_RDONLY | _directory_flags(), dir_fd=run_fd)
                 except OSError:
                     diagnostics.append(
-                        VerificationDiagnostic(commit, "commit directory is unavailable")
+                        VerificationDiagnostic(
+                            _safe_name(commit), "commit directory is unavailable"
+                        )
                     )
                     continue
                 try:
                     by_ordinal: dict[int, list[str]] = {}
                     log_names, logs_bounded = _names(commit_fd, _MAX_LOG_LEAVES)
                     if logs_bounded:
-                        diagnostics.append(VerificationDiagnostic(commit, "log scan is incomplete"))
+                        diagnostics.append(
+                            VerificationDiagnostic(_safe_name(commit), "log scan is incomplete")
+                        )
                     for name in log_names:
                         match = _LOG_RE.fullmatch(name)
                         if match is None:
@@ -246,18 +252,20 @@ def _discover_leaves(
                         ordinal = _parse_filename_ordinal(match["ordinal"])
                         if ordinal is None:
                             diagnostics.append(
-                                VerificationDiagnostic(name, "log ordinal is too large")
+                                VerificationDiagnostic(_safe_name(name), "log ordinal is too large")
                             )
                             continue
                         if ordinal <= 0:
-                            diagnostics.append(VerificationDiagnostic(name, "invalid log ordinal"))
+                            diagnostics.append(
+                                VerificationDiagnostic(_safe_name(name), "invalid log ordinal")
+                            )
                             continue
                         by_ordinal.setdefault(ordinal, []).append(name)
                     for ordinal, names in by_ordinal.items():
                         if len(names) != 1:
                             diagnostics.append(
                                 VerificationDiagnostic(
-                                    ", ".join(sorted(names)), "duplicate ordinal"
+                                    _duplicate_artifact_name(names), "duplicate ordinal"
                                 )
                             )
                             continue
@@ -265,14 +273,20 @@ def _discover_leaves(
                         try:
                             metadata = os.stat(name, dir_fd=commit_fd, follow_symlinks=False)
                         except OSError:
-                            diagnostics.append(VerificationDiagnostic(name, "log is unavailable"))
+                            diagnostics.append(
+                                VerificationDiagnostic(_safe_name(name), "log is unavailable")
+                            )
                             continue
                         if stat.S_ISLNK(metadata.st_mode):
-                            diagnostics.append(VerificationDiagnostic(name, "log is a symlink"))
+                            diagnostics.append(
+                                VerificationDiagnostic(_safe_name(name), "log is a symlink")
+                            )
                             continue
                         if not stat.S_ISREG(metadata.st_mode):
                             diagnostics.append(
-                                VerificationDiagnostic(name, "log is not a regular file")
+                                VerificationDiagnostic(
+                                    _safe_name(name), "log is not a regular file"
+                                )
                             )
                             continue
                         leaves[(commit, ordinal)] = name
@@ -385,6 +399,11 @@ def _required(name: str) -> int:
     if not isinstance(value, int):
         raise OSError(f"secure verification reads require os.{name}")
     return value
+
+
+def _duplicate_artifact_name(names: list[str]) -> str:
+    """Return bounded logical names for a duplicate ordinal's artifacts."""
+    return _safe_name(", ".join(sorted(_safe_name(name) for name in names)))
 
 
 def _safe_name(name: str) -> str:

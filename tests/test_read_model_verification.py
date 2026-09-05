@@ -73,6 +73,22 @@ def test_discover_verification_rejects_mismatched_output_path_and_duplicate_ordi
     )
 
 
+def test_discovery_bounds_untrusted_filename_diagnostic_artifacts(tmp_path):
+    directory = _directory(tmp_path)
+    invalid_name = "x" * 255
+    duplicate_ordinal = "1" * 127
+    duplicate_with_leading_zero = f"0{duplicate_ordinal}"
+    (directory / invalid_name).write_text("invalid filename")
+    (directory / f"{duplicate_ordinal}.log").write_text("first duplicate")
+    (directory / f"{duplicate_with_leading_zero}.log").write_text("second duplicate")
+
+    discovered = discover_verification(tmp_path, "run-1", _result(tmp_path))
+
+    assert any(item.reason == "invalid log filename" for item in discovered.diagnostics)
+    assert any(item.reason == "duplicate ordinal" for item in discovered.diagnostics)
+    assert all(len(item.artifact) <= 256 for item in discovered.diagnostics)
+
+
 def test_discover_verification_preserves_attempts_without_metadata_or_available_log(tmp_path):
     missing = discover_verification(tmp_path, "run-1", None)
     assert missing.attempts == ()
