@@ -3,11 +3,12 @@
 This is the `loop-supervisor` project itself: a headless supervisor that
 drives an OpenCode planner/architect/builder/auditor loop over Git worktrees.
 
-The read-only `loop-supervisor tui` run browser has shipped. It is a
-production-quality Textual interface for exploring supervisor-captured run data;
-this document records its delivered product contract, active-run attribution's
-lock-writer implementation, and the remaining writer-hardening and
-reader/TUI-classification work still in progress (see "Ordered priorities").
+The read-only `loop-supervisor tui` run browser has shipped, including
+PID-reuse-resistant active-run identity (ADR 0037) on both the writer and
+reader sides. A post-delivery audit of that work found remaining defects
+and one unimplemented requirement; this document records the delivered
+product contract and the remaining post-audit remediation work still in
+progress (see "Ordered priorities").
 
 ## Product model
 
@@ -66,13 +67,11 @@ Activity labels must be evidence-based:
 - a fresh-run lock without a run ID is repository-level activity with an
   unknown run association.
 
-The first release may expose only the distinctions supported safely by
-current lock data. Durable active-run identity has since been decided (ADR
-0037) and its writer-side schema and stale-lock recovery are shipped so PID
-reuse cannot be recovered as a live owner; a follow-on audit's writer-side
-robustness fixes must land first (see "Ordered priorities" item 8), then
-classifying reads against that identity (item 9). That work must not be
-approximated by recency heuristics.
+`running` requires the complete schema-2 identity chain (local hostname,
+boot ID, live PID, matching process-start ticks, matching integration path,
+and an associated loadable `RunState`), per ADR 0037. A schema-1 lock never
+satisfies `running`. This classification must not be approximated by
+recency heuristics.
 
 Selecting a run opens a run-detail screen containing:
 
@@ -93,7 +92,10 @@ Selecting a run opens a run-detail screen containing:
 
 The application must support keyboard-only navigation, including selecting a
 run, opening timeline details, returning to the browser, refreshing the
-current snapshot, and quitting cleanly.
+current snapshot, and quitting cleanly. Keyboard focus and the highlighted
+row, record, or log must be preserved by stable identity across Back and
+across both successful and failed refresh; the interface must never lose
+the user's place or jump to a different row.
 
 ## Data and safety requirements
 
@@ -114,160 +116,169 @@ logs, and lock observations. It must:
 - escape Rich/Textual markup in all repository-, agent-, and
   command-controlled text;
 - avoid exposing the lock ownership token;
-- keep one malformed run or record from crashing the application.
+- keep one malformed run or record from crashing the application;
+- never surface raw exception text (`str(exc)`/`repr(exc)`) in any rendered
+  diagnostic or CLI error path; use fixed, safe classifications instead.
 
 Missing history must be represented as unavailable or incomplete, never as
 proof that a phase did not run. `updated_at` and history `recorded_at` are
 persisted update/completion times, not phase-start times; the TUI must not
 fabricate elapsed-time or stall information.
 
-## Lock owner-identity robustness (writer-side)
+`ProjectSnapshot` is the single disk-derived read for a project: it is built
+once at initial load and rebuilt only on an explicit refresh, and it must
+carry immutable current-state, history, and verification metadata for every
+bounded run. All navigation between the browser, a run's detail, and a
+record's detail must read only the already-built snapshot; disk is read
+again only by an explicit refresh action or by explicitly opening a
+verification log's content.
 
-ADR 0037's writer-side schema and stale-lock recovery are shipped
-(`src/loop_supervisor/locking.py`), but a follow-on audit found gaps between
-the shipped code and the ADR's identity-chain contract. These are writer-side
-correctness and coverage fixes within ADR 0037's existing design, not a design
-change:
+## Lock owner-identity robustness
 
-- A recorded owner that no longer exists is stale evidence regardless of
-  which `OSError` subtype the kernel raises for a mid-read
-  `/proc/<pid>/stat` disappearance. `FileNotFoundError` is already handled;
-  `ProcessLookupError`/`ESRCH` (the kernel can raise either for a process
-  that exits between `open()` and `read()`) must be treated the same way,
-  not surfaced as unverifiable.
-- Reading local kernel identity must never let an unexpected exception
-  escape the classifier. `/proc/<pid>/stat`'s `comm` field is arbitrary
-  bytes and need not be valid UTF-8; a decode failure there (or any other
-  unexpected read failure) must resolve to a normalized `LockError` and
-  therefore `IdentityStatus.UNVERIFIABLE`, never propagate a raw
-  `UnicodeDecodeError` out of `acquire()` or stale-lock recovery.
-- `IdentityStatus.UNVERIFIABLE` remains fail-closed: it must never be
-  treated as proof of either liveness or staleness, in either acquisition
-  or recovery.
-- Operator-facing recovery messages and `SupervisorLock`'s docstrings
-  (`recover_stale`, `_inspect_existing_lock`, `classify_local_owner_identity`)
-  must describe schema-2 staleness accurately: the recorded owner can be
-  stale while the numeric PID names a live successor process (PID reuse or
-  a reboot that reused the PID), not only when "the PID is dead." Wording
-  that says "dead process" for a schema-2 stale classification is
-  misleading and must be corrected.
-- Source documentation must not claim capability that does not exist yet:
-  `classify_local_owner_identity`'s docstring must describe its current
-  writer-side-only use; claiming it is already shared with the read model
-  is inaccurate until the read model actually consumes it (see "Ordered
-  priorities" item 9).
+ADR 0037 decided PID-reuse-resistant lock ownership. Lock schema version 2
+(`owner_boot_id`, `owner_process_start`) and the full identity-chain contract
+are shipped end to end: writer-side acquisition and stale-lock recovery
+(`src/loop_supervisor/locking.py`), and reader-side classification consumed
+by `observe_lock` and the TUI (`src/loop_supervisor/read_model/
+lock_observation.py`). A live PID with mismatched boot/start identity (PID
+reuse) is correctly treated as stale, not as a live owner, on both sides.
+The prior writer-side audit gaps (absent-PID `OSError` subtypes, non-UTF-8
+`comm` decode failures, misleading "dead process" wording) are closed. This
+section is retained only as a pointer to that contract for future changes;
+it is not an open work item.
 
 ## Ordered priorities
 
-1. **Delivered.** Define the disk-read boundary, evidence-based status
-   taxonomy, refresh semantics, history validation, log-containment policy, and
-   module boundaries in ADR 0036.
-2. **Delivered.** Implement and thoroughly test a Textual-independent read model
-   for run discovery, current snapshots, history, verification logs, and
-   conservative lock observations.
-3. **Delivered.** Launch the minimum vertical slice from `cmd_tui`: optional
-   `--project`, newest-first run browser, run selection, summary, workflow
-   timeline, manual refresh, back, and quit.
-4. **Delivered.** Add opinionated result/error detail, escaped raw JSON, and the
-   opt-in bounded verification-log viewer.
-5. **Delivered.** Harden empty/loading/degraded states, narrow layouts,
-   concurrent filesystem changes, resource cleanup, and keyboard affordances.
-6. **Delivered.** Update README, installation, skeleton, skill, and CLI
-   documentation to describe the shipped read-only browser. Read-model and
-   Textual fixtures provide repository-verifiable coverage; exercising a bounded
-   real supervisor run remains optional validation, not an open delivery item.
-7. **Delivered (design and writer).** ADR 0037 decides PID-reuse-resistant lock
-   ownership. Lock schema version 2 (`owner_boot_id`, `owner_process_start`) and
-   the writer-side identity chain are shipped: acquisition fails closed if it
-   cannot read local kernel identity, and schema-2 stale-lock recovery correctly
-   treats a live PID with mismatched boot/start identity (PID reuse) as stale,
-   not as a live owner.
-8. **Current priority (writer-side hardening; closes the Part 1 audit).**
-   Fix the gaps recorded in "Lock owner-identity robustness (writer-side)"
-   above. Independently mergeable slices:
-   - 8a (behavioral fix; land first): in
-     `src/loop_supervisor/locking.py`, make `_read_process_start` treat
-     `ProcessLookupError`/`ESRCH` as an absent PID (stale), alongside the
-     existing `FileNotFoundError` handling, and catch a `comm`-field decode
-     failure (or any other unexpected read failure) as a normalized
-     `LockError` so it resolves to `IdentityStatus.UNVERIFIABLE` rather than
-     escaping uncaught. Preserve the existing `FileNotFoundError`-as-stale
-     and `UNVERIFIABLE`-fail-closed contracts exactly. Add focused tests
-     that exercise the real `_read_process_start`/`_read_boot_id` functions
-     (not mocks): malformed `/proc/<pid>/stat` content, a process name
-     containing parentheses, an empty boot ID, a non-`FileNotFoundError`/
-     `ProcessLookupError` `OSError`, and a non-UTF-8 `comm` field.
-   - 8b (wording and docstrings): correct the `StaleLockError` "dead
-     process" message and the `recover_stale` / `_inspect_existing_lock` /
-     `classify_local_owner_identity` docstrings so they describe PID-reuse
-     staleness accurately and describe the reader-sharing status correctly
-     (writer-side only, until item 9 lands).
-   - 8c (test coverage): add an end-to-end recovery test with a matching
-     boot ID and a differing process-start value (ordinary same-boot PID
-     reuse, not a reboot), carried through `_inspect_existing_lock` both
-     with and without `recover_stale`; add a genuine schema-2 lock fixture
-     (with valid `owner_boot_id`/`owner_process_start`) whose only defect
-     is `schema_version: 2.0`, in both `tests/test_locking.py` and
-     `tests/test_read_model_lock_observation.py`.
-   This priority does not change ADR 0037's design and requires no new
-   ADR.
-9. Update the read model's `observe_lock` and the TUI to consume the
-   schema-2 identity chain via `classify_local_owner_identity` (after item
-   8 has hardened it): `running` must require the complete match (local
-   hostname, boot ID, live PID, matching process-start ticks, matching
-   integration path, and an associated loadable `RunState`), per ADR 0037.
-   Schema-1 locks must never satisfy `running`; distinguish stale from
-   unverifiable evidence without exposing the lock ownership token.
-   Replace or update any read-model test that currently encodes the
-   legacy PID-only "live PID implies running" behavior. Do not alter the
-   shipped explorer's classification by pretending current lock data can
-   answer more than it can until this lands.
-10. Make `ProjectSnapshot` genuinely complete: include immutable
-    current-state, history, and verification metadata for every bounded
-    run in the snapshot built at initial load and at each explicit
-    refresh. Run-detail navigation (opening a run, opening a record,
-    returning to the browser) must read only the already-built snapshot,
-    not reread disk. Only an explicit refresh action rebuilds
-    disk-derived data and reconciles selection by stable run/record ID,
-    per this objective's existing "Data is refreshed only when the user
-    explicitly requests it" requirement.
-11. Contain startup and refresh failures: a project-level scan failure
-    (e.g. an unreadable or replaced state directory) must become a safe,
-    bounded diagnostic rather than an uncaught exception. Launching the
-    TUI on such a project must show a clear error, not a traceback.
-    Explicit refresh must preserve the previously displayed snapshot and
-    selection and report the refresh failure, rather than losing the
-    prior view; any open log content is closed rather than silently
-    carried across a failed or successful refresh.
-12. Sanitize and bound every rendered diagnostic: replace raw
-    `StateError`/`OSError` text interpolation in run-row and
-    project-level diagnostics with fixed, safe classifications and
-    bounded logical artifact names, and enforce the existing 256 KiB /
-    10,000-line rendered-output ceiling on every diagnostic and row, not
-    only on opinionated detail views.
-13. Harden verification discovery: bound the number of ordinal digits
-    accepted from a log filename before converting it with `int()`
-    (mirroring history's existing bound), and strengthen the
-    post-read mutation check so a log replaced or modified after the
-    first `fstat` is still reported as `changed_during_read`. Keep
-    explicit, bounded, descriptor-relative, no-follow log access
-    unchanged.
-14. Report history contradictions instead of silently accepting them:
-    detect and diagnose adjacent-record phase discontinuity, timestamp
-    reversal, counter regression, and disagreement between the newest
-    history entry and the authoritative current `RunState`, while
-    preserving every other valid entry and keeping current `RunState`
-    authoritative, per this objective's existing "treat the latest
-    `RunState` as authoritative" requirement.
-15. Repair TUI keyboard-navigation state: preserve the highlighted run,
-    record, or log by stable identity across Back and across refresh
-    (do not silently jump to a different row), restore keyboard focus to
-    the list the user came from, and stop overloading the advertised
-    Refresh binding to also mean "expand raw JSON" in record detail.
+Items 1 through 15 (the initial vertical slice, ADR 0036/0037, the
+Textual-independent read model, and the writer/reader lock-identity
+hardening) are delivered. A post-delivery audit of that work found the
+defects and gap addressed by items 16 through 25 below. Each is
+independently mergeable and subject to the same task-sizing,
+one-mergeable-slice-at-a-time discipline, and the same Ruff/formatting/
+mypy/pytest gates, as all prior priorities.
 
-Each priority above (8 through 15) is subject to the same task-sizing,
-one-mergeable-slice-at-a-time discipline as items 1 through 7, and to the
-same Ruff/formatting/mypy/pytest gates.
+16. Fix the explicit-refresh crash on a project with zero discovered runs.
+    `action_refresh` unconditionally calls `_remember_browser_highlight`,
+    which queries the `#run-list` widget; that widget does not exist when
+    no runs are discovered (the browser renders an empty-state message
+    instead), and the query sits outside the failure-handling `try` block.
+    Refreshing such a project currently raises an uncaught widget-lookup
+    exception instead of the safe, bounded outcome item 11 already
+    requires. Add a regression test that refreshes an empty-run project
+    and a project whose only run was deleted since the last snapshot.
+17. Make explicit refresh reconcile the open **record** selection by
+    stable ID, not only the selected run. Currently only the run-level
+    selection and browser highlight survive a refresh; the open record
+    detail, if any, continues to render its pre-refresh content even when
+    the snapshot changed or the record disappeared, and if the selected
+    run itself disappears, a stale record-selection index can be
+    misapplied to render the wrong run's record once a different run is
+    selected. On refresh: reload the open record's content from the new
+    snapshot by its stable ID if it is still present; close the record
+    detail (returning to run detail) if it is not; and never let a
+    record-selection value outlive the run selection it was scoped to.
+18. Sanitize lock-observation diagnostics. `observe_lock` currently passes
+    raw `str(exc)` (including absolute lock paths and parser text) from a
+    malformed-lock read failure and from an integration-path
+    canonicalization failure into `LockObservation.diagnostic`, which the
+    TUI renders verbatim in the run-detail summary. Replace both with
+    fixed, safe classifications, following the pattern already used by
+    the read model's other diagnostic sources (e.g. run-discovery and
+    current-run diagnostics). This closes an unmet clause of item 12
+    below.
+19. Contain and sanitize project-resolution and startup-scan failures the
+    same way refresh failures are already contained. Two independently
+    mergeable slices:
+    - `cmd_tui`'s `ProjectResolutionError` path currently prints the raw
+      underlying error, which can embed full Git command stdout/stderr
+      and is unbounded; replace it with a fixed, safe, bounded message,
+      matching the existing `StateError` handling immediately below it in
+      the same function.
+    - `cmd_tui` (and snapshot/discovery construction generally) currently
+      catches only `StateError` for a project-level scan failure; an
+      `OSError` raised during directory enumeration (e.g. a mid-scan
+      permission or mount change) is not caught and can still surface as
+      an uncaught traceback at startup. Catch it the same way the
+      existing explicit-refresh path already does.
+20. Preserve keyboard usability across refresh, beyond the row highlight
+    already preserved. A failed refresh currently preserves the
+    highlighted row but not keyboard focus, so the preserved highlight is
+    not actually usable without an extra manual click/keypress to
+    refocus; a successful refresh resets the record-list cursor and
+    focus to the top instead of preserving them. Restore focus to the
+    list the user came from in both cases, per the existing keyboard-
+    navigation requirement above.
+21. Implement the last undelivered history-contradiction category:
+    disagreement between the newest history entry and the authoritative
+    current `RunState`. History validation today only compares adjacent
+    history records to each other; it has no comparison against current
+    `RunState` at all. Two independently mergeable slices:
+    - Record an ADR defining what constitutes a reportable disagreement
+      between the newest valid history entry and current `RunState`
+      (candidates include: the newest entry's `phase_after` disagreeing
+      with `RunState.phase` when no later transition is pending;
+      persisted counters in the newest entry exceeding or contradicting
+      `RunState`'s counters; the newest entry's `recorded_at` occurring
+      after `RunState.updated_at`), calibrated to avoid reintroducing the
+      phase-blind, non-lifecycle-aware false positives that motivated ADR
+      0038's transition-aware counter design. The ADR must not change
+      current `RunState`'s authority: a detected disagreement is a
+      diagnostic, never a correction.
+    - Implement and test the decision, preserving every valid history
+      entry and every existing contradiction diagnostic unchanged.
+22. Stop reporting a spurious phase-discontinuity diagnostic when a
+    sequence gap already explains the discontinuity. Adjacent-record
+    comparison currently runs over the list of records that survived
+    validation, so when an intervening record is missing or excluded
+    (already reported as a sequence gap or a malformed-record
+    diagnostic), the two records on either side of the gap are also
+    compared to each other and reported as a phase discontinuity that
+    does not reflect any actual contradiction in the underlying history.
+    Skip the adjacent-record comparison whenever the two records are not
+    truly sequence-adjacent (`following.seq != preceding.seq + 1`).
+23. Record an ADR describing the accepted scope of the verification log
+    post-read mutation check, and correct this objective and the shipped
+    code to match it precisely. The current check reliably detects a log
+    replaced by a different inode after the first read, but a same-size,
+    same-inode in-place rewrite is detected only when the file's mtime
+    changes at the granularity the filesystem actually provides; on at
+    least one supported filesystem this granularity is coarse enough that
+    an ordinary (non-adversarial) same-size concurrent rewrite is missed
+    in the common case, and an adversarial rewrite that restores the
+    original mtime is never detected by this check at all. The ADR must
+    state plainly which mutation shapes are and are not detected and why
+    closing the remaining gap is or is not warranted now. If the decision
+    is to accept the current scope, correct item 13's historical wording
+    above (already satisfied) and the corresponding test's naming/intent
+    so neither overstates same-size in-place detection as covered. If the
+    decision is to close the gap, implement it as a follow-on slice using
+    a stronger, still-explicit, still-bounded, still-descriptor-relative
+    check, with a test that exercises a genuine same-size, same-mtime
+    in-place rewrite (not only a size-changing one).
+24. Diagnostic-hygiene cleanup, each independently mergeable:
+    - Apply the verification read model's existing bounded-name helper to
+      every diagnostic site that includes an untrusted filename, not only
+      some of them, so a diagnostic artifact string cannot grow
+      unboundedly (observed with adversarially many colliding ordinal
+      spellings).
+    - Consolidate the several duplicated copies of the 256 KiB /
+      10,000-line rendered-output ceiling constants and near-identical
+      bounding functions in the TUI into one shared helper, applied
+      consistently.
+    - Remove the one remaining raw-exception-text passthrough in a
+      history-validation diagnostic reason, replacing it with a fixed
+      classification consistent with the rest of that module.
+    - Make the `builder_guidance_count` reset permitted on a
+      `building`-to-`verifying`/`auditing` transition conditional on that
+      record's recorded status, matching ADR 0038's stated rationale
+      ("a successful building transition") rather than only its phase
+      pair.
+25. Sync the current planner agent prompt into the project-skeleton copy
+    used by newly initialized projects
+    (`src/loop_supervisor/_skeleton/.opencode/agents/loop-planner.md`),
+    which has drifted out of sync with the live prompt, and restore
+    parity test coverage for it in `tests/test_cli_init.py` (currently
+    disabled pending this sync; see the comment marking why).
 
 ## Completion criteria
 
@@ -280,31 +291,32 @@ The objective is complete when:
 - phase results, errors, raw records, verification summaries, and
   explicitly selected bounded logs are inspectable;
 - manual refresh reflects changed, added, removed, or newly malformed
-  files without restarting or crashing;
+  files without restarting or crashing, on every project shape including
+  zero discovered runs;
 - the TUI acquires no mutating supervisor lock and performs no writes;
 - Textual tests cover navigation and rendering;
 - read-model tests cover malformed, partial, missing, pruned, symlinked,
   traversal, oversized, and changing data;
 - CLI tests prove the browser launches and current-directory project resolution
   works;
-- a recorded lock owner that no longer exists is classified stale for every
-  relevant `OSError` subtype the kernel can raise during a mid-read
-  disappearance, and any identity-read/decode failure resolves to a
-  controlled `STALE`/`UNVERIFIABLE` outcome rather than an uncaught
-  exception, with focused tests at the real `_read_process_start`/
-  `_read_boot_id` boundary and an end-to-end same-boot PID-reuse recovery
-  test;
 - `running` requires the complete schema-2 identity chain and a schema-1
   lock never satisfies it;
 - run detail reflects only the manually built/refreshed snapshot; a failed
-  refresh preserves the prior snapshot and selection and reports failure;
-  a project-level scan failure at startup is a clean error, not a
-  traceback;
-- browser rows and diagnostics are sanitized (no raw exception text) and
-  stay within the existing rendered-output bounds;
+  refresh preserves the prior snapshot and selection (run and record) and
+  reports failure without crashing; keyboard focus is preserved across both
+  successful and failed refresh;
+- a project-level scan failure or resolution failure, at startup or on
+  refresh, is a clean, sanitized, bounded error on every relevant exception
+  type, not a traceback and not raw exception text;
+- browser rows and diagnostics, including lock-observation diagnostics, are
+  fully sanitized (no raw exception text anywhere) and stay within the
+  existing rendered-output bounds on every rendered diagnostic and row;
 - history contradictions (phase discontinuity, timestamp reversal, counter
   regression, current-state disagreement) surface as diagnostics without
-  overriding current `RunState`;
+  overriding current `RunState`, and a sequence gap does not also produce a
+  spurious adjacent-record contradiction;
+- the verification log mutation-detection scope is recorded in an ADR and
+  this objective's wording matches what is actually implemented;
 - the configured Ruff, formatting, mypy, and pytest gates pass.
 
 ## Out of scope
