@@ -305,9 +305,8 @@ def _validation_reason(exc: StateError | ValueError | ValidationError) -> str:
     """Classify controlled validation failures without rendering untrusted values."""
     if isinstance(exc, ValidationError):
         return "history record has invalid result or error"
-    message = str(exc)
-    if message.startswith("embedded "):
-        return message
+    if str(exc).startswith("embedded "):
+        return "history record embedded seq, run_id, or phase mismatch"
     return "malformed history record"
 
 
