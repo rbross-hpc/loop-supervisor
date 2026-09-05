@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from .current_run import CurrentRun, load_current_run
 from .discovery import RunSummary, discover_runs_bounded
@@ -13,6 +15,14 @@ from .project import ProjectResolution, resolve_project
 from .verification import VerificationDiscovery, discover_verification
 
 MAX_RUN_CANDIDATES = 10_000
+CurrentStateDisagreementField = Literal[
+    "phase",
+    "accepted_task_count",
+    "revision_count",
+    "replan_count",
+    "architect_retry_count",
+    "builder_guidance_count",
+]
 
 
 @dataclass(frozen=True)
@@ -24,12 +34,21 @@ class SnapshotDiagnostic:
 
 
 @dataclass(frozen=True)
+class CurrentStateDisagreement:
+    """A bounded, presentation-independent mismatch with authoritative current state."""
+
+    field: CurrentStateDisagreementField
+    history_seq: int
+
+
+@dataclass(frozen=True)
 class RunDetailSnapshot:
     """One run's immutable current, history, and verification evidence."""
 
     summary: RunSummary
     current: CurrentRun
     history: HistoryLoad
+    current_state_disagreements: tuple[CurrentStateDisagreement, ...]
     verification: VerificationDiscovery
 
 
@@ -76,12 +95,14 @@ def build_snapshot(project: ProjectResolution) -> ProjectSnapshot:
     run_tuple = tuple(runs)
     run_details: list[RunDetailSnapshot] = []
     for summary in run_tuple:
+        history = load_history(project.git_common_dir, summary.run_id)
         current = load_current_run(project.git_common_dir, summary.run_id)
         run_details.append(
             RunDetailSnapshot(
                 summary=summary,
                 current=current,
-                history=load_history(project.git_common_dir, summary.run_id),
+                history=history,
+                current_state_disagreements=_current_state_disagreements(history, current),
                 verification=discover_verification(
                     project.git_common_dir, summary.run_id, current.verification_result
                 ),
@@ -94,6 +115,48 @@ def build_snapshot(project: ProjectResolution) -> ProjectSnapshot:
         lock=observe_lock(project.git_common_dir, project.integration_root, run_tuple),
         diagnostics=diagnostics,
     )
+
+
+_COUNTER_FIELDS: tuple[CurrentStateDisagreementField, ...] = (
+    "accepted_task_count",
+    "revision_count",
+    "replan_count",
+    "architect_retry_count",
+    "builder_guidance_count",
+)
+
+
+def _current_state_disagreements(
+    history: HistoryLoad, current: CurrentRun
+) -> tuple[CurrentStateDisagreement, ...]:
+    """Compare newest valid history with current state under ADR 0039's ordering gate."""
+    if not current.loadable or not history.entries:
+        return ()
+
+    newest = history.entries[-1]
+    if current.updated_at is None:
+        return ()
+    if _parse_timestamp(newest.recorded_at) > _parse_timestamp(current.updated_at):
+        disagreements: list[CurrentStateDisagreement] = []
+        if newest.phase_after != current.phase:
+            disagreements.append(CurrentStateDisagreement("phase", newest.seq))
+        for field in _COUNTER_FIELDS:
+            if newest.counters[field] != getattr(current, field):
+                disagreements.append(CurrentStateDisagreement(field, newest.seq))
+        return tuple(disagreements)
+
+    accepted_task_count = current.accepted_task_count
+    if (
+        accepted_task_count is not None
+        and newest.counters["accepted_task_count"] > accepted_task_count
+    ):
+        return (CurrentStateDisagreement("accepted_task_count", newest.seq),)
+    return ()
+
+
+def _parse_timestamp(value: str) -> datetime:
+    """Parse an instant already validated by the authoritative source reader."""
+    return datetime.fromisoformat(value)
 
 
 def scan_project(project_path: Path | str | None = None) -> ProjectSnapshot:
