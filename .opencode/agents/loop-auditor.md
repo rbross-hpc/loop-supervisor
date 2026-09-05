@@ -8,6 +8,11 @@ permission:
   edit: deny
   skill: deny
   falda_*: deny
+  external_directory:
+    "/opt/conda": allow
+    "/opt/conda/**": allow
+    "~/.local/share/rtk/tee": allow
+    "~/.local/share/rtk/tee/**": allow
   bash:
     "*": deny
     "git status*": allow

@@ -93,6 +93,13 @@ the user's global config and any provider block in the project `opencode.json`.
   regardless of the file's tracking status.
 - `.opencode/agents/*.md` are resolved from directory-tier config and are
   unaffected by `OPENCODE_CONFIG`; they remain per-worktree and are carried by
-  git as before. Their frontmatter still only overrides `edit`/`bash`/`skill`,
-  so `external_directory` and `doom_loop` must continue to live in
-  `opencode.json`, which is what `OPENCODE_CONFIG` now delivers to every worktree.
+  git as before. By convention their frontmatter has so far only overridden
+  `edit`/`bash`/`skill`, with `external_directory` and `doom_loop` left in
+  `opencode.json`, which is what `OPENCODE_CONFIG` now delivers to every
+  worktree. This is a project convention, not an OpenCode-enforced
+  restriction: agent frontmatter may carry any `permission` key, including
+  `external_directory`. The read-only planner, architect, and auditor agents
+  intentionally add narrow `external_directory` allowances (dependency source
+  trees and `rtk` tee-file output) directly in their own frontmatter, scoped
+  to only those roles, since routing that grant through `opencode.json` would
+  extend it to the write-capable builder as well.
