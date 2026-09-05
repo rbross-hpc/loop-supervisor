@@ -1240,6 +1240,9 @@ def test_v2_lock_with_same_boot_reused_pid_requires_explicit_recovery(tmp_path):
         boot_id=current_boot_id,
         process_start=f"{current_process_start}-recorded-owner",
     )
+    stale_record = json.loads(_lock_path(tmp_path).read_text())
+    assert stale_record["owner_boot_id"] == current_boot_id
+    assert stale_record["owner_process_start"] != current_process_start
 
     with pytest.raises(StaleLockError, match="stale lock"):
         _make_lock(tmp_path, recover_stale=False).acquire()
