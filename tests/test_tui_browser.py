@@ -667,6 +667,109 @@ async def test_record_detail_refreshes_with_r_and_toggles_raw_json_with_e(
 
 
 @pytest.mark.asyncio
+async def test_record_detail_refresh_reconciles_history_selection_by_sequence_identity(
+    tmp_path: Path,
+) -> None:
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00", phase="planning")
+    _persist_history(tmp_path, run_id, "0001-planning.json", seq=1)
+    history_path = tmp_path / "loop-supervisor" / "runs" / run_id / "0001-planning.json"
+    history_record = json.loads(history_path.read_text())
+    history_record["result"]["objective"] = "before refresh"
+    history_path.write_text(json.dumps(history_record))
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter", "down", "enter")
+        before_refresh = cast(Any, app.screen.query_one(".record-detail").render()).plain
+        assert "Objective: before refresh" in before_refresh
+
+        history_record["result"]["objective"] = "after refresh"
+        history_path.write_text(json.dumps(history_record))
+        await pilot.press("r")
+
+        refreshed_detail = cast(Any, app.screen.query_one(".record-detail").render()).plain
+        assert app._snapshot is not snapshot
+        assert "Objective: after refresh" in refreshed_detail
+        assert "Objective: before refresh" not in refreshed_detail
+
+        history_path.unlink()
+        await pilot.press("r")
+
+        assert app._selected_record_index is None
+        assert app.screen.query_one("#run-detail")
+
+
+@pytest.mark.asyncio
+async def test_record_detail_refresh_reloads_current_record_by_current_identity(
+    tmp_path: Path,
+) -> None:
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00", phase="planning")
+    state_path = tmp_path / "loop-supervisor" / "runs" / f"{run_id}.json"
+    state = json.loads(state_path.read_text())
+    state["planner_result"] = {
+        "status": "READY",
+        "task_id": "current-task",
+        "objective": "before refresh",
+        "rationale": "unchanged",
+        "acceptance_criteria": ["it works"],
+        "relevant_files": [],
+        "design_questions": [],
+        "decision_required": False,
+        "decision_question": None,
+        "decision_rationale": None,
+    }
+    state_path.write_text(json.dumps(state))
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter", "enter")
+        before_refresh = cast(Any, app.screen.query_one(".record-detail").render()).plain
+        assert "Objective: before refresh" in before_refresh
+
+        state["planner_result"]["objective"] = "after refresh"
+        state_path.write_text(json.dumps(state))
+        await pilot.press("r")
+
+        refreshed_detail = cast(Any, app.screen.query_one(".record-detail").render()).plain
+        assert app._snapshot is not snapshot
+        assert "Objective: after refresh" in refreshed_detail
+        assert "Objective: before refresh" not in refreshed_detail
+
+
+@pytest.mark.asyncio
+async def test_record_selection_is_cleared_when_its_selected_run_disappears(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "selected", updated_at="2026-01-04T00:00:00+00:00", phase="planning")
+    _persist_history(tmp_path, "selected", "0001-planning.json", seq=1)
+    _persist_run(tmp_path, "other", updated_at="2026-01-03T00:00:00+00:00", phase="done")
+    selected_state = tmp_path / "loop-supervisor" / "runs" / "selected.json"
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter", "down", "enter")
+        assert app.screen.query_one("#record-detail")
+
+        selected_state.unlink()
+        await pilot.press("r")
+
+        assert app._selected_run_id is None
+        assert app._selected_record_index is None
+        assert app.screen.query_one("#run-browser")
+
+        await pilot.press("enter")
+
+        detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert "Run ID: other" in detail
+        assert not app.screen.query("#record-detail")
+
+
+@pytest.mark.asyncio
 async def test_run_detail_opens_escaped_record_detail_and_expandable_raw_json(
     tmp_path: Path,
 ) -> None:
