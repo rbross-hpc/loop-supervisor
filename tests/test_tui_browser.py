@@ -78,3 +78,75 @@ async def test_run_browser_lists_newest_loadable_runs_and_degraded_rows_then_qui
         await pilot.press("q")
 
     assert app.is_running is False
+
+
+@pytest.mark.asyncio
+async def test_run_browser_opens_authoritative_detail_and_returns_to_browser(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "selected", updated_at="2026-01-02T00:00:00+00:00")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+
+        detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert "Run ID: selected" in detail
+        assert "Durable phase: done" in detail
+        assert "Created: 2026-01-01T00:00:00+00:00" in detail
+        assert "Updated: 2026-01-02T00:00:00+00:00" in detail
+        assert "Integration branch: main" in detail
+        assert "Current task: unavailable" in detail
+        assert "Accepted tasks: 0" in detail
+        assert "Pending question: unavailable" in detail
+        assert "Latest operational error: unavailable" in detail
+
+        await pilot.press("b")
+
+        assert app.screen.query_one("#run-browser")
+
+        await pilot.press("enter")
+
+        reopened_detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert "Run ID: selected" in reopened_detail
+
+
+@pytest.mark.asyncio
+async def test_run_browser_opens_run_id_with_period(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "old.run", updated_at="2026-01-02T00:00:00+00:00")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+
+        detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert "Run ID: old.run" in detail
+
+
+@pytest.mark.asyncio
+async def test_run_browser_opens_unloadable_run_as_safe_unavailable_detail_and_quits(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "loadable", updated_at="2026-01-02T00:00:00+00:00")
+    (tmp_path / "loop-supervisor" / "runs" / "unloadable.json").write_text("not JSON")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("down", "enter")
+
+        detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert "Run ID: unloadable" in detail
+        assert "Details: unavailable" in detail
+        assert "Current run details are unavailable" in detail
+        assert "Durable phase:" not in detail
+        assert "Created:" not in detail
+        assert "Accepted tasks:" not in detail
+
+        await pilot.press("q")
+
+    assert app.is_running is False

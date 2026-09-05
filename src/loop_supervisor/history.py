@@ -144,8 +144,7 @@ class PhaseHistoryRecorder:
             self._write_record(outcome)
         except Exception as exc:
             print(
-                f"loop-supervisor: could not record phase history: "
-                f"{type(exc).__name__}: {exc}",
+                f"loop-supervisor: could not record phase history: {type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
 

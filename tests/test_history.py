@@ -226,8 +226,7 @@ def test_revision_preserves_both_builder_results(tmp_path):
 
     directory = history_dir(Path(state.git_common_dir), state.run_id)
     building_records = [
-        json.loads(f.read_text())
-        for f in sorted(directory.glob("*-building.json"))
+        json.loads(f.read_text()) for f in sorted(directory.glob("*-building.json"))
     ]
     assert len(building_records) == 2
     summaries = {r["result"]["implementation_summary"] for r in building_records}
@@ -248,9 +247,7 @@ def test_verifying_record_has_no_log_body(tmp_path):
             "loop-builder": [_builder(status="COMPLETE")],
         }
     )
-    options = _make_options(
-        verify_commands=(f"python3 -c \"print('{marker}' * {repeat_count})\"",)
-    )
+    options = _make_options(verify_commands=(f"python3 -c \"print('{marker}' * {repeat_count})\"",))
     supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
     state = supervisor.start_new_run()
     recorder = PhaseHistoryRecorder()
