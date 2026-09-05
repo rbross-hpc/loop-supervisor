@@ -678,7 +678,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--recover-stale-lock",
         action="store_true",
-        help="Remove a stale lock from a dead local process and retry",
+        help=(
+            "Remove a stale lock whose recorded owner is stale and retry "
+            "(the PID may name a live successor)"
+        ),
     )
     run_parser.add_argument(
         "--config",
@@ -736,7 +739,10 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument(
         "--recover-stale-lock",
         action="store_true",
-        help="Remove a stale lock from a dead local process and retry",
+        help=(
+            "Remove a stale lock whose recorded owner is stale and retry "
+            "(the PID may name a live successor)"
+        ),
     )
     _add_step_control_arguments(resume_parser)
     _add_verbosity_arguments(resume_parser)

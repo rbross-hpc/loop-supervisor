@@ -318,9 +318,10 @@ given repository at a time. The lock is stored at:
 
     <git-common-dir>/loop-supervisor/supervisor.lock
 
-If a crash leaves a stale lock from a dead local process, pass
-`--recover-stale-lock` to remove it and retry. Remote-hostname and
-malformed locks are never auto-recovered.
+If a crash leaves a stale lock whose recorded local owner is stale, pass
+`--recover-stale-lock` to remove it and retry. For schema-2 locks, the numeric
+PID can name a live successor after PID reuse or a reboot that reused the PID.
+Remote-hostname and malformed locks are never auto-recovered.
 
 ### Operational failure and retry
 
