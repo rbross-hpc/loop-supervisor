@@ -532,6 +532,25 @@ async def test_run_detail_successful_refresh_restores_focused_record_cursor(tmp_
 
 
 @pytest.mark.asyncio
+async def test_run_detail_does_not_restore_history_cursor_from_different_run(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "first", updated_at="2026-01-03T00:00:00+00:00")
+    _persist_history(tmp_path, "first", "0001-planning.json", seq=1)
+    _persist_run(tmp_path, "second", updated_at="2026-01-02T00:00:00+00:00")
+    _persist_history(tmp_path, "second", "0001-planning.json", seq=1)
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter", "down", "enter", "b", "b", "down", "enter")
+
+        record_list = app.screen.query_one("#record-list", ListView)
+        assert app.screen.focused is record_list
+        assert record_list.index == 0
+
+
+@pytest.mark.asyncio
 async def test_run_browser_refresh_failure_restores_focus_to_originating_list(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

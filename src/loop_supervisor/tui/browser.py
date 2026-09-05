@@ -75,7 +75,7 @@ class RunBrowserApp(App[None]):
         self._openable_logs: tuple[verification.LogReference, ...] = ()
         self._run_id_by_row_index = tuple(summary.run_id for summary in snapshot.runs)
         self._browser_highlighted_run_id: str | None = None
-        self._record_highlighted_identity: tuple[str, int | None] | None = None
+        self._record_highlighted_identity_by_run: dict[str, tuple[str, int | None]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -385,19 +385,22 @@ class RunBrowserApp(App[None]):
             self._browser_highlighted_run_id = self._run_id_by_row_index[run_list.index]
 
     def _remember_record_highlight(self) -> None:
-        """Capture the current record cursor before replacing the list widget."""
+        """Capture the current run's record cursor before replacing the list widget."""
         record_list = self.query_one("#record-list", ListView)
-        if record_list.index is not None:
-            self._record_highlighted_identity = self._record_identity(
+        if record_list.index is not None and self._selected_run_id is not None:
+            self._record_highlighted_identity_by_run[self._selected_run_id] = self._record_identity(
                 self._detail_records[record_list.index]
             )
 
     def _record_highlight_index(self) -> int:
-        """Return the refreshed record index for the remembered record, or the first."""
-        if self._record_highlighted_identity is None:
+        """Return this run's refreshed record index for the remembered record, or the first."""
+        if self._selected_run_id is None:
+            return 0
+        highlighted_identity = self._record_highlighted_identity_by_run.get(self._selected_run_id)
+        if highlighted_identity is None:
             return 0
         for index, record in enumerate(self._detail_records):
-            if self._record_identity(record) == self._record_highlighted_identity:
+            if self._record_identity(record) == highlighted_identity:
                 return index
         return 0
 
@@ -414,7 +417,8 @@ class RunBrowserApp(App[None]):
         """Open a selected run, record, or explicitly requested authorized log."""
         if event.list_view.id == "record-list":
             self._selected_record_index = event.index
-            self._record_highlighted_identity = self._record_identity(
+            assert self._selected_run_id is not None
+            self._record_highlighted_identity_by_run[self._selected_run_id] = self._record_identity(
                 self._detail_records[event.index]
             )
             self._raw_json_expanded = False
@@ -483,11 +487,18 @@ class RunBrowserApp(App[None]):
         self._snapshot = refreshed_snapshot
         self._refresh_failure = None
         self._run_id_by_row_index = tuple(summary.run_id for summary in self._snapshot.runs)
+        self._record_highlighted_identity_by_run = {
+            run_id: identity
+            for run_id, identity in self._record_highlighted_identity_by_run.items()
+            if run_id in self._run_id_by_row_index
+        }
         if browser_highlighted_run_id not in self._run_id_by_row_index:
             self._browser_highlighted_run_id = None
         if selected_run_id not in self._run_id_by_row_index:
             self._selected_run_id = None
             self._selected_record_index = None
+            if selected_run_id is not None:
+                self._record_highlighted_identity_by_run.pop(selected_run_id, None)
             self._raw_json_expanded = False
         elif selected_record_identity is not None:
             refreshed_records = self._records_for_run(selected_run_id)
