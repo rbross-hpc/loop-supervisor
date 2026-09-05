@@ -117,8 +117,13 @@ def test_discover_runs_keeps_symlinked_and_non_regular_leaves_degraded(tmp_path)
     assert [summary.run_id for summary in summaries] == ["directory", "linked"]
     assert all(not summary.loadable for summary in summaries)
     assert all(summary.phase is None and summary.updated_at is None for summary in summaries)
-    assert "symbolic link" in (summaries[1].diagnostic or "")
-    assert "regular file" in (summaries[0].diagnostic or "")
+    assert (
+        summaries[1].diagnostic == "Run row is unloadable because the snapshot is a symbolic link."
+    )
+    assert (
+        summaries[0].diagnostic
+        == "Run row is unloadable because the snapshot is not a regular file."
+    )
 
 
 def test_discover_runs_skips_invalid_filename_stems(tmp_path):
@@ -130,6 +135,23 @@ def test_discover_runs_skips_invalid_filename_stems(tmp_path):
     summaries = discover_runs(tmp_path)
 
     assert [summary.run_id for summary in summaries] == ["valid"]
+
+
+def test_discover_runs_sanitizes_sensitive_load_failure_text(tmp_path, monkeypatch):
+    _save_state(tmp_path, "sensitive", updated_at="2026-01-02T00:00:00+00:00")
+    sensitive_path = "/private/credentials/state.json"
+
+    def fail_loading(_git_common_dir: Path, _run_id: str) -> RunState:
+        raise StateError(f"malformed snapshot at {sensitive_path}: {'secret' * 100_000}")
+
+    monkeypatch.setattr(discovery, "load_state", fail_loading)
+
+    summaries = discover_runs(tmp_path)
+
+    assert len(summaries) == 1
+    assert summaries[0].diagnostic == "Run row is unloadable because the snapshot is malformed."
+    assert sensitive_path not in (summaries[0].diagnostic or "")
+    assert "secret" not in (summaries[0].diagnostic or "")
 
 
 def test_discover_runs_keeps_a_candidate_that_disappears_during_load(tmp_path, monkeypatch):

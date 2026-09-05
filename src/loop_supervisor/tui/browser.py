@@ -40,6 +40,9 @@ class RunBrowserApp(App[None]):
     )
     _SENSITIVE_LOG_WARNING = "WARNING: Verification output is unredacted and potentially sensitive."
     _REFRESH_FAILURE_DIAGNOSTIC = "Refresh failed: unable to scan supervisor run state."
+    _MAX_BROWSER_RENDERED_BYTES = 256 * 1024
+    _MAX_BROWSER_RENDERED_LINES = 10_000
+    _BROWSER_TRUNCATION_MARKER = "Browser output truncated: rendered-output limit reached."
 
     TITLE = "Loop Supervisor"
     SUB_TITLE = "Run browser"
@@ -110,7 +113,11 @@ class RunBrowserApp(App[None]):
                     id="run-list",
                 )
             for diagnostic in self._snapshot.diagnostics:
-                yield Static(diagnostic.message, markup=False, classes="snapshot-diagnostic")
+                yield Static(
+                    self._bound_browser_output(diagnostic.message),
+                    markup=False,
+                    classes="snapshot-diagnostic",
+                )
 
     def _compose_detail(self, run_id: str) -> ComposeResult:
         detail = self._snapshot.detail_for(run_id)
@@ -424,19 +431,38 @@ class RunBrowserApp(App[None]):
         """Restore keyboard navigation after the browser has been recomposed."""
         self.query_one(ListView).focus()
 
-    @staticmethod
-    def _render_run(summary: RunSummary, lock: LockObservation) -> str:
-        """Return literal durable state and lock evidence without inferring activity."""
-        activity = RunBrowserApp._activity_label(summary.run_id, lock)
+    @classmethod
+    def _bound_browser_output(cls, text: str) -> str:
+        """Bound a browser row or project diagnostic with a visible marker."""
+        if (
+            len(text.encode("utf-8")) <= cls._MAX_BROWSER_RENDERED_BYTES
+            and len(text.splitlines()) <= cls._MAX_BROWSER_RENDERED_LINES
+        ):
+            return text
+        marker = cls._BROWSER_TRUNCATION_MARKER
+        payload = cls._truncate_literal(
+            text,
+            cls._MAX_BROWSER_RENDERED_BYTES - len(marker.encode("utf-8")) - 1,
+            cls._MAX_BROWSER_RENDERED_LINES - 1,
+        )
+        separator = "" if cls._ends_with_line_separator(payload) else "\n"
+        return f"{payload}{separator}{marker}"
+
+    @classmethod
+    def _render_run(cls, summary: RunSummary, lock: LockObservation) -> str:
+        """Return bounded literal durable state and lock evidence."""
+        activity = cls._activity_label(summary.run_id, lock)
         if not summary.loadable:
-            return (
+            rendered = (
                 f"{summary.run_id} — unloadable: {summary.diagnostic or 'unavailable'} — "
                 f"Activity: {activity}"
             )
-        return (
-            f"{summary.run_id} — {summary.phase or 'unknown'} — "
-            f"updated {summary.updated_at or 'unavailable'} — Activity: {activity}"
-        )
+        else:
+            rendered = (
+                f"{summary.run_id} — {summary.phase or 'unknown'} — "
+                f"updated {summary.updated_at or 'unavailable'} — Activity: {activity}"
+            )
+        return cls._bound_browser_output(rendered)
 
     @staticmethod
     def _activity_label(run_id: str, lock: LockObservation) -> str:

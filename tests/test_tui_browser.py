@@ -11,10 +11,17 @@ from typing import Any, cast
 import pytest
 from textual.widgets import Static
 
+import loop_supervisor.read_model.discovery as discovery
 import loop_supervisor.read_model.snapshot as snapshot_reader
 import loop_supervisor.read_model.verification as verification
 import loop_supervisor.tui.browser as browser
-from loop_supervisor.read_model import ProjectResolution, build_snapshot, load_current_run
+from loop_supervisor.read_model import (
+    ProjectResolution,
+    ProjectSnapshot,
+    SnapshotDiagnostic,
+    build_snapshot,
+    load_current_run,
+)
 from loop_supervisor.read_model.history import (
     HistoryDiagnostic,
     HistoryEntry,
@@ -263,6 +270,41 @@ async def test_run_browser_lists_newest_loadable_runs_and_degraded_rows_then_qui
         await pilot.press("q")
 
     assert app.is_running is False
+
+
+@pytest.mark.asyncio
+async def test_run_browser_bounds_sanitized_degraded_row_and_snapshot_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _persist_run(tmp_path, "degraded", updated_at="2026-01-02T00:00:00+00:00")
+    sensitive_path = "/private/credentials/state.json"
+
+    def fail_loading(_git_common_dir: Path, _run_id: str) -> RunState:
+        raise StateError(f"malformed snapshot at {sensitive_path}: {'secret' * 100_000}")
+
+    monkeypatch.setattr(discovery, "load_state", fail_loading)
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    oversized_diagnostic = "scan diagnostic\n" * 100_001
+    bounded_snapshot = ProjectSnapshot(
+        project=snapshot.project,
+        runs=snapshot.runs,
+        run_details=snapshot.run_details,
+        lock=snapshot.lock,
+        diagnostics=(SnapshotDiagnostic(code="scan_incomplete", message=oversized_diagnostic),),
+    )
+    app = RunBrowserApp(bounded_snapshot)
+    async with app.run_test():
+        row = cast(Any, app.screen.query_one(".run-row").render()).plain
+        diagnostic = cast(Any, app.screen.query_one(".snapshot-diagnostic").render()).plain
+
+        for rendered in (row, diagnostic):
+            assert len(rendered.encode("utf-8")) <= 256 * 1024
+            assert len(rendered.splitlines()) <= 10_000
+        assert "Browser output truncated: rendered-output limit reached." in diagnostic
+        assert "Run row is unloadable because the snapshot is malformed." in row
+        assert "Activity: not evidenced running (inactive at inspection time)" in row
+        assert sensitive_path not in row
+        assert "secret" not in row
 
 
 @pytest.mark.asyncio
