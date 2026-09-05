@@ -74,6 +74,7 @@ class RunBrowserApp(App[None]):
         self._detail_records: tuple[CurrentRun | HistoryEntry, ...] = ()
         self._openable_logs: tuple[verification.LogReference, ...] = ()
         self._run_id_by_row_index = tuple(summary.run_id for summary in snapshot.runs)
+        self._browser_highlighted_run_id: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -115,6 +116,7 @@ class RunBrowserApp(App[None]):
                         )
                         for summary in self._snapshot.runs
                     ),
+                    initial_index=self._browser_highlight_index(),
                     id="run-list",
                 )
             for diagnostic in self._snapshot.diagnostics:
@@ -359,6 +361,21 @@ class RunBrowserApp(App[None]):
             and len(rendered.splitlines()) <= cls._MAX_RECORD_DETAIL_RENDERED_LINES
         )
 
+    def _remember_browser_highlight(self) -> None:
+        """Capture the current browser cursor before replacing the list widget."""
+        run_list = self.query_one("#run-list", ListView)
+        if run_list.index is not None:
+            self._browser_highlighted_run_id = self._run_id_by_row_index[run_list.index]
+
+    def _browser_highlight_index(self) -> int:
+        """Return the refreshed row index for the remembered run, or the safe first row."""
+        if self._browser_highlighted_run_id is None:
+            return 0
+        try:
+            return self._run_id_by_row_index.index(self._browser_highlighted_run_id)
+        except ValueError:
+            return 0
+
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Open a selected run, record, or explicitly requested authorized log."""
         if event.list_view.id == "record-list":
@@ -372,6 +389,7 @@ class RunBrowserApp(App[None]):
             )
         else:
             self._selected_run_id = self._run_id_by_row_index[event.index]
+            self._browser_highlighted_run_id = self._selected_run_id
         self.call_after_refresh(self._show_selected_run)
 
     def _show_selected_run(self) -> None:
@@ -396,9 +414,12 @@ class RunBrowserApp(App[None]):
 
     def action_refresh(self) -> None:
         """Replace the displayed snapshot with a fresh disk scan by selected run ID."""
+        if self._selected_run_id is None:
+            self._remember_browser_highlight()
         self._selected_log_reference = None
         self._opened_log = None
         selected_run_id = self._selected_run_id
+        browser_highlighted_run_id = self._browser_highlighted_run_id
         try:
             refreshed_snapshot = build_snapshot(self._snapshot.project)
         except (StateError, OSError):
@@ -411,6 +432,8 @@ class RunBrowserApp(App[None]):
         self._snapshot = refreshed_snapshot
         self._refresh_failure = None
         self._run_id_by_row_index = tuple(summary.run_id for summary in self._snapshot.runs)
+        if browser_highlighted_run_id not in self._run_id_by_row_index:
+            self._browser_highlighted_run_id = None
         if selected_run_id not in self._run_id_by_row_index:
             self._selected_run_id = None
         self.refresh(recompose=True)
@@ -435,8 +458,14 @@ class RunBrowserApp(App[None]):
             self.call_after_refresh(self._focus_run_list)
 
     def _focus_run_list(self) -> None:
-        """Restore keyboard navigation after the browser has been recomposed."""
-        self.query_one(ListView).focus()
+        """Restore the browser cursor by run ID after the list has been recomposed."""
+        run_list = self.query_one("#run-list", ListView)
+        if self._browser_highlighted_run_id is not None:
+            try:
+                run_list.index = self._run_id_by_row_index.index(self._browser_highlighted_run_id)
+            except ValueError:
+                self._browser_highlighted_run_id = None
+        run_list.focus()
 
     @classmethod
     def _bound_browser_output(cls, text: str) -> str:

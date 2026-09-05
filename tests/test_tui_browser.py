@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from textual.widgets import Static
+from textual.widgets import ListView, Static
 
 import loop_supervisor.read_model.discovery as discovery
 import loop_supervisor.read_model.snapshot as snapshot_reader
@@ -409,7 +409,7 @@ async def test_run_browser_manual_refresh_updates_rows_and_reconciles_removed_se
         assert ["newer" in row for row in refreshed_rows] == [True, False]
         assert ["older" in row for row in refreshed_rows] == [False, True]
 
-        await pilot.press("enter")
+        await pilot.press("up", "enter")
         detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
         assert "Run ID: newer" in detail
 
@@ -427,6 +427,46 @@ async def test_run_browser_manual_refresh_updates_rows_and_reconciles_removed_se
         assert app.screen.query_one("#run-browser")
         remaining_rows = [cast(Any, row.render()).plain for row in app.screen.query(".run-row")]
         assert ["older" in row for row in remaining_rows] == [True]
+
+
+@pytest.mark.asyncio
+async def test_run_browser_refresh_restores_highlighted_run_id_when_order_changes(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "older", updated_at="2026-01-01T00:00:00+00:00")
+    _persist_run(tmp_path, "selected", updated_at="2026-01-02T00:00:00+00:00")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("down")
+        _persist_run(tmp_path, "older", updated_at="2026-01-03T00:00:00+00:00")
+
+        await pilot.press("r")
+
+        run_list = app.screen.query_one("#run-list", ListView)
+        assert run_list.highlighted_child is not None
+        assert app._run_id_by_row_index[run_list.index or 0] == "older"
+
+
+@pytest.mark.asyncio
+async def test_run_browser_refresh_falls_back_when_highlighted_run_is_removed(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "older", updated_at="2026-01-01T00:00:00+00:00")
+    _persist_run(tmp_path, "selected", updated_at="2026-01-02T00:00:00+00:00")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("down")
+        (tmp_path / "loop-supervisor" / "runs" / "older.json").unlink()
+
+        await pilot.press("r")
+
+        run_list = app.screen.query_one("#run-list", ListView)
+        assert run_list.highlighted_child is not None
+        assert app._run_id_by_row_index[run_list.index or 0] == "selected"
 
 
 @pytest.mark.asyncio
@@ -462,6 +502,21 @@ async def test_run_browser_refresh_failure_preserves_snapshot_selection_and_clos
         assert app._selected_log_reference is None
         assert diagnostic == "Refresh failed: unable to scan supervisor run state."
         assert "raw replaced-state-directory path" not in diagnostic
+
+
+@pytest.mark.asyncio
+async def test_run_browser_restores_highlighted_run_id_after_back(tmp_path: Path) -> None:
+    _persist_run(tmp_path, "older", updated_at="2026-01-01T00:00:00+00:00")
+    _persist_run(tmp_path, "selected", updated_at="2026-01-02T00:00:00+00:00")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("down", "enter", "b")
+
+        run_list = app.screen.query_one("#run-list", ListView)
+        assert run_list.highlighted_child is not None
+        assert app._run_id_by_row_index[run_list.index or 0] == "older"
 
 
 @pytest.mark.asyncio
