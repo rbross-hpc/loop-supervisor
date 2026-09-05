@@ -43,6 +43,36 @@ _COUNTER_FIELDS = frozenset(
         "builder_guidance_count",
     }
 )
+_RESET_TRANSITIONS_BY_COUNTER: dict[str, frozenset[tuple[str, str]]] = {
+    "revision_count": frozenset(
+        {
+            ("planning", "building"),
+            ("planning", "architecting"),
+            ("creating_worktree", "building"),
+            ("creating_worktree", "architecting"),
+            ("cleanup_branch", "planning"),
+        }
+    ),
+    "replan_count": frozenset({("cleanup_branch", "planning")}),
+    "architect_retry_count": frozenset(
+        {
+            ("recording_decision", "building"),
+            ("recording_decision", "planning"),
+            ("cleanup_branch", "planning"),
+        }
+    ),
+    "builder_guidance_count": frozenset(
+        {
+            ("planning", "building"),
+            ("planning", "architecting"),
+            ("creating_worktree", "building"),
+            ("creating_worktree", "architecting"),
+            ("building", "verifying"),
+            ("building", "auditing"),
+            ("cleanup_branch", "planning"),
+        }
+    ),
+}
 _RECORD_FIELDS = frozenset(
     {
         "seq",
@@ -237,6 +267,7 @@ def _load_enumerated(
             )
 
     _append_gap_diagnostics(entries, diagnostics)
+    _append_adjacent_contradiction_diagnostics(entries, diagnostics)
     completeness = HistoryStatus.COMPLETE if not diagnostics else HistoryStatus.INCOMPLETE
     return HistoryLoad(tuple(entries), completeness, tuple(diagnostics))
 
@@ -295,6 +326,52 @@ def _append_gap_diagnostics(
                 reason = f"sequence gap from {expected} to {seq - 1}"
             diagnostics.append(HistoryDiagnostic(str(expected), reason, expected))
         expected = seq + 1
+
+
+def _append_adjacent_contradiction_diagnostics(
+    entries: list[HistoryEntry], diagnostics: list[HistoryDiagnostic]
+) -> None:
+    """Report contradictions between successive valid records without omitting either."""
+    for preceding, following in zip(entries, entries[1:], strict=False):
+        if preceding.phase_after != following.phase:
+            diagnostics.append(
+                HistoryDiagnostic(
+                    str(following.seq),
+                    f"phase discontinuity after sequence {preceding.seq}",
+                    following.seq,
+                )
+            )
+        if _parse_recorded_at(preceding.recorded_at) > _parse_recorded_at(following.recorded_at):
+            diagnostics.append(
+                HistoryDiagnostic(
+                    str(following.seq),
+                    f"recorded timestamp reversal after sequence {preceding.seq}",
+                    following.seq,
+                )
+            )
+        for field in sorted(_COUNTER_FIELDS):
+            is_regression = following.counters[field] < preceding.counters[field]
+            if is_regression and not _is_permitted_counter_reset(field, following):
+                diagnostics.append(
+                    HistoryDiagnostic(
+                        str(following.seq),
+                        f"counter regression for {field} after sequence {preceding.seq}",
+                        following.seq,
+                    )
+                )
+
+
+def _is_permitted_counter_reset(field: str, following: HistoryEntry) -> bool:
+    """Return whether a decreased counter is a documented reset on this transition."""
+    return following.counters[field] == 0 and (
+        following.phase,
+        following.phase_after,
+    ) in _RESET_TRANSITIONS_BY_COUNTER.get(field, frozenset())
+
+
+def _parse_recorded_at(recorded_at: str) -> datetime:
+    """Parse a timestamp already validated while constructing a history entry."""
+    return datetime.fromisoformat(recorded_at)
 
 
 def _validate_record(raw: Any, run_id: str, filename_seq: int, filename_phase: str) -> HistoryEntry:
