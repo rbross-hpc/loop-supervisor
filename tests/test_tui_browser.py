@@ -9,7 +9,14 @@ from typing import Any, cast
 import pytest
 
 from loop_supervisor.read_model import ProjectResolution, build_snapshot
+from loop_supervisor.read_model.history import (
+    HistoryDiagnostic,
+    HistoryEntry,
+    HistoryLoad,
+    HistoryStatus,
+)
 from loop_supervisor.state import STATE_SCHEMA_VERSION, RunOptions, RunState, save_state
+from loop_supervisor.supervisor import AdvanceStatus
 from loop_supervisor.tui import RunBrowserApp
 
 
@@ -55,6 +62,69 @@ def _persist_run(git_common_dir: Path, run_id: str, *, updated_at: str) -> None:
     state = json.loads(state_path.read_text())
     state["updated_at"] = updated_at
     state_path.write_text(json.dumps(state))
+
+
+def _persist_history(
+    git_common_dir: Path,
+    run_id: str,
+    name: str,
+    *,
+    seq: int,
+    phase: str = "planning",
+    phase_after: str = "creating_worktree",
+    status: str = "advanced",
+    recorded_at: str = "2026-01-03T00:00:00+00:00",
+    has_result: bool = True,
+    has_error: bool = False,
+) -> None:
+    directory = git_common_dir / "loop-supervisor" / "runs" / run_id
+    directory.mkdir(parents=True, exist_ok=True)
+    record: dict[str, object] = {
+        "seq": seq,
+        "run_id": run_id,
+        "phase": phase,
+        "phase_after": phase_after,
+        "status": status,
+        "recorded_at": recorded_at,
+        "original_task_id": None,
+        "counters": {
+            "accepted_task_count": 2,
+            "revision_count": 1,
+            "replan_count": 0,
+            "architect_retry_count": 0,
+            "builder_guidance_count": 0,
+        },
+        "result": None,
+        "error": None,
+    }
+    if has_result:
+        record["result"] = {
+            "status": "COMPLETE",
+            "task_id": None,
+            "objective": None,
+            "rationale": None,
+            "acceptance_criteria": [],
+            "relevant_files": [],
+            "design_questions": [],
+            "decision_required": False,
+            "decision_question": None,
+            "decision_rationale": None,
+        }
+    if has_error:
+        record["error"] = {
+            "error_id": "history-error",
+            "kind": "operational",
+            "operation": phase,
+            "failed_phase": phase,
+            "retry_phase": None,
+            "exception_type": "RuntimeError",
+            "message": "recorded failure",
+            "retryable": False,
+            "requires_repair": False,
+            "recovery_hint": None,
+            "occurred_at": "2026-01-03T00:00:00+00:00",
+        }
+    (directory / name).write_text(json.dumps(record))
 
 
 @pytest.mark.asyncio
@@ -128,6 +198,84 @@ async def test_run_browser_opens_run_id_with_period(
 
 
 @pytest.mark.asyncio
+async def test_run_detail_renders_ordered_incomplete_history_timeline(tmp_path: Path) -> None:
+    _persist_run(tmp_path, "selected", updated_at="2026-01-04T00:00:00+00:00")
+    _persist_history(
+        tmp_path,
+        "selected",
+        "0003-planning.json",
+        seq=3,
+        phase_after="creating_worktree",
+        recorded_at="2026-01-03T03:00:00+00:00",
+        has_result=False,
+        has_error=True,
+    )
+    _persist_history(
+        tmp_path,
+        "selected",
+        "0001-planning.json",
+        seq=1,
+        recorded_at="2026-01-03T01:00:00+00:00",
+    )
+    (tmp_path / "loop-supervisor" / "runs" / "selected" / "0002-planning.json").write_text("{")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+
+        timeline = cast(Any, app.screen.query_one(".run-detail-timeline").render()).plain
+        assert timeline.index("Sequence 1") < timeline.index("Sequence 3")
+        assert "Phase: planning → creating_worktree" in timeline
+        assert "Outcome: advanced" in timeline
+        assert "Recorded: 2026-01-03T01:00:00+00:00" in timeline
+        expected_counters = (
+            "Counters: accepted tasks=2, revisions=1, replans=0, "
+            "architect retries=0, builder guidance=0"
+        )
+        assert expected_counters in timeline
+        assert "Result: available; Error: unavailable" in timeline
+        assert "Recorded: 2026-01-03T03:00:00+00:00" in timeline
+        assert "Result: unavailable; Error: available" in timeline
+        assert "Workflow timeline: incomplete" in timeline
+        assert "0002-planning.json: malformed history record" in timeline
+
+
+def test_timeline_rendering_reserves_incomplete_diagnostic_within_output_limits() -> None:
+    entry = HistoryEntry(
+        seq=1,
+        phase="planning",
+        phase_after="creating_worktree",
+        status=AdvanceStatus.ADVANCED,
+        recorded_at="2026-01-03T00:00:00+00:00",
+        counters={
+            "accepted_task_count": 2,
+            "revision_count": 1,
+            "replan_count": 0,
+            "architect_retry_count": 0,
+            "builder_guidance_count": 0,
+        },
+        original_task_id=None,
+        has_result=True,
+        has_error=False,
+    )
+    history = HistoryLoad(
+        entries=(entry,) * 10_000,
+        completeness=HistoryStatus.INCOMPLETE,
+        diagnostics=(HistoryDiagnostic("0002-planning.json", "malformed history record", 2),),
+    )
+
+    timeline = RunBrowserApp._render_history(history)
+
+    assert len(timeline.encode("utf-8")) <= 256 * 1024
+    assert len(timeline.splitlines()) <= 10_000
+    assert "Timeline output truncated: rendered-output limit reached." in timeline
+    assert "Workflow timeline: incomplete" in timeline
+    assert "Timeline diagnostics:" in timeline
+    assert "0002-planning.json: malformed history record" in timeline
+
+
+@pytest.mark.asyncio
 async def test_run_browser_opens_unloadable_run_as_safe_unavailable_detail_and_quits(
     tmp_path: Path,
 ) -> None:
@@ -146,6 +294,9 @@ async def test_run_browser_opens_unloadable_run_as_safe_unavailable_detail_and_q
         assert "Durable phase:" not in detail
         assert "Created:" not in detail
         assert "Accepted tasks:" not in detail
+
+        timeline = cast(Any, app.screen.query_one(".run-detail-timeline").render()).plain
+        assert timeline == "Workflow timeline: unavailable (no recorded history)."
 
         await pilot.press("q")
 
