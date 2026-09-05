@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 from pathlib import Path
 from typing import Any, cast
 
@@ -62,6 +64,25 @@ def _persist_run(git_common_dir: Path, run_id: str, *, updated_at: str) -> None:
     state = json.loads(state_path.read_text())
     state["updated_at"] = updated_at
     state_path.write_text(json.dumps(state))
+
+
+def _persist_lock(git_common_dir: Path, *, run_id: str | None, hostname: str | None = None) -> None:
+    directory = git_common_dir / "loop-supervisor"
+    directory.mkdir(exist_ok=True)
+    (directory / "supervisor.lock").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "token": "browser-test-ownership-token",
+                "pid": os.getpid(),
+                "hostname": hostname or socket.gethostname(),
+                "started_at": "2026-01-03T00:00:00Z",
+                "operation": "run",
+                "run_id": run_id,
+                "integration_path": str(git_common_dir),
+            }
+        )
+    )
 
 
 def _persist_history(
@@ -148,6 +169,65 @@ async def test_run_browser_lists_newest_loadable_runs_and_degraded_rows_then_qui
         await pilot.press("q")
 
     assert app.is_running is False
+
+
+@pytest.mark.asyncio
+async def test_run_browser_displays_evidence_based_activity_and_safe_lock_details(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "associated", updated_at="2026-01-02T00:00:00+00:00")
+    _persist_run(tmp_path, "other", updated_at="2026-01-01T00:00:00+00:00")
+    _persist_lock(tmp_path, run_id="associated")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        rendered_rows = [cast(Any, row.render()).plain for row in app.screen.query(".run-row")]
+        associated_row = next(row for row in rendered_rows if row.startswith("associated"))
+        other_row = next(row for row in rendered_rows if row.startswith("other"))
+        assert "Activity: running" in associated_row
+        assert "Activity: not evidenced running" in other_row
+
+        await pilot.press("enter")
+
+        detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert "Activity: running" in detail
+        assert "Lock observation: local live associated" in detail
+        assert "Lock started: 2026-01-03T00:00:00Z" in detail
+        assert f"Lock hostname: {socket.gethostname()}" in detail
+        assert f"Lock PID: {os.getpid()}" in detail
+        assert "Lock operation: run" in detail
+        assert "Lock association: associated" in detail
+        assert f"Lock integration path: {tmp_path}" in detail
+        assert "browser-test-ownership-token" not in detail
+
+        await pilot.press("b")
+        (tmp_path / "loop-supervisor" / "supervisor.lock").unlink()
+        await pilot.press("r")
+
+        absent_rows = [cast(Any, row.render()).plain for row in app.screen.query(".run-row")]
+        assert all(
+            "Activity: not evidenced running (inactive at inspection time)" in row
+            for row in absent_rows
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_detail_bounds_oversized_multiline_lock_metadata(tmp_path: Path) -> None:
+    _persist_run(tmp_path, "selected", updated_at="2026-01-02T00:00:00+00:00")
+    _persist_lock(tmp_path, run_id="selected", hostname=("host\n" * 100_001))
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+
+        detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert len(detail.encode("utf-8")) <= 256 * 1024
+        assert len(detail.splitlines()) <= 10_000
+        assert "Summary output truncated: rendered-output limit reached." in detail
+        assert "Activity: not evidenced running" in detail
+        assert "Lock observation: remote" in detail
 
 
 @pytest.mark.asyncio

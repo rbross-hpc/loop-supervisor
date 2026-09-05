@@ -9,6 +9,7 @@ from textual.widgets import Footer, Header, ListItem, ListView, Static
 from ..read_model.current_run import CurrentRun, load_current_run
 from ..read_model.discovery import RunSummary
 from ..read_model.history import HistoryEntry, HistoryLoad, HistoryStatus, load_history
+from ..read_model.lock_observation import ActivityLabel, LockActivity, LockObservation
 from ..read_model.snapshot import ProjectSnapshot, build_snapshot
 
 
@@ -18,6 +19,9 @@ class RunBrowserApp(App[None]):
     _MAX_TIMELINE_RENDERED_BYTES = 256 * 1024
     _MAX_TIMELINE_RENDERED_LINES = 10_000
     _TIMELINE_TRUNCATION_MARKER = "Timeline output truncated: rendered-output limit reached."
+    _MAX_SUMMARY_RENDERED_BYTES = 256 * 1024
+    _MAX_SUMMARY_RENDERED_LINES = 10_000
+    _SUMMARY_TRUNCATION_MARKER = "Summary output truncated: rendered-output limit reached."
 
     TITLE = "Loop Supervisor"
     SUB_TITLE = "Run browser"
@@ -64,7 +68,11 @@ class RunBrowserApp(App[None]):
                 yield ListView(
                     *(
                         ListItem(
-                            Static(self._render_run(summary), markup=False, classes="run-row"),
+                            Static(
+                                self._render_run(summary, self._snapshot.lock),
+                                markup=False,
+                                classes="run-row",
+                            ),
                         )
                         for summary in self._snapshot.runs
                     ),
@@ -79,7 +87,9 @@ class RunBrowserApp(App[None]):
         with VerticalScroll(id="run-detail"):
             yield Static("Run detail — press b to return to the browser.", markup=False)
             yield Static(
-                self._render_current_run(current), markup=False, classes="run-detail-summary"
+                self._render_current_run(current, self._snapshot.lock),
+                markup=False,
+                classes="run-detail-summary",
             )
             yield Static(self._render_history(history), markup=False, classes="run-detail-timeline")
 
@@ -115,14 +125,48 @@ class RunBrowserApp(App[None]):
         self.query_one(ListView).focus()
 
     @staticmethod
-    def _render_run(summary: RunSummary) -> str:
-        """Return literal row text without constructing Rich markup from disk data."""
+    def _render_run(summary: RunSummary, lock: LockObservation) -> str:
+        """Return literal durable state and lock evidence without inferring activity."""
+        activity = RunBrowserApp._activity_label(summary.run_id, lock)
         if not summary.loadable:
-            return f"{summary.run_id} — unloadable: {summary.diagnostic or 'unavailable'}"
+            return (
+                f"{summary.run_id} — unloadable: {summary.diagnostic or 'unavailable'} — "
+                f"Activity: {activity}"
+            )
         return (
             f"{summary.run_id} — {summary.phase or 'unknown'} — "
-            f"updated {summary.updated_at or 'unavailable'}"
+            f"updated {summary.updated_at or 'unavailable'} — Activity: {activity}"
         )
+
+    @staticmethod
+    def _activity_label(run_id: str, lock: LockObservation) -> str:
+        """Render only the per-run classification returned by the lock reader."""
+        label = next((item.label for item in lock.activities if item.run_id == run_id), None)
+        if label is ActivityLabel.RUNNING:
+            return "running"
+        if lock.activity is LockActivity.ABSENT:
+            return "not evidenced running (inactive at inspection time)"
+        return "not evidenced running"
+
+    @staticmethod
+    def _render_lock_observation(lock: LockObservation) -> tuple[str, ...]:
+        """Render safe repository-level evidence without exposing lock ownership credentials."""
+        lines = [f"Lock observation: {lock.activity.value.replace('_', ' ')}"]
+        if lock.started_at is not None:
+            lines.append(f"Lock started: {lock.started_at}")
+        if lock.hostname is not None:
+            lines.append(f"Lock hostname: {lock.hostname}")
+        if lock.pid is not None:
+            lines.append(f"Lock PID: {lock.pid}")
+        if lock.operation is not None:
+            lines.append(f"Lock operation: {lock.operation}")
+        if lock.run_id is not None:
+            lines.append(f"Lock association: {lock.run_id}")
+        if lock.integration_path is not None:
+            lines.append(f"Lock integration path: {lock.integration_path}")
+        if lock.diagnostic is not None:
+            lines.append(f"Lock diagnostic: {lock.diagnostic}")
+        return tuple(lines)
 
     @classmethod
     def _render_history(cls, history: HistoryLoad) -> str:
@@ -192,20 +236,29 @@ class RunBrowserApp(App[None]):
             <= cls._MAX_TIMELINE_RENDERED_BYTES
         )
 
-    @staticmethod
-    def _render_current_run(current: CurrentRun) -> str:
-        """Render only validated summary fields, or a safe unavailable diagnostic."""
+    @classmethod
+    def _render_current_run(cls, current: CurrentRun, lock: LockObservation) -> str:
+        """Render bounded state and evidence while retaining its essential classification."""
+        activity = cls._activity_label(current.run_id, lock)
+        classification_lines = [
+            f"Run ID: {current.run_id}",
+            f"Activity: {activity}",
+            f"Lock observation: {lock.activity.value.replace('_', ' ')}",
+        ]
+        lock_lines = cls._render_lock_observation(lock)[1:]
         if not current.loadable:
-            return "\n".join(
-                (
-                    f"Run ID: {current.run_id}",
+            return cls._bound_summary_lines(
+                [
+                    *classification_lines,
                     "Details: unavailable",
+                    *lock_lines,
                     current.diagnostic or "Unavailable.",
-                )
+                ]
             )
-        return "\n".join(
-            (
-                f"Run ID: {current.run_id}",
+        return cls._bound_summary_lines(
+            [
+                *classification_lines,
+                *lock_lines,
                 f"Durable phase: {current.phase}",
                 f"Created: {current.created_at}",
                 f"Updated: {current.updated_at}",
@@ -219,5 +272,34 @@ class RunBrowserApp(App[None]):
                 f"  Builder guidance: {current.builder_guidance_count}",
                 f"Pending question: {current.pending_question or 'unavailable'}",
                 f"Latest operational error: {current.latest_operational_error or 'unavailable'}",
-            )
+            ]
+        )
+
+    @classmethod
+    def _bound_summary_lines(cls, lines: list[str]) -> str:
+        """Bound summary output while preserving its activity and lock classification."""
+        rendered = "\n".join(lines)
+        if cls._within_summary_limits(rendered):
+            return rendered
+
+        marker = cls._SUMMARY_TRUNCATION_MARKER
+        classification_lines = lines[:3]
+        reserved = "\n".join((*classification_lines, marker))
+        available_bytes = cls._MAX_SUMMARY_RENDERED_BYTES - len(reserved.encode("utf-8"))
+        available_lines = cls._MAX_SUMMARY_RENDERED_LINES - len(classification_lines) - 1
+        rendered_evidence: list[str] = []
+        for line in "\n".join(lines[3:]).splitlines():
+            line_bytes = len(line.encode("utf-8")) + 1
+            if len(rendered_evidence) == available_lines or line_bytes > available_bytes:
+                break
+            rendered_evidence.append(line)
+            available_bytes -= line_bytes
+        return "\n".join((*classification_lines, *rendered_evidence, marker))
+
+    @classmethod
+    def _within_summary_limits(cls, rendered: str) -> bool:
+        """Return whether literal summary text fits the ADR display limits."""
+        return (
+            len(rendered.encode("utf-8")) <= cls._MAX_SUMMARY_RENDERED_BYTES
+            and len(rendered.splitlines()) <= cls._MAX_SUMMARY_RENDERED_LINES
         )
