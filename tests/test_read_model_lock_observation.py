@@ -83,6 +83,7 @@ def test_observe_lock_rejects_float_schema_version_on_genuine_v2_record(tmp_path
     observation = observe_lock(tmp_path, tmp_path, (_summary(),))
 
     assert observation.activity is LockActivity.MALFORMED
+    assert observation.diagnostic == "lock record has an unsupported schema version"
 
 
 @pytest.mark.parametrize(
