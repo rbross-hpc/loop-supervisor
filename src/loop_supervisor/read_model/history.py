@@ -237,6 +237,7 @@ def _load_enumerated(
             )
 
     _append_gap_diagnostics(entries, diagnostics)
+    _append_adjacent_contradiction_diagnostics(entries, diagnostics)
     completeness = HistoryStatus.COMPLETE if not diagnostics else HistoryStatus.INCOMPLETE
     return HistoryLoad(tuple(entries), completeness, tuple(diagnostics))
 
@@ -295,6 +296,43 @@ def _append_gap_diagnostics(
                 reason = f"sequence gap from {expected} to {seq - 1}"
             diagnostics.append(HistoryDiagnostic(str(expected), reason, expected))
         expected = seq + 1
+
+
+def _append_adjacent_contradiction_diagnostics(
+    entries: list[HistoryEntry], diagnostics: list[HistoryDiagnostic]
+) -> None:
+    """Report contradictions between successive valid records without omitting either."""
+    for preceding, following in zip(entries, entries[1:], strict=False):
+        if preceding.phase_after != following.phase:
+            diagnostics.append(
+                HistoryDiagnostic(
+                    str(following.seq),
+                    f"phase discontinuity after sequence {preceding.seq}",
+                    following.seq,
+                )
+            )
+        if _parse_recorded_at(preceding.recorded_at) > _parse_recorded_at(following.recorded_at):
+            diagnostics.append(
+                HistoryDiagnostic(
+                    str(following.seq),
+                    f"recorded timestamp reversal after sequence {preceding.seq}",
+                    following.seq,
+                )
+            )
+        for field in sorted(_COUNTER_FIELDS):
+            if following.counters[field] < preceding.counters[field]:
+                diagnostics.append(
+                    HistoryDiagnostic(
+                        str(following.seq),
+                        f"counter regression for {field} after sequence {preceding.seq}",
+                        following.seq,
+                    )
+                )
+
+
+def _parse_recorded_at(recorded_at: str) -> datetime:
+    """Parse a timestamp already validated while constructing a history entry."""
+    return datetime.fromisoformat(recorded_at)
 
 
 def _validate_record(raw: Any, run_id: str, filename_seq: int, filename_phase: str) -> HistoryEntry:

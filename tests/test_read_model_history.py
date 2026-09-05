@@ -57,8 +57,10 @@ def test_load_history_reports_absent_when_history_directory_is_missing(tmp_path)
 
 
 def test_load_history_returns_valid_records_in_numeric_sequence_order(tmp_path):
+    first = _record("run-1", 1)
+    first["phase_after"] = "planning"
     _write_history(tmp_path, "0002-planning.json", _record("run-1", 2))
-    _write_history(tmp_path, "0001-planning.json", _record("run-1", 1))
+    _write_history(tmp_path, "0001-planning.json", first)
 
     loaded = load_history(tmp_path, "run-1")
 
@@ -66,6 +68,70 @@ def test_load_history_returns_valid_records_in_numeric_sequence_order(tmp_path):
     assert all(entry.has_result and not entry.has_error for entry in loaded.entries)
     assert loaded.completeness is HistoryStatus.COMPLETE
     assert loaded.diagnostics == ()
+
+
+def _consistent_adjacent_records() -> tuple[dict[str, object], dict[str, object]]:
+    first = _record("run-1", 1)
+    second = _record("run-1", 2, "creating_worktree")
+    second["phase_after"] = "planning"
+    second["recorded_at"] = "2026-01-01T00:00:01+00:00"
+    second["result"] = None
+    return first, second
+
+
+def test_load_history_diagnoses_adjacent_phase_discontinuity_without_omitting_records(tmp_path):
+    first, second = _consistent_adjacent_records()
+    second["phase"] = "awaiting_input"
+    _write_history(tmp_path, "0001-planning.json", first)
+    _write_history(tmp_path, "0002-awaiting_input.json", second)
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert [(entry.seq, entry.phase, entry.phase_after) for entry in loaded.entries] == [
+        (1, "planning", "creating_worktree"),
+        (2, "awaiting_input", "planning"),
+    ]
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert any("phase discontinuity" in diagnostic.reason for diagnostic in loaded.diagnostics)
+
+
+def test_load_history_diagnoses_adjacent_recorded_timestamp_reversal_without_omitting_records(
+    tmp_path,
+):
+    first, second = _consistent_adjacent_records()
+    second["recorded_at"] = "2025-12-31T23:59:59+00:00"
+    _write_history(tmp_path, "0001-planning.json", first)
+    _write_history(tmp_path, "0002-creating_worktree.json", second)
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert [(entry.seq, entry.recorded_at) for entry in loaded.entries] == [
+        (1, "2026-01-01T00:00:00+00:00"),
+        (2, "2025-12-31T23:59:59+00:00"),
+    ]
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert any("timestamp reversal" in diagnostic.reason for diagnostic in loaded.diagnostics)
+
+
+def test_load_history_diagnoses_adjacent_counter_regression_without_omitting_records(tmp_path):
+    first, second = _consistent_adjacent_records()
+    first_counters = first["counters"]
+    second_counters = second["counters"]
+    assert isinstance(first_counters, dict)
+    assert isinstance(second_counters, dict)
+    first_counters["revision_count"] = 2
+    second_counters["revision_count"] = 1
+    _write_history(tmp_path, "0001-planning.json", first)
+    _write_history(tmp_path, "0002-creating_worktree.json", second)
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert [(entry.seq, entry.counters["revision_count"]) for entry in loaded.entries] == [
+        (1, 2),
+        (2, 1),
+    ]
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert any("counter regression" in diagnostic.reason for diagnostic in loaded.diagnostics)
 
 
 def test_load_history_retains_validated_detail_and_round_trippable_raw_json(tmp_path):
@@ -235,8 +301,13 @@ def test_load_history_diagnoses_oversized_filename_sequence_without_crashing(tmp
 
 def test_load_history_reports_huge_sparse_sequence_as_one_bounded_gap(tmp_path):
     huge_seq = 99_999_999_999_999_999_999
-    _write_history(tmp_path, "0001-planning.json", _record("run-1", 1))
-    _write_history(tmp_path, f"{huge_seq}-planning.json", _record("run-1", huge_seq))
+    first = _record("run-1", 1)
+    following = _record("run-1", huge_seq, "creating_worktree")
+    following["phase_after"] = "planning"
+    following["recorded_at"] = "2026-01-01T00:00:01+00:00"
+    following["result"] = None
+    _write_history(tmp_path, "0001-planning.json", first)
+    _write_history(tmp_path, f"{huge_seq}-creating_worktree.json", following)
 
     loaded = load_history(tmp_path, "run-1")
 
