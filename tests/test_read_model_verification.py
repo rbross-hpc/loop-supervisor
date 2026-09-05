@@ -338,9 +338,10 @@ def test_read_log_reports_replacement_after_first_fstat(tmp_path, monkeypatch):
     assert content.changed_during_read is True
 
 
-def test_read_log_reports_in_place_mutation_of_opened_inode(tmp_path, monkeypatch):
+def test_read_log_reports_size_changing_in_place_mutation_of_opened_inode(tmp_path, monkeypatch):
     directory = _directory(tmp_path)
     log = directory / "01.log"
+    # This deliberately changes size; it does not claim same-size detection.
     log.write_text("before mutation")
     reference = discover_verification(tmp_path, "run-1", _result(tmp_path)).attempts[0].log
     assert reference is not None

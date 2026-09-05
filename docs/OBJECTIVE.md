@@ -237,25 +237,22 @@ mypy/pytest gates, as all prior priorities.
     does not reflect any actual contradiction in the underlying history.
     Skip the adjacent-record comparison whenever the two records are not
     truly sequence-adjacent (`following.seq != preceding.seq + 1`).
-23. Record an ADR describing the accepted scope of the verification log
-    post-read mutation check, and correct this objective and the shipped
-    code to match it precisely. The current check reliably detects a log
-    replaced by a different inode after the first read, but a same-size,
-    same-inode in-place rewrite is detected only when the file's mtime
-    changes at the granularity the filesystem actually provides; on at
-    least one supported filesystem this granularity is coarse enough that
-    an ordinary (non-adversarial) same-size concurrent rewrite is missed
-    in the common case, and an adversarial rewrite that restores the
-    original mtime is never detected by this check at all. The ADR must
-    state plainly which mutation shapes are and are not detected and why
-    closing the remaining gap is or is not warranted now. If the decision
-    is to accept the current scope, correct item 13's historical wording
-    above (already satisfied) and the corresponding test's naming/intent
-    so neither overstates same-size in-place detection as covered. If the
-    decision is to close the gap, implement it as a follow-on slice using
-    a stronger, still-explicit, still-bounded, still-descriptor-relative
-    check, with a test that exercises a genuine same-size, same-mtime
-    in-place rewrite (not only a size-changing one).
+23. ADR 0040 records the verification-log post-read mutation-check scope.
+    The shipped metadata and reopen-by-name check detects a replacement only
+    when the reopened target's numeric inode number (`st_ino`) changed, and
+    detects an in-place rewrite of the opened inode when its size or
+    `mtime_ns` changes between observations. It does **not** detect a
+    replacement whose reopened target has the same `st_ino` but a different
+    device (`st_dev`), or a genuine same-size, same-`mtime_ns` in-place
+    rewrite of that inode; coarse filesystem timestamp behavior can produce
+    the latter shape for an ordinary concurrent rewrite, and a rewrite that
+    restores the original timestamp can deliberately produce it. The ADR
+    declines to treat that metadata-only scope as the finished contract while
+    keeping this documentation-and-test-correction slice separately
+    mergeable. Its follow-on implementation will use a stronger, explicit,
+    bounded, descriptor-relative content comparison and a genuine same-size,
+    same-`mtime_ns` in-place-rewrite test. That future check remains an
+    observational warning and does not change current `RunState`'s authority.
 24. Diagnostic-hygiene cleanup, each independently mergeable:
     - Apply the verification read model's existing bounded-name helper to
       every diagnostic site that includes an untrusted filename, not only
@@ -388,8 +385,12 @@ The objective is complete when:
   regression, current-state disagreement) surface as diagnostics without
   overriding current `RunState`, and a sequence gap does not also produce a
   spurious adjacent-record contradiction;
-- the verification log mutation-detection scope is recorded in an ADR and
-  this objective's wording matches what is actually implemented;
+- ADR 0040 records the verification-log mutation-detection scope: the
+  shipped reopen check detects only a changed numeric inode number (`st_ino`),
+  while the descriptor check detects size- or `mtime_ns`-changing in-place
+  rewrites; it does not detect a same-`st_ino`, different-`st_dev`
+  replacement or a same-size, same-`mtime_ns` in-place rewrite; the stronger
+  bounded content comparison remains a separately scheduled follow-on;
 - the distribution version is bumped to `0.2.0` and observable at runtime
   via both `loop-supervisor --version` and `doctor`, sourced from package
   metadata rather than duplicated in source; the release tag itself is
