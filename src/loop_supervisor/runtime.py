@@ -845,6 +845,7 @@ class RunSession:
                     options=options,
                 )
                 run_state = supervisor.start_new_run()
+                lock.bind_run_id(run_state.run_id)
             else:
                 assert self._run_id is not None
                 try:
