@@ -383,6 +383,34 @@ def test_load_history_excludes_identity_mismatched_record(tmp_path):
     assert any("run_id" in diagnostic.reason for diagnostic in loaded.diagnostics)
 
 
+@pytest.mark.parametrize(
+    ("record_change", "raw_reason"),
+    [
+        (lambda record: record.update(seq=2), "embedded seq does not match filename"),
+        (
+            lambda record: record.update(run_id="other-run"),
+            "embedded run_id does not match selected run",
+        ),
+        (lambda record: record.update(phase="building"), "embedded phase does not match filename"),
+    ],
+)
+def test_load_history_sanitizes_embedded_filename_identity_mismatch(
+    tmp_path, record_change, raw_reason
+):
+    record = _record("run-1", 1)
+    record_change(record)
+    _write_history(tmp_path, "0001-planning.json", record)
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert loaded.entries == ()
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert [diagnostic.reason for diagnostic in loaded.diagnostics] == [
+        "history record embedded seq, run_id, or phase mismatch"
+    ]
+    assert all(raw_reason not in diagnostic.reason for diagnostic in loaded.diagnostics)
+
+
 def test_load_history_reports_record_that_disappears_after_enumeration(tmp_path, monkeypatch):
     record_path = _write_history(tmp_path, "0001-planning.json", _record("run-1", 1))
     original_read = history.read_bounded_json
