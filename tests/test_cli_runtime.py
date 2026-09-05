@@ -818,6 +818,28 @@ def test_cmd_tui_starts_the_read_only_browser_after_scanning(tmp_path, monkeypat
     assert started == [snapshot]
 
 
+def test_cmd_tui_contains_replaced_state_directory_before_starting_app(
+    tmp_path, monkeypatch, capsys
+):
+    """A real state-directory scan failure is reported before Textual starts."""
+    project = _init_repo_for_prune(tmp_path)
+    runs_path = project / ".git" / "loop-supervisor" / "runs"
+    runs_path.parent.mkdir()
+    runs_path.write_text("replaced directory")
+
+    def fake_app(*args, **kwargs):
+        raise AssertionError("the app must not start when project scanning fails")
+
+    monkeypatch.setattr(cli_mod, "RunBrowserApp", fake_app)
+    rc = cli_mod.cmd_tui(argparse.Namespace(project=str(project)))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: cannot scan supervisor run state for this project\n"
+    assert "Traceback" not in captured.err
+
+
 # -- SIGTERM-to-KeyboardInterrupt bridge (backlog item 22a / ADR 0015) --
 #
 # These are in-process unit tests of the bridge's own hygiene (handler
