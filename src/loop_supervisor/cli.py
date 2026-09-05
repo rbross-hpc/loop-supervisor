@@ -648,8 +648,10 @@ def cmd_tui(args: argparse.Namespace) -> int:
     """Launch the read-only run browser after resolving and scanning the project."""
     try:
         snapshot = scan_project(args.project)
-    except ProjectResolutionError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except ProjectResolutionError:
+        # Project resolution can embed unbounded Git command output. Keep this
+        # pre-TUI diagnostic fixed, as with scan-wide state-storage failures.
+        print("error: cannot resolve project for this TUI", file=sys.stderr)
         return 1
     except StateError:
         # A scan-wide state-storage failure (unlike one malformed run leaf)

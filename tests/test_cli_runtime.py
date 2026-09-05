@@ -800,6 +800,33 @@ def test_cmd_tui_reports_invalid_project_before_starting_app(tmp_path, monkeypat
     assert "Traceback" not in captured.err
 
 
+def test_cmd_tui_sanitizes_project_resolution_error_before_starting_app(
+    tmp_path, monkeypatch, capsys
+):
+    """Git command output must not escape through the pre-TUI failure path."""
+
+    sensitive_output = "SIMULATED_GIT_STDOUT_AND_STDERR=" + "x" * 10_000
+
+    class FailingGitRepo:
+        def __init__(self, root):
+            raise GitError(f"git rev-parse failed:\n{sensitive_output}")
+
+    def fake_app(*args, **kwargs):
+        raise AssertionError("the app must not start when project resolution fails")
+
+    monkeypatch.setattr("loop_supervisor.read_model.project.GitRepo", FailingGitRepo)
+    monkeypatch.setattr(cli_mod, "RunBrowserApp", fake_app)
+
+    rc = cli_mod.cmd_tui(argparse.Namespace(project=str(tmp_path)))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: cannot resolve project for this TUI\n"
+    assert sensitive_output not in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_cmd_tui_starts_the_read_only_browser_after_scanning(tmp_path, monkeypatch):
     snapshot = object()
     started: list[object] = []
