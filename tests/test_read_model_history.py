@@ -68,6 +68,51 @@ def test_load_history_returns_valid_records_in_numeric_sequence_order(tmp_path):
     assert loaded.diagnostics == ()
 
 
+def test_load_history_retains_validated_detail_and_round_trippable_raw_json(tmp_path):
+    record = _record("run-1", 1)
+    result = record["result"]
+    assert isinstance(result, dict)
+    result["objective"] = "[bold]literal objective[/bold]"
+    record["error"] = {
+        "error_id": "history-error",
+        "kind": "operational",
+        "operation": "planning",
+        "failed_phase": "planning",
+        "retry_phase": None,
+        "exception_type": "RuntimeError",
+        "message": "[red]literal error[/red]",
+        "retryable": False,
+        "requires_repair": False,
+        "recovery_hint": None,
+        "occurred_at": "2026-01-01T00:00:00+00:00",
+    }
+    _write_history(tmp_path, "0001-planning.json", record)
+
+    entry = load_history(tmp_path, "run-1").entries[0]
+
+    assert entry.result_detail is not None
+    assert "[bold]literal objective[/bold]" in entry.result_detail
+    assert entry.error_detail is not None
+    assert "[red]literal error[/red]" in entry.error_detail
+    assert entry.raw_json_truncated is False
+    assert json.loads(entry.raw_json) == record
+
+
+def test_load_history_truncates_oversized_serialized_raw_json_without_rejecting_record(tmp_path):
+    record = _record("run-1", 1)
+    result = record["result"]
+    assert isinstance(result, dict)
+    result["objective"] = "x" * (256 * 1024)
+    _write_history(tmp_path, "0001-planning.json", record)
+
+    entry = load_history(tmp_path, "run-1").entries[0]
+
+    assert entry.has_result is True
+    assert entry.raw_json_truncated is True
+    assert len(entry.raw_json.encode("utf-8")) <= 256 * 1024
+    assert len(entry.raw_json.splitlines()) <= 10_000
+
+
 def test_load_history_reports_sequence_gaps_without_filling_them(tmp_path):
     _write_history(tmp_path, "0001-planning.json", _record("run-1", 1))
     _write_history(tmp_path, "0003-planning.json", _record("run-1", 3))

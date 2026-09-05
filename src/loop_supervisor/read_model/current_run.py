@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..state import StateError, load_state
+from .record_detail import format_opinionated_content, serialize_raw_json
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,10 @@ class CurrentRun:
     pending_question: str | None
     latest_operational_error: str | None
     diagnostic: str | None
+    result_detail: str | None
+    error_detail: str | None
+    raw_json: str | None
+    raw_json_truncated: bool
 
     @classmethod
     def degraded(cls, run_id: str, diagnostic: str) -> CurrentRun:
@@ -52,6 +57,10 @@ class CurrentRun:
             pending_question=None,
             latest_operational_error=None,
             diagnostic=diagnostic,
+            result_detail=None,
+            error_detail=None,
+            raw_json=None,
+            raw_json_truncated=False,
         )
 
 
@@ -71,6 +80,8 @@ def load_current_run(git_common_dir: Path, run_id: str) -> CurrentRun:
     pending_message = pending_question["message"] if pending_question is not None else None
     last_error = state.last_error
     error_message = last_error["message"] if last_error is not None else None
+    result = _latest_result(state)
+    raw_json, raw_json_truncated = serialize_raw_json(state.to_dict())
     return CurrentRun(
         run_id=state.run_id,
         loadable=True,
@@ -87,7 +98,26 @@ def load_current_run(git_common_dir: Path, run_id: str) -> CurrentRun:
         pending_question=pending_message,
         latest_operational_error=error_message,
         diagnostic=None,
+        result_detail=format_opinionated_content(result) if result is not None else None,
+        error_detail=format_opinionated_content(last_error) if last_error is not None else None,
+        raw_json=raw_json,
+        raw_json_truncated=raw_json_truncated,
     )
+
+
+def _latest_result(state: object) -> dict[str, object] | None:
+    """Return the validated latest phase result exposed by the current state."""
+    for name in (
+        "auditor_result",
+        "verification_result",
+        "builder_result",
+        "architect_result",
+        "planner_result",
+    ):
+        value = getattr(state, name)
+        if value is not None:
+            return value
+    return None
 
 
 def _current_task_id(planner_result: dict[str, object] | None) -> str | None:

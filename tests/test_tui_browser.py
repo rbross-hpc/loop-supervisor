@@ -315,6 +315,43 @@ async def test_run_browser_opens_run_id_with_period(
 
 
 @pytest.mark.asyncio
+async def test_run_detail_opens_escaped_record_detail_and_expandable_raw_json(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "selected", updated_at="2026-01-04T00:00:00+00:00")
+    _persist_history(tmp_path, "selected", "0001-planning.json", seq=1, has_error=True)
+    _persist_history(tmp_path, "selected", "0002-planning.json", seq=2, has_result=False)
+    record_path = tmp_path / "loop-supervisor" / "runs" / "selected" / "0001-planning.json"
+    record = json.loads(record_path.read_text())
+    record["result"]["objective"] = "[bold]literal result[/bold]"
+    record["error"]["message"] = "[red]literal error[/red]"
+    record_path.write_text(json.dumps(record))
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter", "down", "enter")
+
+        detail = cast(Any, app.screen.query_one(".record-detail").render()).plain
+        assert "[bold]literal result[/bold]" in detail
+        assert "[red]literal error[/red]" in detail
+        assert "Raw JSON: collapsed (press r to expand)" in detail
+
+        await pilot.press("r")
+
+        raw_json = cast(Any, app.screen.query_one(".record-detail-raw-json").render()).plain
+        assert '"objective": "[bold]literal result[/bold]"' in raw_json
+        assert '"message": "[red]literal error[/red]"' in raw_json
+
+        await pilot.press("b")
+        await pilot.press("down", "down", "enter")
+
+        unavailable = cast(Any, app.screen.query_one(".record-detail").render()).plain
+        assert "Result: unavailable (none recorded)." in unavailable
+        assert "Error: unavailable (none recorded)." in unavailable
+
+
+@pytest.mark.asyncio
 async def test_run_detail_renders_ordered_incomplete_history_timeline(tmp_path: Path) -> None:
     _persist_run(tmp_path, "selected", updated_at="2026-01-04T00:00:00+00:00")
     _persist_history(
@@ -375,6 +412,10 @@ def test_timeline_rendering_reserves_incomplete_diagnostic_within_output_limits(
         original_task_id=None,
         has_result=True,
         has_error=False,
+        result_detail=None,
+        error_detail=None,
+        raw_json="{}",
+        raw_json_truncated=False,
     )
     history = HistoryLoad(
         entries=(entry,) * 10_000,
