@@ -17,6 +17,8 @@ LOG_RENDER_BYTE_LIMIT = 256 * 1024
 LOG_RENDER_LINE_LIMIT = 10_000
 _MAX_LOG_LEAVES = 10_000
 _MAX_COMMIT_DIRECTORIES = 10_000
+_MAX_ORDINAL_DIGITS = 128
+"""Maximum filename ordinal digits accepted for bounded numeric processing."""
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _LOG_RE = re.compile(r"^(?P<ordinal>[0-9]{2,})\.log$")
 
@@ -151,7 +153,8 @@ def read_log(git_common_dir: Path, reference: LogReference) -> LogContent:
         run_id = validate_run_id(reference.run_id)
         if not _COMMIT_RE.fullmatch(reference.commit) or not _LOG_RE.fullmatch(reference._name):
             raise ValueError
-        if int(reference._name[:-4]) != reference.ordinal or reference.ordinal <= 0:
+        ordinal = _parse_filename_ordinal(reference._name[:-4])
+        if ordinal is None or ordinal != reference.ordinal or reference.ordinal <= 0:
             raise ValueError
     except (StateError, ValueError):
         return _unavailable("invalid log reference")
@@ -240,7 +243,12 @@ def _discover_leaves(
                                 VerificationDiagnostic(_safe_name(name), "invalid log filename")
                             )
                             continue
-                        ordinal = int(match["ordinal"])
+                        ordinal = _parse_filename_ordinal(match["ordinal"])
+                        if ordinal is None:
+                            diagnostics.append(
+                                VerificationDiagnostic(name, "log ordinal is too large")
+                            )
+                            continue
                         if ordinal <= 0:
                             diagnostics.append(VerificationDiagnostic(name, "invalid log ordinal"))
                             continue
@@ -273,6 +281,13 @@ def _discover_leaves(
     except OSError:
         diagnostics.append(VerificationDiagnostic(run_id, "verification directory is unavailable"))
     return leaves
+
+
+def _parse_filename_ordinal(value: str) -> int | None:
+    """Return a bounded numeric filename ordinal without huge-int conversion."""
+    if len(value) > _MAX_ORDINAL_DIGITS:
+        return None
+    return int(value)
 
 
 def _output_identity(
