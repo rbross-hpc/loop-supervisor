@@ -96,6 +96,25 @@ def _options() -> RunOptions:
     )
 
 
+def _cli_environment(**updates: str) -> dict[str, str]:
+    """Build a lifecycle CLI environment that imports this candidate source.
+
+    An inherited ``PYTHONPATH`` can point at the integration checkout, so each
+    spawned CLI must put this task worktree's ``src`` directory first rather
+    than silently exercising an older editable installation.
+    """
+    env = dict(os.environ)
+    source_root = str(REPO_ROOT / "src")
+    inherited_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        source_root
+        if not inherited_pythonpath
+        else f"{source_root}{os.pathsep}{inherited_pythonpath}"
+    )
+    env.update(updates)
+    return env
+
+
 def _cli_command(repo: Path, *, recover: bool = False) -> list[str]:
     command = [
         sys.executable,
@@ -143,14 +162,11 @@ def test_hard_crash_leaves_group_and_requires_explicit_stale_lock_recovery(
     lock_path = repo / ".git" / "loop-supervisor" / "supervisor.lock"
     server_pid_file = tmp_path / "server.pid"
     descendant_pid_file = tmp_path / "descendant.pid"
-    env = dict(os.environ)
-    env.update(
-        {
-            "FAKE_OPENCODE_SESSION_BLOCK_SECONDS": "300",
-            "FAKE_OPENCODE_SELF_PID_FILE": str(server_pid_file),
-            "FAKE_OPENCODE_DESCENDANT_PID_FILE": str(descendant_pid_file),
-            "FAKE_OPENCODE_DESCENDANT_IGNORE_SIGTERM": "1",
-        }
+    env = _cli_environment(
+        FAKE_OPENCODE_SESSION_BLOCK_SECONDS="300",
+        FAKE_OPENCODE_SELF_PID_FILE=str(server_pid_file),
+        FAKE_OPENCODE_DESCENDANT_PID_FILE=str(descendant_pid_file),
+        FAKE_OPENCODE_DESCENDANT_IGNORE_SIGTERM="1",
     )
     supervisor = subprocess.Popen(
         _cli_command(repo),
@@ -179,7 +195,7 @@ def test_hard_crash_leaves_group_and_requires_explicit_stale_lock_recovery(
         rejected = subprocess.run(
             _cli_command(repo),
             cwd=str(REPO_ROOT),
-            env={**os.environ, "FAKE_OPENCODE_RESPONSE": json.dumps({"status": "COMPLETE"})},
+            env=_cli_environment(FAKE_OPENCODE_RESPONSE=json.dumps({"status": "COMPLETE"})),
             capture_output=True,
             text=True,
             timeout=15,
@@ -195,7 +211,7 @@ def test_hard_crash_leaves_group_and_requires_explicit_stale_lock_recovery(
         recovered = subprocess.run(
             _cli_command(repo, recover=True),
             cwd=str(REPO_ROOT),
-            env={**os.environ, "FAKE_OPENCODE_RESPONSE": json.dumps({"status": "COMPLETE"})},
+            env=_cli_environment(FAKE_OPENCODE_RESPONSE=json.dumps({"status": "COMPLETE"})),
             capture_output=True,
             text=True,
             timeout=20,
