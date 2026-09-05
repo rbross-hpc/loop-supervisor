@@ -10,7 +10,12 @@ if TYPE_CHECKING:
     from .history import HistoryDiagnostic, HistoryEntry, HistoryLoad, HistoryStatus
     from .lock_observation import ActivityLabel, LockActivity, LockObservation, RunActivity
     from .project import ProjectResolution, ProjectResolutionError
-    from .snapshot import ProjectSnapshot, RunDetailSnapshot, SnapshotDiagnostic
+    from .snapshot import (
+        CurrentStateDisagreement,
+        ProjectSnapshot,
+        RunDetailSnapshot,
+        SnapshotDiagnostic,
+    )
     from .verification import (
         LogContent,
         LogReference,
@@ -21,6 +26,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CurrentRun",
+    "CurrentStateDisagreement",
     "HistoryDiagnostic",
     "HistoryEntry",
     "HistoryLoad",
@@ -81,6 +87,7 @@ def __getattr__(name: str) -> Any:
 
         return getattr(project, name)
     if name in {
+        "CurrentStateDisagreement",
         "ProjectSnapshot",
         "RunDetailSnapshot",
         "SnapshotDiagnostic",

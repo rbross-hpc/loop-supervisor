@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import loop_supervisor.read_model.snapshot as snapshot_module
 from loop_supervisor.read_model import (
     LockActivity,
     ProjectResolution,
@@ -38,7 +39,18 @@ def _options() -> RunOptions:
     )
 
 
-def _save_state(git_common_dir: Path, run_id: str, *, updated_at: str) -> None:
+def _save_state(
+    git_common_dir: Path,
+    run_id: str,
+    *,
+    updated_at: str,
+    phase: str = "planning",
+    accepted_task_count: int = 0,
+    revision_count: int = 0,
+    replan_count: int = 0,
+    architect_retry_count: int = 0,
+    builder_guidance_count: int = 0,
+) -> None:
     save_state(
         git_common_dir,
         RunState(
@@ -53,6 +65,12 @@ def _save_state(git_common_dir: Path, run_id: str, *, updated_at: str) -> None:
             integration_status_snapshot="",
             created_at="2026-01-01T00:00:00+00:00",
             updated_at=updated_at,
+            phase=phase,
+            accepted_task_count=accepted_task_count,
+            revision_count=revision_count,
+            replan_count=replan_count,
+            architect_retry_count=architect_retry_count,
+            builder_guidance_count=builder_guidance_count,
         ),
     )
     path = git_common_dir / "loop-supervisor" / "runs" / f"{run_id}.json"
@@ -65,6 +83,49 @@ def _project(path: Path) -> ProjectResolution:
     return ProjectResolution(integration_root=path, git_common_dir=path)
 
 
+def _write_history(
+    tmp_path: Path,
+    run_id: str,
+    *,
+    recorded_at: str,
+    phase_after: str = "planning",
+    counters: dict[str, int] | None = None,
+) -> None:
+    record = {
+        "seq": 1,
+        "run_id": run_id,
+        "phase": "planning",
+        "phase_after": phase_after,
+        "status": "advanced",
+        "recorded_at": recorded_at,
+        "original_task_id": None,
+        "counters": counters
+        or {
+            "accepted_task_count": 0,
+            "revision_count": 0,
+            "replan_count": 0,
+            "architect_retry_count": 0,
+            "builder_guidance_count": 0,
+        },
+        "result": {
+            "status": "COMPLETE",
+            "task_id": None,
+            "objective": None,
+            "rationale": None,
+            "acceptance_criteria": [],
+            "relevant_files": [],
+            "design_questions": [],
+            "decision_required": False,
+            "decision_question": None,
+            "decision_rationale": None,
+        },
+        "error": None,
+    }
+    directory = tmp_path / "loop-supervisor" / "runs" / run_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "0001-planning.json").write_text(json.dumps(record))
+
+
 def test_build_snapshot_returns_an_immutable_empty_snapshot_for_absent_runs(tmp_path: Path) -> None:
     snapshot = build_snapshot(_project(tmp_path))
 
@@ -74,6 +135,153 @@ def test_build_snapshot_returns_an_immutable_empty_snapshot_for_absent_runs(tmp_
     assert snapshot.diagnostics == ()
     with pytest.raises(FrozenInstanceError):
         snapshot.runs = ()  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("counter", "phase", "phase_after"),
+    [
+        ("revision_count", "planning", "building"),
+        ("replan_count", "cleanup_branch", "planning"),
+        ("architect_retry_count", "recording_decision", "building"),
+        ("builder_guidance_count", "building", "verifying"),
+    ],
+)
+def test_build_snapshot_suppresses_resettable_disagreements_when_current_is_later(
+    tmp_path: Path, counter: str, phase: str, phase_after: str
+) -> None:
+    _save_state(
+        tmp_path,
+        "run-1",
+        updated_at="2026-01-01T00:00:01+00:00",
+        phase="planning",
+    )
+    counters = {
+        "accepted_task_count": 0,
+        "revision_count": 0,
+        "replan_count": 0,
+        "architect_retry_count": 0,
+        "builder_guidance_count": 0,
+    }
+    counters[counter] = 1
+    _write_history(
+        tmp_path,
+        "run-1",
+        recorded_at="2026-01-01T00:00:00+00:00",
+        phase_after=phase,
+        counters=counters,
+    )
+
+    detail = build_snapshot(_project(tmp_path)).detail_for("run-1")
+
+    assert detail.current.phase == "planning"
+    assert detail.history.entries[0].counters[counter] == 1
+    assert detail.current_state_disagreements == ()
+
+
+def test_build_snapshot_loads_history_before_current_state(tmp_path: Path, monkeypatch) -> None:
+    _save_state(tmp_path, "run-1", updated_at="2026-01-01T00:00:00+00:00")
+    calls: list[str] = []
+    original_history = snapshot_module.load_history
+    original_current = snapshot_module.load_current_run
+
+    def record_history(git_common_dir: Path, run_id: str) -> HistoryLoad:
+        calls.append("history")
+        return original_history(git_common_dir, run_id)
+
+    def record_current(git_common_dir: Path, run_id: str) -> CurrentRun:
+        calls.append("current")
+        return original_current(git_common_dir, run_id)
+
+    monkeypatch.setattr(snapshot_module, "load_history", record_history)
+    monkeypatch.setattr(snapshot_module, "load_current_run", record_current)
+
+    build_snapshot(_project(tmp_path))
+
+    assert calls == ["history", "current"]
+
+
+def test_build_snapshot_reports_same_transition_phase_and_counter_disagreements(
+    tmp_path: Path,
+) -> None:
+    _save_state(tmp_path, "run-1", updated_at="2026-01-01T00:00:00+00:00")
+    _write_history(
+        tmp_path,
+        "run-1",
+        recorded_at="2026-01-01T00:00:01+00:00",
+        phase_after="building",
+        counters={
+            "accepted_task_count": 1,
+            "revision_count": 1,
+            "replan_count": 1,
+            "architect_retry_count": 1,
+            "builder_guidance_count": 1,
+        },
+    )
+
+    detail = build_snapshot(_project(tmp_path)).detail_for("run-1")
+
+    assert [(item.field, item.history_seq) for item in detail.current_state_disagreements] == [
+        ("phase", 1),
+        ("accepted_task_count", 1),
+        ("revision_count", 1),
+        ("replan_count", 1),
+        ("architect_retry_count", 1),
+        ("builder_guidance_count", 1),
+    ]
+    assert detail.current.phase == "planning"
+    assert detail.history.entries[0].phase_after == "building"
+
+
+@pytest.mark.parametrize("updated_at", ["2026-01-01T00:00:01+00:00", "2026-01-01T00:00:00+00:00"])
+def test_build_snapshot_reports_only_accepted_count_when_current_is_not_older(
+    tmp_path: Path, updated_at: str
+) -> None:
+    _save_state(tmp_path, "run-1", updated_at=updated_at)
+    _write_history(
+        tmp_path,
+        "run-1",
+        recorded_at="2026-01-01T00:00:00+00:00",
+        phase_after="building",
+        counters={
+            "accepted_task_count": 1,
+            "revision_count": 1,
+            "replan_count": 1,
+            "architect_retry_count": 1,
+            "builder_guidance_count": 1,
+        },
+    )
+
+    detail = build_snapshot(_project(tmp_path)).detail_for("run-1")
+
+    assert [(item.field, item.history_seq) for item in detail.current_state_disagreements] == [
+        ("accepted_task_count", 1)
+    ]
+
+
+def test_build_snapshot_reports_no_disagreement_for_coherent_or_unavailable_sources(
+    tmp_path: Path,
+) -> None:
+    _save_state(tmp_path, "coherent", updated_at="2026-01-01T00:00:00+00:00")
+    _write_history(
+        tmp_path,
+        "coherent",
+        recorded_at="2026-01-01T00:00:01+00:00",
+    )
+    _save_state(tmp_path, "absent", updated_at="2026-01-01T00:00:00+00:00")
+    (tmp_path / "loop-supervisor" / "runs" / "unloadable.json").write_text("not JSON")
+    _write_history(
+        tmp_path,
+        "unloadable",
+        recorded_at="2026-01-01T00:00:01+00:00",
+        phase_after="building",
+    )
+
+    snapshot = build_snapshot(_project(tmp_path))
+
+    assert snapshot.detail_for("coherent").current_state_disagreements == ()
+    assert snapshot.detail_for("absent").current_state_disagreements == ()
+    assert snapshot.detail_for("unloadable").current.loadable is False
+    assert snapshot.detail_for("unloadable").current_state_disagreements == ()
 
 
 def test_build_snapshot_rereads_disk_without_reusing_prior_artifact_values(tmp_path: Path) -> None:
