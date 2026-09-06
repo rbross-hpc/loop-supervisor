@@ -1547,6 +1547,14 @@ class Supervisor:
         state.replan_count = 0
         state.architect_retry_count = 0
         state.builder_guidance_count = 0
+        planner = PlannerResult.model_validate(state.planner_result)
+        if planner.task_id is None or planner.objective is None or planner.rationale is None:
+            raise LoopError("accepted task requires a complete READY planner result")
+        state.last_completed_task = {
+            "task_id": planner.task_id,
+            "objective": planner.objective,
+            "rationale": planner.rationale,
+        }
         state.planner_result = None
         state.architect_result = None
         state.builder_result = None
@@ -1937,6 +1945,13 @@ def _parse_with_retry(parse, raw, *, retries, rerun):
 
 def _build_planner_prompt(state: RunState) -> str:
     lines = ["Determine the next unit of work."]
+    if state.last_completed_task is not None:
+        completed_task = state.last_completed_task
+        lines.append("")
+        lines.append("Previous accepted task:")
+        lines.append(f"Previous task_id: {completed_task['task_id']}")
+        lines.append(f"Previous objective: {completed_task['objective']}")
+        lines.append(f"Previous rationale: {completed_task['rationale']}")
     if state.auditor_result is not None:
         auditor = AuditorResult.model_validate(state.auditor_result)
         if auditor.disposition is AuditorDisposition.REPLAN:

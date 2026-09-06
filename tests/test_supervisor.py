@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from loop_supervisor.git import GitRepo
-from loop_supervisor.state import RunOptions
+from loop_supervisor.state import RunOptions, load_state
 from loop_supervisor.supervisor import (
     PHASE_AWAITING_INPUT,
     PHASE_DONE,
@@ -14,6 +14,7 @@ from loop_supervisor.supervisor import (
     PHASE_PLANNING,
     LoopError,
     Supervisor,
+    _build_planner_prompt,
     _default_run_options,
 )
 
@@ -244,6 +245,49 @@ def test_happy_path_accept_then_complete(tmp_path):
     assert final.phase == PHASE_DONE
     assert final.accepted_task_count == 1
     assert (repo.root / "change-1.txt").exists()
+
+
+def test_accepted_task_context_is_persisted_and_included_in_next_planner_prompt(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [
+                _planner_ready(
+                    objective="First objective",
+                    rationale="Defer the remaining follow-up to the next task",
+                )
+            ],
+            "loop-builder": [_builder(status="COMPLETE", objective="First objective")],
+            "loop-auditor": [_auditor(disposition="ACCEPT", objective="First objective")],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    for _ in range(7):
+        supervisor.advance(state)
+
+    assert state.phase == PHASE_PLANNING
+    assert state.last_completed_task == {
+        "task_id": "task-1",
+        "objective": "First objective",
+        "rationale": "Defer the remaining follow-up to the next task",
+    }
+    assert (
+        load_state(repo.common_dir(), state.run_id).last_completed_task == state.last_completed_task
+    )
+
+    prompt = _build_planner_prompt(state)
+    assert "Previous accepted task:" in prompt
+    assert "Previous task_id: task-1" in prompt
+    assert "Previous objective: First objective" in prompt
+    assert "Previous rationale: Defer the remaining follow-up to the next task" in prompt
+
+
+def test_planner_prompt_omits_completed_task_context_when_none(tmp_path):
+    supervisor, _ = _make_supervisor(tmp_path, ScriptedRunner({}))
+    state = supervisor.start_new_run()
+
+    prompt = _build_planner_prompt(state)
+    assert "Previous accepted task:" not in prompt
 
 
 def test_builder_abbreviated_commit_hash_is_accepted_and_resolved(tmp_path):
@@ -1194,6 +1238,11 @@ def test_max_accepted_tasks_stops_run(tmp_path):
 
     assert final.phase == PHASE_DONE
     assert final.accepted_task_count == 2
+    assert final.last_completed_task == {
+        "task_id": "task-2",
+        "objective": "Do a thing",
+        "rationale": "because",
+    }
 
 
 def test_start_new_run_requires_clean_integration(tmp_path):

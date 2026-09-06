@@ -344,6 +344,7 @@ class RunState:
     task_status_snapshot: str | None = None
     phase: str = "planning"
     planner_result: dict[str, Any] | None = None
+    last_completed_task: dict[str, str] | None = None
     architect_result: dict[str, Any] | None = None
     builder_result: dict[str, Any] | None = None
     verification_result: dict[str, Any] | None = None
@@ -391,6 +392,12 @@ class RunState:
             )
 
         data = dict(data)
+
+        # ADR 0042 permits this narrowly scoped same-schema additive
+        # compatibility default. It must precede exact-field validation so
+        # documents persisted before this field existed remain resumable;
+        # unknown fields and every other missing field still fail closed.
+        data.setdefault("last_completed_task", None)
 
         # Strict, exact field set. Dataclass defaults are appropriate for
         # constructing *new* in-memory states, but must never implicitly
@@ -523,7 +530,24 @@ def _validate_role_result(data: dict[str, Any], field_name: str, model: type[Bas
         raise StateError(f"state field {field_name!r} failed contract validation: {exc}") from exc
 
 
+def _validate_last_completed_task(data: dict[str, Any]) -> None:
+    value = data.get("last_completed_task")
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise StateError("state field 'last_completed_task' must be an object or null")
+    expected_fields = {"task_id", "objective", "rationale"}
+    if set(value) != expected_fields:
+        raise StateError(
+            f"state field 'last_completed_task' must contain exactly {sorted(expected_fields)}"
+        )
+    for name in expected_fields:
+        if not isinstance(value[name], str) or not value[name]:
+            raise StateError(f"state field 'last_completed_task.{name}' must be a non-empty string")
+
+
 def _validate_nested_results(data: dict[str, Any]) -> None:
+    _validate_last_completed_task(data)
     planner = _validate_role_result(data, "planner_result", PlannerResult)
     _validate_role_result(data, "architect_result", ArchitectResult)
     builder = _validate_role_result(data, "builder_result", BuilderResult)
