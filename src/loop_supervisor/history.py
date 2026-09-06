@@ -86,6 +86,7 @@ _COUNTER_FIELDS = (
     "replan_count",
     "architect_retry_count",
     "builder_guidance_count",
+    "operational_retry_count",
 )
 
 _SEQ_WIDTH = 4

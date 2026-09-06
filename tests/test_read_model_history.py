@@ -233,6 +233,73 @@ def test_load_history_permits_building_guidance_reset_only_after_successful_buil
     assert has_regression is expects_regression
 
 
+@pytest.mark.parametrize(
+    ("phase", "phase_after"),
+    [("planning", "creating_worktree"), ("building", "auditing")],
+)
+def test_load_history_permits_operational_retry_reset_on_successful_advance(
+    tmp_path, phase, phase_after
+):
+    first = _record("run-1", 1)
+    first["phase_after"] = phase
+    first_counters = first["counters"]
+    assert isinstance(first_counters, dict)
+    first_counters["operational_retry_count"] = 2
+    following = _record("run-1", 2, phase)
+    following["phase_after"] = phase_after
+    following["recorded_at"] = "2026-01-01T00:00:01+00:00"
+    following["result"] = None
+    following_counters = following["counters"]
+    assert isinstance(following_counters, dict)
+    following_counters["operational_retry_count"] = 0
+    _write_history(tmp_path, "0001-planning.json", first)
+    _write_history(tmp_path, f"0002-{phase}.json", following)
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert loaded.completeness is HistoryStatus.COMPLETE
+    assert not any(
+        "counter regression for operational_retry_count" in diagnostic.reason
+        for diagnostic in loaded.diagnostics
+    )
+
+
+@pytest.mark.parametrize(
+    ("phase", "phase_after", "status", "new_count"),
+    [
+        ("operational_failure", "planning", "advanced", 0),
+        ("awaiting_input", "planning", "input_unavailable", 0),
+        ("planning", "creating_worktree", "advanced", 1),
+    ],
+)
+def test_load_history_diagnoses_forbidden_operational_retry_decrease(
+    tmp_path, phase, phase_after, status, new_count
+):
+    first = _record("run-1", 1)
+    first["phase_after"] = phase
+    first_counters = first["counters"]
+    assert isinstance(first_counters, dict)
+    first_counters["operational_retry_count"] = 2
+    following = _record("run-1", 2, phase)
+    following["phase_after"] = phase_after
+    following["status"] = status
+    following["recorded_at"] = "2026-01-01T00:00:01+00:00"
+    following["result"] = None
+    following_counters = following["counters"]
+    assert isinstance(following_counters, dict)
+    following_counters["operational_retry_count"] = new_count
+    _write_history(tmp_path, "0001-planning.json", first)
+    _write_history(tmp_path, f"0002-{phase}.json", following)
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert any(
+        "counter regression for operational_retry_count" in diagnostic.reason
+        for diagnostic in loaded.diagnostics
+    )
+
+
 def test_load_history_diagnoses_counter_decrease_to_nonzero_without_omitting_records(tmp_path):
     first, second = _consistent_adjacent_records()
     first_counters = first["counters"]
