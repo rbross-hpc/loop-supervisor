@@ -215,6 +215,7 @@ def _persist_history(
             "replan_count": 0,
             "architect_retry_count": 0,
             "builder_guidance_count": 0,
+            "operational_retry_count": 0,
         },
         "result": None,
         "error": None,
@@ -1002,7 +1003,7 @@ async def test_run_detail_renders_ordered_incomplete_history_timeline(tmp_path: 
         assert "Recorded: 2026-01-03T01:00:00+00:00" in timeline
         expected_counters = (
             "Counters: accepted tasks=2, revisions=1, replans=0, "
-            "architect retries=0, builder guidance=0"
+            "architect retries=0, builder guidance=0, operational retries=0"
         )
         assert expected_counters in timeline
         assert "Result: available; Error: unavailable" in timeline
@@ -1010,6 +1011,32 @@ async def test_run_detail_renders_ordered_incomplete_history_timeline(tmp_path: 
         assert "Result: unavailable; Error: available" in timeline
         assert "Workflow timeline: incomplete" in timeline
         assert "0002-planning.json: malformed history record" in timeline
+
+
+@pytest.mark.asyncio
+async def test_run_detail_renders_operational_retry_counter_in_summary_and_timeline(
+    tmp_path: Path,
+) -> None:
+    _persist_run(tmp_path, "selected", updated_at="2026-01-04T00:00:00+00:00")
+    state_path = tmp_path / "loop-supervisor" / "runs" / "selected.json"
+    state = json.loads(state_path.read_text())
+    state["operational_retry_count"] = 2
+    state_path.write_text(json.dumps(state))
+    _persist_history(tmp_path, "selected", "0001-planning.json", seq=1)
+    history_path = tmp_path / "loop-supervisor" / "runs" / "selected" / "0001-planning.json"
+    history = json.loads(history_path.read_text())
+    history["counters"]["operational_retry_count"] = 2
+    history_path.write_text(json.dumps(history))
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+
+        summary = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        timeline = cast(Any, app.screen.query_one(".run-detail-timeline").render()).plain
+        assert "Operational retries: 2" in summary
+        assert "operational retries=2" in timeline
 
 
 def test_shared_render_output_bound_applies_marker_without_splitting_unicode() -> None:
@@ -1035,6 +1062,7 @@ def test_timeline_rendering_reserves_incomplete_diagnostic_within_output_limits(
             "replan_count": 0,
             "architect_retry_count": 0,
             "builder_guidance_count": 0,
+            "operational_retry_count": 0,
         },
         original_task_id=None,
         has_result=True,

@@ -30,6 +30,7 @@ class CurrentRun:
     replan_count: int | None
     architect_retry_count: int | None
     builder_guidance_count: int | None
+    operational_retry_count: int | None
     pending_question: str | None
     latest_operational_error: str | None
     diagnostic: str | None
@@ -55,6 +56,7 @@ class CurrentRun:
             replan_count=None,
             architect_retry_count=None,
             builder_guidance_count=None,
+            operational_retry_count=None,
             pending_question=None,
             latest_operational_error=None,
             diagnostic=diagnostic,
@@ -97,6 +99,7 @@ def load_current_run(git_common_dir: Path, run_id: str) -> CurrentRun:
         replan_count=state.replan_count,
         architect_retry_count=state.architect_retry_count,
         builder_guidance_count=state.builder_guidance_count,
+        operational_retry_count=state.operational_retry_count,
         pending_question=pending_message,
         latest_operational_error=error_message,
         diagnostic=None,

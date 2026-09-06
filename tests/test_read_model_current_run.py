@@ -279,6 +279,7 @@ def test_load_current_run_maps_validated_state_into_immutable_summary(tmp_path: 
     assert current.replan_count == 2
     assert current.architect_retry_count == 1
     assert current.builder_guidance_count == 5
+    assert current.operational_retry_count == 0
     assert current.pending_question == "Which supported API should be used?"
     assert current.latest_operational_error == "The control plane was unavailable."
     assert current.diagnostic is None
@@ -330,6 +331,7 @@ def test_load_current_run_returns_safe_degraded_value_for_unloadable_state(
     assert current.replan_count is None
     assert current.architect_retry_count is None
     assert current.builder_guidance_count is None
+    assert current.operational_retry_count is None
     assert current.pending_question is None
     assert current.latest_operational_error is None
     assert current.diagnostic is not None
