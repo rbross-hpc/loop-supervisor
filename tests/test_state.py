@@ -68,6 +68,50 @@ def test_save_and_load_roundtrip(tmp_path):
     assert loaded.phase == "planning"
 
 
+def test_last_completed_task_roundtrips_and_legacy_omission_defaults_to_none(tmp_path):
+    completed_task = {
+        "task_id": "task-1",
+        "objective": "Carry context forward",
+        "rationale": "The remaining work was deliberately deferred",
+    }
+    state = _make_state(new_run_id(), last_completed_task=completed_task)
+    save_state(tmp_path, state)
+
+    path = state_path(tmp_path, state.run_id)
+    saved = json.loads(path.read_text())
+    assert saved["last_completed_task"] == completed_task
+    assert load_state(tmp_path, state.run_id).last_completed_task == completed_task
+
+    del saved["last_completed_task"]
+    path.write_text(json.dumps(saved))
+    assert load_state(tmp_path, state.run_id).last_completed_task is None
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ({"task_id": "task-1", "objective": "objective"}, "exactly"),
+        (
+            {"task_id": "task-1", "objective": "objective", "rationale": "rationale", "extra": "x"},
+            "exactly",
+        ),
+        ({"task_id": "", "objective": "objective", "rationale": "rationale"}, "non-empty"),
+        ({"task_id": "task-1", "objective": 1, "rationale": "rationale"}, "non-empty"),
+        ([], "object or null"),
+    ],
+)
+def test_load_rejects_malformed_last_completed_task(tmp_path, value, match):
+    state = _make_state(new_run_id())
+    save_state(tmp_path, state)
+    path = state_path(tmp_path, state.run_id)
+    data = json.loads(path.read_text())
+    data["last_completed_task"] = value
+    path.write_text(json.dumps(data))
+
+    with pytest.raises(StateError, match=match):
+        load_state(tmp_path, state.run_id)
+
+
 def test_save_sets_permissions(tmp_path):
     state = _make_state(new_run_id())
     save_state(tmp_path, state)
