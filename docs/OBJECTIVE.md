@@ -149,166 +149,59 @@ it is not an open work item.
 
 ## Ordered priorities
 
-Items 1 through 15 (the initial vertical slice, ADR 0036/0037, the
-Textual-independent read model, and the writer/reader lock-identity
-hardening) are delivered. A post-delivery audit of that work found the
-defects and gap addressed by items 16 through 25 below; item 26 closes
-this objective's run with an observable version bump. Each is
-independently mergeable and subject to the same task-sizing,
-one-mergeable-slice-at-a-time discipline, and the same Ruff/formatting/
-mypy/pytest gates, as all prior priorities.
+Items 1 through 29 are delivered: the initial vertical slice, ADR
+0036/0037, the Textual-independent read model, writer/reader
+lock-identity hardening, a post-delivery audit's fixes for the TUI
+refresh crash, record-selection reconciliation, lock-diagnostic and
+startup sanitization, keyboard-focus preservation, the newest-history/
+current-state disagreement diagnostic (ADR 0039), the sequence-gap
+false positive, diagnostic hygiene, skeleton-prompt parity, and the
+observable `0.2.0` version bump, and a second-pass audit's hardening of
+a recurring TUI list-widget crash family, importability without
+installed distribution metadata, and rendering of the ADR 0039
+disagreement diagnostics that were previously computed but never shown.
+ADR 0041 additionally superseded ADR 0040: verification logs are
+write-once (`_summarize_verification` in `supervisor.py`), so the
+same-size in-place-rewrite gap ADR 0040 flagged is not a mutation shape
+this project's writer can produce, and the byte-comparison slice it
+proposed was not implemented.
 
-16. Fix the explicit-refresh crash on a project with zero discovered runs.
-    `action_refresh` unconditionally calls `_remember_browser_highlight`,
-    which queries the `#run-list` widget; that widget does not exist when
-    no runs are discovered (the browser renders an empty-state message
-    instead), and the query sits outside the failure-handling `try` block.
-    Refreshing such a project currently raises an uncaught widget-lookup
-    exception instead of the safe, bounded outcome item 11 already
-    requires. Add a regression test that refreshes an empty-run project
-    and a project whose only run was deleted since the last snapshot.
-17. Make explicit refresh reconcile the open **record** selection by
-    stable ID, not only the selected run. Currently only the run-level
-    selection and browser highlight survive a refresh; the open record
-    detail, if any, continues to render its pre-refresh content even when
-    the snapshot changed or the record disappeared, and if the selected
-    run itself disappears, a stale record-selection index can be
-    misapplied to render the wrong run's record once a different run is
-    selected. On refresh: reload the open record's content from the new
-    snapshot by its stable ID if it is still present; close the record
-    detail (returning to run detail) if it is not; and never let a
-    record-selection value outlive the run selection it was scoped to.
-18. Sanitize lock-observation diagnostics. `observe_lock` currently passes
-    raw `str(exc)` (including absolute lock paths and parser text) from a
-    malformed-lock read failure and from an integration-path
-    canonicalization failure into `LockObservation.diagnostic`, which the
-    TUI renders verbatim in the run-detail summary. Replace both with
-    fixed, safe classifications, following the pattern already used by
-    the read model's other diagnostic sources (e.g. run-discovery and
-    current-run diagnostics). This closes an unmet clause of item 12
-    below.
-19. Contain and sanitize project-resolution and startup-scan failures the
-    same way refresh failures are already contained. Two independently
-    mergeable slices:
-    - `cmd_tui`'s `ProjectResolutionError` path currently prints the raw
-      underlying error, which can embed full Git command stdout/stderr
-      and is unbounded; replace it with a fixed, safe, bounded message,
-      matching the existing `StateError` handling immediately below it in
-      the same function.
-    - `cmd_tui` (and snapshot/discovery construction generally) currently
-      catches only `StateError` for a project-level scan failure; an
-      `OSError` raised during directory enumeration (e.g. a mid-scan
-      permission or mount change) is not caught and can still surface as
-      an uncaught traceback at startup. Catch it the same way the
-      existing explicit-refresh path already does.
-20. Preserve keyboard usability across refresh, beyond the row highlight
-    already preserved. A failed refresh currently preserves the
-    highlighted row but not keyboard focus, so the preserved highlight is
-    not actually usable without an extra manual click/keypress to
-    refocus; a successful refresh resets the record-list cursor and
-    focus to the top instead of preserving them. Restore focus to the
-    list the user came from in both cases, per the existing keyboard-
-    navigation requirement above.
-21. Implement the last undelivered history-contradiction category:
-    disagreement between the newest history entry and the authoritative
-    current `RunState`. History validation today only compares adjacent
-    history records to each other; it has no comparison against current
-    `RunState` at all. Two independently mergeable slices:
-    - Record an ADR defining what constitutes a reportable disagreement
-      between the newest valid history entry and current `RunState`
-      (candidates include: the newest entry's `phase_after` disagreeing
-      with `RunState.phase` when no later transition is pending;
-      persisted counters in the newest entry exceeding or contradicting
-      `RunState`'s counters; the newest entry's `recorded_at` occurring
-      after `RunState.updated_at`), calibrated to avoid reintroducing the
-      phase-blind, non-lifecycle-aware false positives that motivated ADR
-      0038's transition-aware counter design. The ADR must not change
-      current `RunState`'s authority: a detected disagreement is a
-      diagnostic, never a correction.
-    - Implement and test the decision, preserving every valid history
-      entry and every existing contradiction diagnostic unchanged.
-22. Stop reporting a spurious phase-discontinuity diagnostic when a
-    sequence gap already explains the discontinuity. Adjacent-record
-    comparison currently runs over the list of records that survived
-    validation, so when an intervening record is missing or excluded
-    (already reported as a sequence gap or a malformed-record
-    diagnostic), the two records on either side of the gap are also
-    compared to each other and reported as a phase discontinuity that
-    does not reflect any actual contradiction in the underlying history.
-    Skip the adjacent-record comparison whenever the two records are not
-    truly sequence-adjacent (`following.seq != preceding.seq + 1`).
-23. ADR 0040 records the verification-log post-read mutation-check scope.
-    The shipped metadata and reopen-by-name check detects a replacement only
-    when the reopened target's numeric inode number (`st_ino`) changed, and
-    detects an in-place rewrite of the opened inode when its size or
-    `mtime_ns` changes between observations. It does **not** detect a
-    replacement whose reopened target has the same `st_ino` but a different
-    device (`st_dev`), or a genuine same-size, same-`mtime_ns` in-place
-    rewrite of that inode; coarse filesystem timestamp behavior can produce
-    the latter shape for an ordinary concurrent rewrite, and a rewrite that
-    restores the original timestamp can deliberately produce it. The ADR
-    declines to treat that metadata-only scope as the finished contract while
-    keeping this documentation-and-test-correction slice separately
-    mergeable. Its follow-on implementation will use a stronger, explicit,
-    bounded, descriptor-relative content comparison and a genuine same-size,
-    same-`mtime_ns` in-place-rewrite test. That future check remains an
-    observational warning and does not change current `RunState`'s authority.
-24. Diagnostic-hygiene cleanup, each independently mergeable:
-    - Apply the verification read model's existing bounded-name helper to
-      every diagnostic site that includes an untrusted filename, not only
-      some of them, so a diagnostic artifact string cannot grow
-      unboundedly (observed with adversarially many colliding ordinal
-      spellings).
-    - Consolidate the several duplicated copies of the 256 KiB /
-      10,000-line rendered-output ceiling constants and near-identical
-      bounding functions in the TUI into one shared helper, applied
-      consistently.
-    - Remove the one remaining raw-exception-text passthrough in a
-      history-validation diagnostic reason, replacing it with a fixed
-      classification consistent with the rest of that module.
-    - Make the `builder_guidance_count` reset permitted on a
-      `building`-to-`verifying`/`auditing` transition conditional on that
-      record's recorded status, matching ADR 0038's stated rationale
-      ("a successful building transition") rather than only its phase
-      pair.
-25. Sync the current planner agent prompt into the project-skeleton copy
-    used by newly initialized projects
-    (`src/loop_supervisor/_skeleton/.opencode/agents/loop-planner.md`),
-    which has drifted out of sync with the live prompt, and restore
-    parity test coverage for it in `tests/test_cli_init.py` (currently
-    disabled pending this sync; see the comment marking why).
-26. Bump the distribution version and make it observable at runtime.
-    **This item must be selected last, after every other item in
-    "Ordered priorities" above is complete**, so the version names the
-    finished state of this objective.
+The following items from that second-pass audit were intentionally left
+as still open, lower-priority follow-ups rather than scheduled here:
 
-    `pyproject.toml`'s `version` is still `0.1.0`, which predates the
-    entire read-only TUI browser, ADRs 0035-0038, and lock schema v2. The
-    version is not exposed anywhere in the package or the CLI today --
-    there is no `__version__`, no `--version` flag, and `doctor` reports
-    only the Python version -- so an installed copy cannot be
-    distinguished from any earlier build at runtime.
+- `read_model/project.py`'s `ProjectResolutionError` still embeds the
+  full underlying Git command's stdout/stderr in the exception object,
+  even though `cmd_tui` (item 19's fix) no longer prints it. This is
+  containment at the sole consumer, not sanitization at the source; a
+  future second caller, or an unhandled propagation, could still expose
+  it.
+- Three TUI render sites still bypass the shared rendered-output-ceiling
+  helper introduced for item 24's consolidation: the project path line,
+  the record-list row label, and the verification log-list row label.
+  Each interpolates a value that is separately bounded upstream (an
+  OS-bounded path, an ordinal capped at 128 digits, a phase name
+  constrained to a fixed set), so this is a consistency gap, not a
+  reachable overflow.
+- The reset-family test coverage for ADR 0039's newest-history/
+  current-state disagreement diagnostic is partly decorative: a test
+  parametrized over ADR 0038's four reset-family transitions still
+  passes if every transition is replaced with an unrelated phase pair,
+  because suppression in that window is driven entirely by the
+  timestamp gate, not by the transition. There is also no test for the
+  ordinary post-merge shape where history's `accepted_task_count`
+  exceeds current `RunState`'s (a lagging or failed history write).
 
-    - Bump `version` to `0.2.0` in `pyproject.toml`.
-    - Expose `__version__` sourced from installed package metadata
-      (`importlib.metadata`), not hardcoded a second time, so the number
-      lives in exactly one place.
-    - Add a `--version` flag to the CLI.
-    - Report the version in `doctor` output alongside the existing
-      Python-version check.
-
-    Do not create a Git tag. A release tag must name the post-merge
-    commit on `main`, which does not exist while this task is being
-    built in a worktree; tagging is a human step after this objective's
-    run completes.
+There is no remaining scheduled work in "Ordered priorities" as of this
+revision; see "Deferred work" below for the one item intentionally held
+back from scheduling.
 
 ## Deferred work (not yet scheduled)
 
-Priorities 16 through 26 above are the current active work. The following
-is captured so it is not lost, but it is deliberately **not** part of
-"Ordered priorities" yet: the planner must not select it, and it is not
-part of this objective's completion criteria, until a human promotes it
-into "Ordered priorities" by editing this document.
+Priorities 16 through 29 above are delivered. The following is captured
+so it is not lost, but it is deliberately **not** part of "Ordered
+priorities": the planner must not select it, and it is not part of this
+objective's completion criteria, until a human promotes it into "Ordered
+priorities" by editing this document.
 
 This item exists because the audit that produced items 16-25 was itself
 lost between planner invocations: a builder commit message deferred the
@@ -382,15 +275,17 @@ The objective is complete when:
   fully sanitized (no raw exception text anywhere) and stay within the
   existing rendered-output bounds on every rendered diagnostic and row;
 - history contradictions (phase discontinuity, timestamp reversal, counter
-  regression, current-state disagreement) surface as diagnostics without
-  overriding current `RunState`, and a sequence gap does not also produce a
-  spurious adjacent-record contradiction;
-- ADR 0040 records the verification-log mutation-detection scope: the
-  shipped reopen check detects only a changed numeric inode number (`st_ino`),
-  while the descriptor check detects size- or `mtime_ns`-changing in-place
-  rewrites; it does not detect a same-`st_ino`, different-`st_dev`
-  replacement or a same-size, same-`mtime_ns` in-place rewrite; the stronger
-  bounded content comparison remains a separately scheduled follow-on;
+  regression, current-state disagreement) surface as rendered diagnostics
+  without overriding current `RunState`, and a sequence gap does not also
+  produce a spurious adjacent-record contradiction;
+- ADR 0041 records the accepted verification-log mutation-detection scope:
+  the shipped metadata-and-reopen check detects a replacement whenever the
+  reopened target's numeric inode number (`st_ino`) changed and an in-place
+  rewrite of the opened inode whenever its size or `mtime_ns` changed; it
+  does not detect a same-`st_ino`, different-`st_dev` replacement or a
+  genuine same-size, same-`mtime_ns` in-place rewrite, and no further
+  content-comparison work is scheduled because this project's writer
+  cannot produce that in-place shape;
 - the distribution version is bumped to `0.2.0` and observable at runtime
   via both `loop-supervisor --version` and `doctor`, sourced from package
   metadata rather than duplicated in source; the release tag itself is

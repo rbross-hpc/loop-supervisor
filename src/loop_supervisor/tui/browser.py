@@ -11,7 +11,7 @@ from ..read_model.current_run import CurrentRun
 from ..read_model.discovery import RunSummary
 from ..read_model.history import HistoryEntry, HistoryLoad, HistoryStatus
 from ..read_model.lock_observation import ActivityLabel, LockActivity, LockObservation
-from ..read_model.snapshot import ProjectSnapshot, build_snapshot
+from ..read_model.snapshot import CurrentStateDisagreement, ProjectSnapshot, build_snapshot
 from ..state import StateError
 
 
@@ -127,7 +127,9 @@ class RunBrowserApp(App[None]):
         with VerticalScroll(id="run-detail"):
             yield Static("Run detail — press b to return to the browser.", markup=False)
             yield Static(
-                self._render_current_run(current, self._snapshot.lock),
+                self._render_current_run(
+                    current, self._snapshot.lock, detail.current_state_disagreements
+                ),
                 markup=False,
                 classes="run-detail-summary",
             )
@@ -358,16 +360,39 @@ class RunBrowserApp(App[None]):
             and len(text.splitlines()) <= cls._MAX_RENDERED_LINES
         )
 
+    def _find_list_view(self, selector: str) -> ListView | None:
+        """Return the named list view if it is currently mounted, else ``None``.
+
+        A selected/refresh-scoped state field (``_selected_run_id``,
+        ``_selected_record_index``) is not proof that the corresponding list
+        widget is mounted: a pending recompose from a just-handled selection
+        or refresh can leave the DOM momentarily out of sync with that
+        state, most easily reproduced by coalesced keystrokes (e.g. two
+        keys delivered in one input batch). Callers must tolerate ``None``
+        rather than let a bare ``query_one`` raise ``NoMatches`` here.
+        """
+        matches = self.query(selector)
+        if not matches:
+            return None
+        widget = matches.first()
+        assert isinstance(widget, ListView)
+        return widget
+
     def _remember_browser_highlight(self) -> None:
         """Capture the current browser cursor before replacing the list widget."""
-        run_list = self.query_one("#run-list", ListView)
-        if run_list.index is not None:
+        run_list = self._find_list_view("#run-list")
+        if run_list is not None and run_list.index is not None:
             self._browser_highlighted_run_id = self._run_id_by_row_index[run_list.index]
 
     def _remember_record_highlight(self) -> None:
         """Capture the current run's record cursor before replacing the list widget."""
-        record_list = self.query_one("#record-list", ListView)
-        if record_list.index is not None and self._selected_run_id is not None:
+        record_list = self._find_list_view("#record-list")
+        if (
+            record_list is not None
+            and record_list.index is not None
+            and self._selected_run_id is not None
+            and record_list.index < len(self._detail_records)
+        ):
             self._record_highlighted_identity_by_run[self._selected_run_id] = self._record_identity(
                 self._detail_records[record_list.index]
             )
@@ -396,8 +421,14 @@ class RunBrowserApp(App[None]):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Open a selected run, record, or explicitly requested authorized log."""
         if event.list_view.id == "record-list":
+            if self._selected_run_id is None or event.index >= len(self._detail_records):
+                # A stale event from a list that outlived the run selection
+                # it was scoped to (e.g. the selected run disappeared on a
+                # refresh that raced this event's delivery), or an index
+                # from a since-shrunk record list. Ignore rather than crash
+                # or record a highlight under the wrong or no run.
+                return
             self._selected_record_index = event.index
-            assert self._selected_run_id is not None
             self._record_highlighted_identity_by_run[self._selected_run_id] = self._record_identity(
                 self._detail_records[event.index]
             )
@@ -427,7 +458,9 @@ class RunBrowserApp(App[None]):
 
     def _focus_record_list(self) -> None:
         """Keep the selected run's current and history records keyboard-accessible."""
-        self.query_one("#record-list", ListView).focus()
+        record_list = self._find_list_view("#record-list")
+        if record_list is not None:
+            record_list.focus()
 
     def action_toggle_raw_json(self) -> None:
         """Toggle the opt-in raw JSON view for the open record detail."""
@@ -523,7 +556,9 @@ class RunBrowserApp(App[None]):
 
     def _focus_run_list(self) -> None:
         """Restore the browser cursor by run ID after the list has been recomposed."""
-        run_list = self.query_one("#run-list", ListView)
+        run_list = self._find_list_view("#run-list")
+        if run_list is None:
+            return
         if self._browser_highlighted_run_id is not None:
             try:
                 run_list.index = self._run_id_by_row_index.index(self._browser_highlighted_run_id)
@@ -644,7 +679,12 @@ class RunBrowserApp(App[None]):
         return "\n".join((status_line, *rendered_evidence, marker))
 
     @classmethod
-    def _render_current_run(cls, current: CurrentRun, lock: LockObservation) -> str:
+    def _render_current_run(
+        cls,
+        current: CurrentRun,
+        lock: LockObservation,
+        disagreements: tuple[CurrentStateDisagreement, ...],
+    ) -> str:
         """Render bounded state and evidence while retaining its essential classification."""
         activity = cls._activity_label(current.run_id, lock)
         classification_lines = [
@@ -679,7 +719,21 @@ class RunBrowserApp(App[None]):
                 f"  Builder guidance: {current.builder_guidance_count}",
                 f"Pending question: {current.pending_question or 'unavailable'}",
                 f"Latest operational error: {current.latest_operational_error or 'unavailable'}",
+                *cls._render_current_state_disagreements(disagreements),
             ]
+        )
+
+    @staticmethod
+    def _render_current_state_disagreements(
+        disagreements: tuple[CurrentStateDisagreement, ...],
+    ) -> tuple[str, ...]:
+        """Render ADR 0039 mismatches between the newest history record and
+        current RunState. Diagnostic only: current RunState remains
+        authoritative and every history entry is retained regardless."""
+        return tuple(
+            f"State/history disagreement: {disagreement.field} "
+            f"(history record {disagreement.history_seq})"
+            for disagreement in disagreements
         )
 
     @classmethod

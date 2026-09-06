@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from textual.widgets import ListView, Static
+from textual.widgets import ListItem, ListView, Static
 
 import loop_supervisor.read_model.discovery as discovery
 import loop_supervisor.read_model.snapshot as snapshot_reader
@@ -1282,3 +1282,145 @@ async def test_run_browser_opens_unloadable_run_as_safe_unavailable_detail_and_q
         await pilot.press("q")
 
     assert app.is_running is False
+
+
+@pytest.mark.asyncio
+async def test_run_detail_renders_current_state_disagreements(tmp_path: Path) -> None:
+    _persist_run(tmp_path, "run-1", updated_at="2026-01-01T00:00:00+00:00", phase="done")
+    _persist_history(
+        tmp_path,
+        "run-1",
+        "0001-planning.json",
+        seq=1,
+        recorded_at="2026-01-03T00:00:00+00:00",
+    )
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+
+        detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert "State/history disagreement: phase (history record 1)" in detail
+        assert "State/history disagreement: accepted_task_count (history record 1)" in detail
+        assert "State/history disagreement: revision_count (history record 1)" in detail
+
+
+@pytest.mark.asyncio
+async def test_run_detail_renders_no_disagreements_for_a_coherent_run(tmp_path: Path) -> None:
+    _persist_run(
+        tmp_path, "run-1", updated_at="2026-01-05T00:00:00+00:00", phase="creating_worktree"
+    )
+    _persist_history(
+        tmp_path,
+        "run-1",
+        "0001-planning.json",
+        seq=1,
+        recorded_at="2026-01-03T00:00:00+00:00",
+    )
+    history_path = tmp_path / "loop-supervisor" / "runs" / "run-1" / "0001-planning.json"
+    record = json.loads(history_path.read_text())
+    record["counters"] = {
+        "accepted_task_count": 0,
+        "revision_count": 0,
+        "replan_count": 0,
+        "architect_retry_count": 0,
+        "builder_guidance_count": 0,
+    }
+    history_path.write_text(json.dumps(record))
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+
+        detail = cast(Any, app.screen.query_one(".run-detail-summary").render()).plain
+        assert "State/history disagreement" not in detail
+
+
+@pytest.mark.asyncio
+async def test_refresh_focus_restore_tolerates_a_not_yet_mounted_record_list(
+    tmp_path: Path,
+) -> None:
+    """A refresh's focus-restore step must not crash if it runs while a run
+    selection's recompose is still pending -- selected-run/record state is
+    not proof the corresponding list widget is mounted yet. Reproduced here
+    by invoking the restore step directly against that exact window,
+    rather than depending on real keystroke-coalescing timing."""
+    _persist_run(tmp_path, "only-run", updated_at="2026-01-01T00:00:00+00:00")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test():
+        app._selected_run_id = "only-run"
+        app._selected_record_index = None
+        app._selected_log_reference = None
+
+        app._restore_refresh_focus()
+
+
+@pytest.mark.asyncio
+async def test_remember_record_highlight_tolerates_a_not_yet_mounted_record_list(
+    tmp_path: Path,
+) -> None:
+    """Capturing the record cursor before a refresh must not crash if the
+    record list is not mounted for the currently-selected run, matching
+    `_restore_refresh_focus`'s tolerance for the same window."""
+    _persist_run(tmp_path, "only-run", updated_at="2026-01-01T00:00:00+00:00")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test():
+        app._selected_run_id = "only-run"
+
+        app._remember_record_highlight()
+
+
+@pytest.mark.asyncio
+async def test_record_list_selection_after_run_cleared_is_ignored_not_a_crash(
+    tmp_path: Path,
+) -> None:
+    """A `record-list` selection event delivered after `_selected_run_id`
+    was cleared (e.g. a refresh removed the selected run while this event
+    was in flight) must be ignored, not crash the app with an assertion
+    failure or record a highlight under no run."""
+    _persist_run(tmp_path, "only-run", updated_at="2026-01-01T00:00:00+00:00")
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        record_list = app.screen.query_one("#record-list", ListView)
+        assert app._selected_run_id == "only-run"
+
+        app._selected_run_id = None
+
+        event = ListView.Selected(record_list, cast(ListItem, record_list.children[0]), 0)
+        app.on_list_view_selected(event)
+
+        assert app._selected_run_id is None
+        assert app._selected_record_index is None
+        assert app._record_highlighted_identity_by_run == {}
+
+
+@pytest.mark.asyncio
+async def test_record_list_selection_with_stale_index_is_ignored_not_a_crash(
+    tmp_path: Path,
+) -> None:
+    """A `record-list` selection event whose index no longer fits the
+    current run's records (the record list shrank since the event was
+    generated) must be ignored rather than raise `IndexError`."""
+    _persist_run(tmp_path, "only-run", updated_at="2026-01-01T00:00:00+00:00")
+    _persist_history(tmp_path, "only-run", "0001-planning.json", seq=1)
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        record_list = app.screen.query_one("#record-list", ListView)
+        assert len(app._detail_records) == 2
+
+        event = ListView.Selected(record_list, cast(ListItem, record_list.children[0]), 5)
+        app.on_list_view_selected(event)
+
+        assert app._selected_record_index is None

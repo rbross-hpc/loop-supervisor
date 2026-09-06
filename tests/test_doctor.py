@@ -6,8 +6,9 @@ test_cli_init.py-style CLI wiring tests in test_cli_runtime.py."""
 
 import json
 import subprocess
+import sys
 import tomllib
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from loop_supervisor.doctor import (
@@ -25,6 +26,8 @@ from loop_supervisor.doctor import (
     run_checks,
     validate_report,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _run(args, cwd):
@@ -44,12 +47,37 @@ def _init_repo(path: Path) -> None:
 
 
 def test_package_version_matches_installed_distribution_metadata():
+    # This assertion only holds when the active environment's installed
+    # distribution metadata (e.g. an editable install's dist-info) has been
+    # refreshed to match the source tree's declared version -- run
+    # `pip install -e .` after bumping `pyproject.toml`'s version if this
+    # fails with a stale value.
     import loop_supervisor
 
-    with Path("pyproject.toml").open("rb") as file:
+    with (_REPO_ROOT / "pyproject.toml").open("rb") as file:
         declared_version = tomllib.load(file)["project"]["version"]
 
     assert loop_supervisor.__version__ == version("loop-supervisor") == declared_version
+
+
+def test_import_succeeds_without_installed_distribution_metadata(monkeypatch):
+    """`loop_supervisor` must remain importable even when package metadata
+    cannot be resolved (e.g. a bare `sys.path` import of the source tree,
+    not a `pip install`/`pip install -e`), since `__init__.py` runs before
+    every submodule and must not fail the whole package's import."""
+
+    def _raise_not_found(name: str) -> str:
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr("importlib.metadata.version", _raise_not_found)
+    monkeypatch.delitem(sys.modules, "loop_supervisor", raising=False)
+
+    import loop_supervisor
+
+    assert loop_supervisor.__version__ == "0.0.0+unknown"
+
+    monkeypatch.delitem(sys.modules, "loop_supervisor", raising=False)
+    import loop_supervisor  # noqa: F401,F811 -- restore the real module for later tests
 
 
 def test_check_python_version_passes_on_current_interpreter():
