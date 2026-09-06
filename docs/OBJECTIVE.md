@@ -149,22 +149,24 @@ it is not an open work item.
 
 ## Ordered priorities
 
-Items 1 through 29 are delivered: the initial vertical slice, ADR
+Items 1 through 30 are delivered: the initial vertical slice, ADR
 0036/0037, the Textual-independent read model, writer/reader
 lock-identity hardening, a post-delivery audit's fixes for the TUI
 refresh crash, record-selection reconciliation, lock-diagnostic and
 startup sanitization, keyboard-focus preservation, the newest-history/
 current-state disagreement diagnostic (ADR 0039), the sequence-gap
 false positive, diagnostic hygiene, skeleton-prompt parity, and the
-observable `0.2.0` version bump, and a second-pass audit's hardening of
-a recurring TUI list-widget crash family, importability without
+observable `0.2.0` version bump; a second-pass audit's hardening of a
+recurring TUI list-widget crash family, importability without
 installed distribution metadata, and rendering of the ADR 0039
-disagreement diagnostics that were previously computed but never shown.
-ADR 0041 additionally superseded ADR 0040: verification logs are
-write-once (`_summarize_verification` in `supervisor.py`), so the
-same-size in-place-rewrite gap ADR 0040 flagged is not a mutation shape
-this project's writer can produce, and the byte-comparison slice it
-proposed was not implemented.
+disagreement diagnostics that were previously computed but never
+shown; and a builder-managed scratch directory (item 30) closing a
+recurring `external_directory` denial the loop hit repeatedly while
+delivering items 16-29. ADR 0041 additionally superseded ADR 0040:
+verification logs are write-once (`_summarize_verification` in
+`supervisor.py`), so the same-size in-place-rewrite gap ADR 0040
+flagged is not a mutation shape this project's writer can produce, and
+the byte-comparison slice it proposed was not implemented.
 
 The following items from that second-pass audit were intentionally left
 as still open, lower-priority follow-ups rather than scheduled here:
@@ -191,31 +193,15 @@ as still open, lower-priority follow-ups rather than scheduled here:
   ordinary post-merge shape where history's `accepted_task_count`
   exceeds current `RunState`'s (a lagging or failed history write).
 
-There is no remaining scheduled work in "Ordered priorities" as of this
-revision; see "Deferred work" below for the one item intentionally held
-back from scheduling.
-
-## Deferred work (not yet scheduled)
-
-Priorities 16 through 29 above are delivered. The following is captured
-so it is not lost, but it is deliberately **not** part of "Ordered
-priorities": the planner must not select it, and it is not part of this
-objective's completion criteria, until a human promotes it into "Ordered
-priorities" by editing this document.
-
-This item exists because the audit that produced items 16-25 was itself
-lost between planner invocations: a builder commit message deferred the
-newest-history/current-`RunState` comparison (item 21) to "a follow-on
-slice," the auditor accepted that framing, and the planner then reported
-the objective COMPLETE without the deferred slice ever being scheduled,
-because the deferral existed only in commit prose the planner never reads
-and has no instruction to look for.
-
-27. Give the planner a narrow, mechanical way to carry a just-completed
+31. Give the planner a narrow, mechanical way to carry a just-completed
     task's stated rationale into its next invocation, and require it to
     check that rationale for a named, still-unresolved deferral before
-    considering the objective complete. Two independently mergeable
-    slices:
+    considering the objective complete. This item was previously held
+    back in "Deferred work" below; it is promoted here because it
+    shares an architect decision and a `RunState` shape change with item
+    32, and doing both in one ADR avoids two separate state-shape
+    revisions for closely related loop-control changes. Two
+    independently mergeable slices:
     - Add an optional `last_completed_task` field to `RunState`
       (`task_id`, `objective`, `rationale`; `None` by default, no schema
       version bump), populated by `_finish_task_cleanup` immediately
@@ -242,6 +228,49 @@ and has no instruction to look for.
     mechanism; closing that gap, if it proves necessary in practice, is
     intentionally left for a later decision rather than solved
     speculatively here.
+32. Automatically retry a transient operational failure instead of
+    always stopping for a human. `Supervisor.run()` unconditionally
+    raises on `AdvanceStatus.OPERATIONAL_FAILURE`, even though the
+    persisted error record already distinguishes retryable transient
+    failures (e.g. `AgentInvocationError` from a denied
+    `external_directory` request, `PhaseTimeoutError`, a plain
+    `GitError`) from failures that require human repair (a merge
+    conflict, a dirty `cleanup_worktree`, an unresolved `DecisionError`)
+    -- `retryable`/`requires_repair` on `OperationalErrorRecord` and
+    `_do_retry_operational_failure()` already know how to resume the
+    former; nothing currently calls that path automatically. This
+    recurred four times across the runs that delivered items 16-29,
+    each requiring a manual `resume` that did nothing a loop iteration
+    could not have done itself. Two independently mergeable slices:
+    - Record an ADR deciding: a new persisted, run-scoped
+      `operational_retry_count` counter, reset to zero on every
+      successful `advance()` (so it bounds *consecutive* failures, not
+      a run's lifetime total, matching how `max_builder_guidance_attempts`
+      already behaves) and incremented only on an auto-retried
+      operational failure; a `max_operational_retries` limit (default
+      3) on `Limits`/`RunOptions`, gated so only `retryable and not
+      requires_repair` failures auto-retry -- a failure requiring
+      repair must still stop for a human exactly as today; whether and
+      how the new counter joins the five counters ADR 0038's reset
+      table already enumerates, and whether (and how) it participates
+      in ADR 0039's newest-history/current-state comparison; and how
+      `RunOptions` accepts a run resumed from state saved before this
+      field existed, since `RunOptions.from_dict` currently raises
+      `StateError` on any unknown field.
+    - Implement the decision: the new counter and limit; auto-retry in
+      `Supervisor.run()`'s `OPERATIONAL_FAILURE` branch, incrementing
+      the counter, persisting state, and continuing the loop (so the
+      next `advance()` reaches `_do_retry_operational_failure()`)
+      instead of raising, until the limit is reached or the failure is
+      classified as requiring repair; a short, interrupt-safe delay
+      between automatic retries so a genuinely flapping dependency
+      cannot exhaust the budget in a tight loop; and a `-v` line on
+      each automatic retry distinguishing it from a human-initiated
+      `resume`, so a log reader is never left wondering which happened.
+
+## Deferred work (not yet scheduled)
+
+There is no work currently held back from scheduling.
 
 ## Completion criteria
 
