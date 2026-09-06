@@ -51,6 +51,7 @@ def _save_state(
     replan_count: int = 0,
     architect_retry_count: int = 0,
     builder_guidance_count: int = 0,
+    operational_retry_count: int = 0,
 ) -> None:
     task_state: dict[str, Any] = {}
     if phase in {"building", "verifying"}:
@@ -110,6 +111,7 @@ def _save_state(
             replan_count=replan_count,
             architect_retry_count=architect_retry_count,
             builder_guidance_count=builder_guidance_count,
+            operational_retry_count=operational_retry_count,
             **task_state,
         ),
     )
@@ -212,6 +214,36 @@ def test_build_snapshot_suppresses_resettable_disagreements_when_current_is_late
     assert detail.current_state_disagreements == ()
 
 
+def test_build_snapshot_suppresses_operational_retry_disagreement_when_current_may_be_later(
+    tmp_path: Path,
+) -> None:
+    _save_state(
+        tmp_path,
+        "run-1",
+        updated_at="2026-01-01T00:00:01+00:00",
+        operational_retry_count=0,
+    )
+    _write_history(
+        tmp_path,
+        "run-1",
+        recorded_at="2026-01-01T00:00:00+00:00",
+        counters={
+            "accepted_task_count": 0,
+            "revision_count": 0,
+            "replan_count": 0,
+            "architect_retry_count": 0,
+            "builder_guidance_count": 0,
+            "operational_retry_count": 1,
+        },
+    )
+
+    detail = build_snapshot(_project(tmp_path)).detail_for("run-1")
+
+    assert detail.current.operational_retry_count == 0
+    assert detail.history.entries[0].counters["operational_retry_count"] == 1
+    assert detail.current_state_disagreements == ()
+
+
 def test_build_snapshot_loads_history_before_current_state(tmp_path: Path, monkeypatch) -> None:
     _save_state(tmp_path, "run-1", updated_at="2026-01-01T00:00:00+00:00")
     calls: list[str] = []
@@ -237,7 +269,12 @@ def test_build_snapshot_loads_history_before_current_state(tmp_path: Path, monke
 def test_build_snapshot_reports_same_transition_phase_and_counter_disagreements(
     tmp_path: Path,
 ) -> None:
-    _save_state(tmp_path, "run-1", updated_at="2026-01-01T00:00:00+00:00")
+    _save_state(
+        tmp_path,
+        "run-1",
+        updated_at="2026-01-01T00:00:00+00:00",
+        operational_retry_count=0,
+    )
     _write_history(
         tmp_path,
         "run-1",
@@ -249,6 +286,7 @@ def test_build_snapshot_reports_same_transition_phase_and_counter_disagreements(
             "replan_count": 1,
             "architect_retry_count": 1,
             "builder_guidance_count": 1,
+            "operational_retry_count": 1,
         },
     )
 
@@ -261,6 +299,7 @@ def test_build_snapshot_reports_same_transition_phase_and_counter_disagreements(
         ("replan_count", 1),
         ("architect_retry_count", 1),
         ("builder_guidance_count", 1),
+        ("operational_retry_count", 1),
     ]
     assert detail.current.phase == "planning"
     assert detail.history.entries[0].phase_after == "building"

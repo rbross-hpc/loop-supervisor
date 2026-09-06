@@ -650,7 +650,8 @@ class RunBrowserApp(App[None]):
             f"revisions={counters['revision_count']}, "
             f"replans={counters['replan_count']}, "
             f"architect retries={counters['architect_retry_count']}, "
-            f"builder guidance={counters['builder_guidance_count']}",
+            f"builder guidance={counters['builder_guidance_count']}, "
+            f"operational retries={counters['operational_retry_count']}",
             "  Result: "
             f"{'available' if entry.has_result else 'unavailable'}; "
             f"Error: {'available' if entry.has_error else 'unavailable'}",
@@ -717,6 +718,7 @@ class RunBrowserApp(App[None]):
                 f"  Replans: {current.replan_count}",
                 f"  Architect retries: {current.architect_retry_count}",
                 f"  Builder guidance: {current.builder_guidance_count}",
+                f"  Operational retries: {current.operational_retry_count}",
                 f"Pending question: {current.pending_question or 'unavailable'}",
                 f"Latest operational error: {current.latest_operational_error or 'unavailable'}",
                 *cls._render_current_state_disagreements(disagreements),
