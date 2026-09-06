@@ -91,7 +91,7 @@ class RunBrowserApp(App[None]):
     def _compose_browser(self) -> ComposeResult:
         with VerticalScroll(id="run-browser"):
             yield Static(
-                f"Project: {self._snapshot.project.integration_root}",
+                self._bound_browser_output(f"Project: {self._snapshot.project.integration_root}"),
                 markup=False,
                 classes="project-path",
             )
@@ -158,7 +158,10 @@ class RunBrowserApp(App[None]):
                 log_rows = (
                     ListItem(
                         Static(
-                            f"Attempt {reference.ordinal} log (open; unredacted sensitive output)",
+                            self._bound_browser_output(
+                                f"Attempt {reference.ordinal} log "
+                                "(open; unredacted sensitive output)"
+                            ),
                             markup=False,
                         )
                     )
@@ -274,11 +277,11 @@ class RunBrowserApp(App[None]):
             ("\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
         )
 
-    @staticmethod
-    def _record_label(record: CurrentRun | HistoryEntry) -> str:
+    @classmethod
+    def _record_label(cls, record: CurrentRun | HistoryEntry) -> str:
         if isinstance(record, HistoryEntry):
-            return f"Sequence {record.seq}: {record.phase} (open detail)"
-        return "Current state (open detail)"
+            return cls._bound_browser_output(f"Sequence {record.seq}: {record.phase} (open detail)")
+        return cls._bound_browser_output("Current state (open detail)")
 
     @staticmethod
     def _record_identity(record: CurrentRun | HistoryEntry) -> tuple[str, int | None]:
