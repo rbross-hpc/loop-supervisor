@@ -18,20 +18,14 @@ from ..state import StateError
 class RunBrowserApp(App[None]):
     """Browse one immutable project snapshot and inspect authoritative run details."""
 
-    _MAX_TIMELINE_RENDERED_BYTES = 256 * 1024
-    _MAX_TIMELINE_RENDERED_LINES = 10_000
+    _MAX_RENDERED_BYTES = 256 * 1024
+    _MAX_RENDERED_LINES = 10_000
     _TIMELINE_TRUNCATION_MARKER = "Timeline output truncated: rendered-output limit reached."
-    _MAX_SUMMARY_RENDERED_BYTES = 256 * 1024
-    _MAX_SUMMARY_RENDERED_LINES = 10_000
     _SUMMARY_TRUNCATION_MARKER = "Summary output truncated: rendered-output limit reached."
-    _MAX_RECORD_DETAIL_RENDERED_BYTES = 256 * 1024
-    _MAX_RECORD_DETAIL_RENDERED_LINES = 10_000
     _RECORD_DETAIL_TRUNCATION_MARKER = (
         "Record detail output truncated: rendered-output limit reached."
     )
     _RAW_JSON_TRUNCATION_MARKER = "Raw JSON output truncated: rendered-output limit reached."
-    _MAX_VERIFICATION_RENDERED_BYTES = 256 * 1024
-    _MAX_VERIFICATION_RENDERED_LINES = 10_000
     _VERIFICATION_TRUNCATION_MARKER = (
         "Verification output truncated: rendered-output limit reached."
     )
@@ -40,8 +34,6 @@ class RunBrowserApp(App[None]):
     )
     _SENSITIVE_LOG_WARNING = "WARNING: Verification output is unredacted and potentially sensitive."
     _REFRESH_FAILURE_DIAGNOSTIC = "Refresh failed: unable to scan supervisor run state."
-    _MAX_BROWSER_RENDERED_BYTES = 256 * 1024
-    _MAX_BROWSER_RENDERED_LINES = 10_000
     _BROWSER_TRUNCATION_MARKER = "Browser output truncated: rendered-output limit reached."
 
     TITLE = "Loop Supervisor"
@@ -209,20 +201,7 @@ class RunBrowserApp(App[None]):
         if content.changed_during_read:
             lines.append("Verification log changed during read: content may be inconsistent.")
         lines.append(content.text)
-        rendered = "\n".join(lines)
-        if (
-            len(rendered.encode("utf-8")) <= cls._MAX_VERIFICATION_RENDERED_BYTES
-            and len(rendered.splitlines()) <= cls._MAX_VERIFICATION_RENDERED_LINES
-        ):
-            return rendered
-        marker = cls._LOG_VIEWER_TRUNCATION_MARKER
-        payload = cls._truncate_literal(
-            rendered,
-            cls._MAX_VERIFICATION_RENDERED_BYTES - len(marker.encode("utf-8")) - 1,
-            cls._MAX_VERIFICATION_RENDERED_LINES - 1,
-        )
-        separator = "" if cls._ends_with_line_separator(payload) else "\n"
-        return f"{payload}{separator}{marker}"
+        return cls._bound_rendered_output("\n".join(lines), cls._LOG_VIEWER_TRUNCATION_MARKER)
 
     @classmethod
     def _render_raw_json(cls, record: CurrentRun | HistoryEntry) -> str:
@@ -230,13 +209,12 @@ class RunBrowserApp(App[None]):
         raw_json = record.raw_json or "Raw JSON: unavailable."
         if not record.raw_json_truncated:
             return raw_json
-        marker = cls._RAW_JSON_TRUNCATION_MARKER
-        payload = cls._truncate_literal(
+        return cls._bound_rendered_output(
             raw_json,
-            cls._MAX_RECORD_DETAIL_RENDERED_BYTES - len(marker.encode("utf-8")) - 1,
-            cls._MAX_RECORD_DETAIL_RENDERED_LINES - 1,
+            cls._RAW_JSON_TRUNCATION_MARKER,
+            force_truncation=True,
+            always_separate_marker=True,
         )
-        return f"{payload}\n{marker}"
 
     @classmethod
     def _render_verification(cls, discovery: verification.VerificationDiscovery) -> str:
@@ -263,24 +241,28 @@ class RunBrowserApp(App[None]):
         if discovery.diagnostics:
             lines.append("Verification diagnostics:")
             lines.extend(f"  {item.artifact}: {item.reason}" for item in discovery.diagnostics)
-        return cls._bound_verification_lines(lines)
+        return cls._bound_rendered_output("\n".join(lines), cls._VERIFICATION_TRUNCATION_MARKER)
 
     @classmethod
-    def _bound_verification_lines(cls, lines: list[str]) -> str:
-        """Bound literal verification output and retain an explicit marker."""
-        rendered = "\n".join(lines)
-        if (
-            len(rendered.encode("utf-8")) <= cls._MAX_VERIFICATION_RENDERED_BYTES
-            and len(rendered.splitlines()) <= cls._MAX_VERIFICATION_RENDERED_LINES
-        ):
-            return rendered
-
-        marker = cls._VERIFICATION_TRUNCATION_MARKER
-        available_bytes = cls._MAX_VERIFICATION_RENDERED_BYTES - len(marker.encode("utf-8")) - 1
+    def _bound_rendered_output(
+        cls,
+        text: str,
+        marker: str,
+        *,
+        force_truncation: bool = False,
+        always_separate_marker: bool = False,
+    ) -> str:
+        """Bound literal text with a view-specific truncation marker."""
+        if not force_truncation and cls._rendered_output_within_limits(text):
+            return text
         payload = cls._truncate_literal(
-            rendered, available_bytes, cls._MAX_VERIFICATION_RENDERED_LINES - 1
+            text,
+            cls._MAX_RENDERED_BYTES - len(marker.encode("utf-8")) - 1,
+            cls._MAX_RENDERED_LINES - 1,
         )
-        separator = "" if cls._ends_with_line_separator(payload) else "\n"
+        separator = "\n" if always_separate_marker else ""
+        if not separator and not cls._ends_with_line_separator(payload):
+            separator = "\n"
         return f"{payload}{separator}{marker}"
 
     @staticmethod
@@ -323,7 +305,7 @@ class RunBrowserApp(App[None]):
         """Bound content while retaining result, error, and raw-view guidance."""
         result, error, raw_status = lines
         rendered = "\n".join(lines)
-        if cls._within_record_detail_limits(rendered):
+        if cls._rendered_output_within_limits(rendered):
             return rendered
 
         marker = cls._RECORD_DETAIL_TRUNCATION_MARKER
@@ -338,13 +320,11 @@ class RunBrowserApp(App[None]):
             else "Error: available (detail may be truncated)."
         )
         required = (result_availability, error_availability, f"Raw JSON: {raw_status}", marker)
-        available_bytes = (
-            cls._MAX_RECORD_DETAIL_RENDERED_BYTES - len("\n".join(required).encode("utf-8")) - 1
-        )
+        available_bytes = cls._MAX_RENDERED_BYTES - len("\n".join(required).encode("utf-8")) - 1
         error_detail = cls._truncate_literal(
             error,
             available_bytes,
-            cls._MAX_RECORD_DETAIL_RENDERED_LINES - len(required),
+            cls._MAX_RENDERED_LINES - len(required),
         )
         return "\n".join(
             (
@@ -371,11 +351,11 @@ class RunBrowserApp(App[None]):
         return "".join(selected)
 
     @classmethod
-    def _within_record_detail_limits(cls, rendered: str) -> bool:
-        """Return whether literal record detail fits the ADR display limits."""
+    def _rendered_output_within_limits(cls, text: str) -> bool:
+        """Return whether literal text fits the shared ADR display limits."""
         return (
-            len(rendered.encode("utf-8")) <= cls._MAX_RECORD_DETAIL_RENDERED_BYTES
-            and len(rendered.splitlines()) <= cls._MAX_RECORD_DETAIL_RENDERED_LINES
+            len(text.encode("utf-8")) <= cls._MAX_RENDERED_BYTES
+            and len(text.splitlines()) <= cls._MAX_RENDERED_LINES
         )
 
     def _remember_browser_highlight(self) -> None:
@@ -554,19 +534,7 @@ class RunBrowserApp(App[None]):
     @classmethod
     def _bound_browser_output(cls, text: str) -> str:
         """Bound a browser row or project diagnostic with a visible marker."""
-        if (
-            len(text.encode("utf-8")) <= cls._MAX_BROWSER_RENDERED_BYTES
-            and len(text.splitlines()) <= cls._MAX_BROWSER_RENDERED_LINES
-        ):
-            return text
-        marker = cls._BROWSER_TRUNCATION_MARKER
-        payload = cls._truncate_literal(
-            text,
-            cls._MAX_BROWSER_RENDERED_BYTES - len(marker.encode("utf-8")) - 1,
-            cls._MAX_BROWSER_RENDERED_LINES - 1,
-        )
-        separator = "" if cls._ends_with_line_separator(payload) else "\n"
-        return f"{payload}{separator}{marker}"
+        return cls._bound_rendered_output(text, cls._BROWSER_TRUNCATION_MARKER)
 
     @classmethod
     def _render_run(cls, summary: RunSummary, lock: LockObservation) -> str:
@@ -657,12 +625,13 @@ class RunBrowserApp(App[None]):
     def _bound_history_lines(cls, status_line: str, evidence_lines: list[str]) -> str:
         """Limit timeline output while retaining the status and bounded evidence."""
         complete_lines = [status_line, *evidence_lines]
-        if cls._within_history_limits(complete_lines):
-            return "\n".join(complete_lines)
+        rendered = "\n".join(complete_lines)
+        if cls._rendered_output_within_limits(rendered):
+            return rendered
 
         marker = cls._TIMELINE_TRUNCATION_MARKER
-        available_lines = cls._MAX_TIMELINE_RENDERED_LINES - 2
-        available_bytes = cls._MAX_TIMELINE_RENDERED_BYTES - sum(
+        available_lines = cls._MAX_RENDERED_LINES - 2
+        available_bytes = cls._MAX_RENDERED_BYTES - sum(
             len(line.encode("utf-8")) + 1 for line in (status_line, marker)
         )
         rendered_evidence: list[str] = []
@@ -673,14 +642,6 @@ class RunBrowserApp(App[None]):
             rendered_evidence.append(line)
             available_bytes -= line_bytes
         return "\n".join((status_line, *rendered_evidence, marker))
-
-    @classmethod
-    def _within_history_limits(cls, lines: list[str]) -> bool:
-        """Return whether rendered literal lines fit the ADR display limits."""
-        return len(lines) <= cls._MAX_TIMELINE_RENDERED_LINES and (
-            sum(len(line.encode("utf-8")) for line in lines) + len(lines) - 1
-            <= cls._MAX_TIMELINE_RENDERED_BYTES
-        )
 
     @classmethod
     def _render_current_run(cls, current: CurrentRun, lock: LockObservation) -> str:
@@ -725,14 +686,14 @@ class RunBrowserApp(App[None]):
     def _bound_summary_lines(cls, lines: list[str]) -> str:
         """Bound summary output while preserving its activity and lock classification."""
         rendered = "\n".join(lines)
-        if cls._within_summary_limits(rendered):
+        if cls._rendered_output_within_limits(rendered):
             return rendered
 
         marker = cls._SUMMARY_TRUNCATION_MARKER
         classification_lines = lines[:3]
         reserved = "\n".join((*classification_lines, marker))
-        available_bytes = cls._MAX_SUMMARY_RENDERED_BYTES - len(reserved.encode("utf-8"))
-        available_lines = cls._MAX_SUMMARY_RENDERED_LINES - len(classification_lines) - 1
+        available_bytes = cls._MAX_RENDERED_BYTES - len(reserved.encode("utf-8"))
+        available_lines = cls._MAX_RENDERED_LINES - len(classification_lines) - 1
         rendered_evidence: list[str] = []
         for line in "\n".join(lines[3:]).splitlines():
             line_bytes = len(line.encode("utf-8")) + 1
@@ -741,11 +702,3 @@ class RunBrowserApp(App[None]):
             rendered_evidence.append(line)
             available_bytes -= line_bytes
         return "\n".join((*classification_lines, *rendered_evidence, marker))
-
-    @classmethod
-    def _within_summary_limits(cls, rendered: str) -> bool:
-        """Return whether literal summary text fits the ADR display limits."""
-        return (
-            len(rendered.encode("utf-8")) <= cls._MAX_SUMMARY_RENDERED_BYTES
-            and len(rendered.splitlines()) <= cls._MAX_SUMMARY_RENDERED_LINES
-        )
