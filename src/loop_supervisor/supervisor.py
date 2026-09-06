@@ -135,6 +135,7 @@ class Limits:
     max_replans_per_task: int = 3
     max_architect_retries: int = 3
     max_builder_guidance_attempts: int = 3
+    max_operational_retries: int = 3
     malformed_output_retries: int = 1
     role_timeout: float = 1800.0
 
@@ -148,6 +149,7 @@ def _default_run_options() -> RunOptions:
         max_architect_retries=defaults.max_architect_retries,
         max_builder_guidance_attempts=defaults.max_builder_guidance_attempts,
         malformed_output_retries=defaults.malformed_output_retries,
+        max_operational_retries=defaults.max_operational_retries,
         role_timeout=defaults.role_timeout,
         worktree_root=None,
         require_decision_approval=False,
@@ -207,6 +209,7 @@ class Supervisor:
             max_architect_retries=self.options.max_architect_retries,
             max_builder_guidance_attempts=self.options.max_builder_guidance_attempts,
             malformed_output_retries=self.options.malformed_output_retries,
+            max_operational_retries=self.options.max_operational_retries,
             role_timeout=self.options.role_timeout,
         )
 

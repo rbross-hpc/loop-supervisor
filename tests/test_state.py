@@ -27,6 +27,7 @@ def _make_options(**overrides) -> RunOptions:
         max_replans_per_task=3,
         max_architect_retries=3,
         max_builder_guidance_attempts=3,
+        max_operational_retries=3,
         malformed_output_retries=1,
         role_timeout=1800.0,
         worktree_root=None,
@@ -85,6 +86,56 @@ def test_last_completed_task_roundtrips_and_legacy_omission_defaults_to_none(tmp
     del saved["last_completed_task"]
     path.write_text(json.dumps(saved))
     assert load_state(tmp_path, state.run_id).last_completed_task is None
+
+
+def test_operational_retry_fields_roundtrip_and_legacy_omissions_default_independently(tmp_path):
+    state = _make_state(
+        new_run_id(),
+        operational_retry_count=2,
+        options=_make_options(max_operational_retries=4),
+    )
+    save_state(tmp_path, state)
+
+    path = state_path(tmp_path, state.run_id)
+    saved = json.loads(path.read_text())
+    assert saved["operational_retry_count"] == 2
+    assert saved["options"]["max_operational_retries"] == 4
+    loaded = load_state(tmp_path, state.run_id)
+    assert loaded.operational_retry_count == 2
+    assert loaded.options.max_operational_retries == 4
+
+    del saved["operational_retry_count"]
+    path.write_text(json.dumps(saved))
+    legacy_state = load_state(tmp_path, state.run_id)
+    assert legacy_state.operational_retry_count == 0
+    save_state(tmp_path, legacy_state)
+    assert json.loads(path.read_text())["operational_retry_count"] == 0
+
+    saved = json.loads(path.read_text())
+    saved["operational_retry_count"] = 2
+    del saved["options"]["max_operational_retries"]
+    path.write_text(json.dumps(saved))
+    legacy_state = load_state(tmp_path, state.run_id)
+    assert legacy_state.options.max_operational_retries == 3
+    save_state(tmp_path, legacy_state)
+    assert json.loads(path.read_text())["options"]["max_operational_retries"] == 3
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("operational_retry_count", True), ("max_operational_retries", -1)],
+)
+def test_load_rejects_malformed_operational_retry_fields(tmp_path, field, value):
+    state = _make_state(new_run_id())
+    save_state(tmp_path, state)
+    path = state_path(tmp_path, state.run_id)
+    data = json.loads(path.read_text())
+    destination = data if field == "operational_retry_count" else data["options"]
+    destination[field] = value
+    path.write_text(json.dumps(data))
+
+    with pytest.raises(StateError, match=field):
+        load_state(tmp_path, state.run_id)
 
 
 @pytest.mark.parametrize(
