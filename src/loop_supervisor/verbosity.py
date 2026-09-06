@@ -131,6 +131,12 @@ class VerboseReporter:
             return
         self._print(f"{outcome.phase_before} -> {outcome.phase_after}{suffix}")
 
+    def operational_retry(self, *, retry_count: int, max_retries: int, state: Any) -> None:
+        """Report an automatic retry separately from phase transitions and resume."""
+        label = _task_label(state)
+        suffix = f"  {label}" if label else ""
+        self._print(f"automatic operational retry {retry_count}/{max_retries}{suffix}")
+
 
 @dataclass
 class _GapStats:

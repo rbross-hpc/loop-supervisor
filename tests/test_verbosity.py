@@ -176,6 +176,19 @@ def test_on_advance_prints_phase_transition_with_task_label():
     assert "task-001: Do the thing" in output
 
 
+def test_operational_retry_line_is_distinct_from_phase_transition():
+    stream = io.StringIO()
+    reporter = VerboseReporter(stream=stream)
+
+    reporter.operational_retry(retry_count=2, max_retries=3, state=_fake_state(task_id="task-001"))
+
+    output = stream.getvalue()
+    assert _TIMESTAMP_RE.match(output)
+    assert "automatic operational retry 2/3" in output
+    assert "task-001" in output
+    assert "->" not in output
+
+
 def test_on_advance_skips_line_when_phase_unchanged():
     """An advance() call that loops without a phase transition (e.g.
     INPUT_REQUIRED) must not print a same-phase 'X -> X' line, which

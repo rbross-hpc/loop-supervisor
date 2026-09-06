@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import time
 import uuid
 from collections import Counter
 from collections.abc import Callable
@@ -87,6 +88,14 @@ from .state import (
 )
 
 _TERMINAL_PHASES = TERMINAL_PHASES
+_OPERATIONAL_RETRY_DELAY_SECONDS = 1.0
+
+
+def _wait_before_operational_retry() -> None:
+    """Give a flapping dependency a short, interruptible pause before retrying."""
+    time.sleep(_OPERATIONAL_RETRY_DELAY_SECONDS)
+
+
 _DURABLE_SIDE_EFFECT_PHASES = {
     PHASE_CREATING_WORKTREE,
     PHASE_RECORDING_DECISION,
@@ -626,6 +635,8 @@ class Supervisor:
         safe as any other phase retry.
         """
         classify_phase = phase_before if state.phase in _TERMINAL_PHASES else state.phase
+        if success_status == AdvanceStatus.ADVANCED and phase_before != PHASE_OPERATIONAL_FAILURE:
+            state.operational_retry_count = 0
         try:
             self._save(state)
         except _OPERATIONAL_FAILURE_EXCEPTIONS as exc:
@@ -837,6 +848,31 @@ class Supervisor:
                     raise LoopError(str(outcome.error)) from outcome.error
                 return state
             if outcome.status == AdvanceStatus.OPERATIONAL_FAILURE:
+                record = (
+                    OperationalErrorRecord.from_dict(state.last_error)
+                    if state.last_error is not None
+                    else None
+                )
+                if (
+                    record is not None
+                    and record.retryable
+                    and not record.requires_repair
+                    and state.operational_retry_count < state.options.max_operational_retries
+                ):
+                    state.operational_retry_count += 1
+                    self._save(state)
+                    retry_reporter = getattr(on_advance, "operational_retry", None)
+                    if callable(retry_reporter):
+                        try:
+                            retry_reporter(
+                                retry_count=state.operational_retry_count,
+                                max_retries=state.options.max_operational_retries,
+                                state=state,
+                            )
+                        except Exception:
+                            pass
+                    _wait_before_operational_retry()
+                    continue
                 if outcome.error is not None:
                     raise LoopError(str(outcome.error)) from outcome.error
                 return state

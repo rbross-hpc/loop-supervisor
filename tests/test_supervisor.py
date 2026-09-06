@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from loop_supervisor.git import GitRepo
+from loop_supervisor.opencode import AgentInvocationError
 from loop_supervisor.state import RunOptions, load_state
 from loop_supervisor.supervisor import (
     PHASE_AWAITING_INPUT,
@@ -185,6 +186,9 @@ def _make_options(**overrides):
         malformed_output_retries=overrides.get(
             "malformed_output_retries", base.malformed_output_retries
         ),
+        max_operational_retries=overrides.get(
+            "max_operational_retries", base.max_operational_retries
+        ),
         role_timeout=overrides.get("role_timeout", base.role_timeout),
         worktree_root=overrides.get("worktree_root", base.worktree_root),
         require_decision_approval=overrides.get(
@@ -216,6 +220,7 @@ def _make_supervisor(
                 max_architect_retries=limits.max_architect_retries,
                 max_builder_guidance_attempts=limits.max_builder_guidance_attempts,
                 malformed_output_retries=limits.malformed_output_retries,
+                max_operational_retries=limits.max_operational_retries,
                 role_timeout=limits.role_timeout,
             )
         overrides["require_decision_approval"] = not auto_decide
@@ -832,6 +837,143 @@ def test_revise_clears_stale_verification_result(tmp_path):
     assert state.verification_result is None
 
 
+def test_run_automatically_retries_retryable_failure_and_persists_count(tmp_path, monkeypatch):
+    calls = 0
+    retry_counts_at_save: list[int] = []
+    delays: list[float] = []
+
+    class FlakyRunner:
+        def run_agent(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise AgentInvocationError("temporary service failure")
+            return _planner_complete()
+
+    supervisor, repo = _make_supervisor(tmp_path, FlakyRunner())
+    state = supervisor.start_new_run()
+    original_save = supervisor._save
+
+    def record_save(saved_state):
+        retry_counts_at_save.append(saved_state.operational_retry_count)
+        original_save(saved_state)
+
+    monkeypatch.setattr(supervisor, "_save", record_save)
+    monkeypatch.setattr(
+        "loop_supervisor.supervisor._wait_before_operational_retry",
+        lambda: delays.append(1.0),
+        raising=False,
+    )
+
+    final = supervisor.run(state)
+
+    assert final.phase == PHASE_DONE
+    assert calls == 2
+    assert retry_counts_at_save == [0, 1, 1, 0]
+    assert delays == [1.0]
+    assert load_state(repo.common_dir(), state.run_id).operational_retry_count == 0
+
+
+def test_advance_resets_retry_count_only_after_successful_non_recovery_dispatch(tmp_path):
+    runner = ScriptedRunner({"loop-planner": [_planner_complete()]})
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    state.operational_retry_count = 2
+
+    supervisor.advance(state)
+
+    assert state.phase == PHASE_DONE
+    assert state.operational_retry_count == 0
+
+
+def test_input_unavailable_does_not_reset_retry_count(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="BLOCKED", open_concerns=["clarification needed"])],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner, input_provider=ScriptedInput([]))
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+    supervisor.advance(state)
+    supervisor.advance(state)
+    state.operational_retry_count = 2
+
+    supervisor.advance(state)
+
+    assert state.phase == PHASE_AWAITING_INPUT
+    assert state.operational_retry_count == 2
+
+
+def test_recovery_unwrap_retains_retry_count_until_retried_phase_succeeds(tmp_path):
+    class FailingRunner:
+        def run_agent(self, **_kwargs):
+            raise AgentInvocationError("temporary service failure")
+
+    supervisor, repo = _make_supervisor(tmp_path, FailingRunner())
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+    state.operational_retry_count = 2
+
+    supervisor.advance(state)
+
+    assert state.phase == PHASE_PLANNING
+    assert state.operational_retry_count == 2
+
+
+def test_run_does_not_retry_when_limit_is_zero(tmp_path, monkeypatch):
+    calls = 0
+    delays: list[float] = []
+
+    class FailingRunner:
+        def run_agent(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise AgentInvocationError("temporary service failure")
+
+    options = _make_options(max_operational_retries=0)
+    supervisor, repo = _make_supervisor(tmp_path, FailingRunner(), options=options)
+    state = supervisor.start_new_run()
+    monkeypatch.setattr(
+        "loop_supervisor.supervisor._wait_before_operational_retry",
+        lambda: delays.append(1.0),
+    )
+
+    with pytest.raises(LoopError, match="temporary service failure"):
+        supervisor.run(state)
+
+    assert calls == 1
+    assert delays == []
+    assert state.operational_retry_count == 0
+
+
+def test_run_stops_when_automatic_retry_budget_is_exhausted(tmp_path, monkeypatch):
+    calls = 0
+    delays: list[float] = []
+
+    class FailingRunner:
+        def run_agent(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise AgentInvocationError("temporary service failure")
+
+    options = _make_options(max_operational_retries=1)
+    supervisor, repo = _make_supervisor(tmp_path, FailingRunner(), options=options)
+    state = supervisor.start_new_run()
+    monkeypatch.setattr(
+        "loop_supervisor.supervisor._wait_before_operational_retry",
+        lambda: delays.append(1.0),
+    )
+
+    with pytest.raises(LoopError, match="temporary service failure"):
+        supervisor.run(state)
+
+    assert calls == 2
+    assert delays == [1.0]
+    assert state.operational_retry_count == 1
+
+
 def test_run_max_steps_none_matches_unbounded_default(tmp_path):
     runner = ScriptedRunner(
         {
@@ -1401,7 +1543,9 @@ def test_task_identity_mismatch_from_builder_raises(tmp_path):
             "loop-builder": [_builder(task_id="task-WRONG", status="COMPLETE")],
         }
     )
-    supervisor, repo = _make_supervisor(tmp_path, runner)
+    supervisor, repo = _make_supervisor(
+        tmp_path, runner, options=_make_options(max_operational_retries=0)
+    )
     state = supervisor.start_new_run()
 
     from loop_supervisor.contracts import ContractError
@@ -1484,7 +1628,12 @@ def test_architect_must_answer_the_requested_question(tmp_path):
             "loop-architect": [_architect_decided(question="A different question entirely")],
         }
     )
-    supervisor, repo = _make_supervisor(tmp_path, runner, auto_decide=True)
+    supervisor, repo = _make_supervisor(
+        tmp_path,
+        runner,
+        auto_decide=True,
+        options=_make_options(max_operational_retries=0),
+    )
     state = supervisor.start_new_run()
 
     from loop_supervisor.contracts import ContractError
