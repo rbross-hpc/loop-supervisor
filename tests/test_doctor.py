@@ -10,7 +10,6 @@ import tomllib
 from importlib.metadata import version
 from pathlib import Path
 
-from loop_supervisor import __version__
 from loop_supervisor.doctor import (
     _check_agent_files,
     _check_clean_and_attached,
@@ -45,10 +44,12 @@ def _init_repo(path: Path) -> None:
 
 
 def test_package_version_matches_installed_distribution_metadata():
+    import loop_supervisor
+
     with Path("pyproject.toml").open("rb") as file:
         declared_version = tomllib.load(file)["project"]["version"]
 
-    assert __version__ == version("loop-supervisor") == declared_version
+    assert loop_supervisor.__version__ == version("loop-supervisor") == declared_version
 
 
 def test_check_python_version_passes_on_current_interpreter():
@@ -328,7 +329,7 @@ def test_validate_report_includes_package_version_with_python_version(tmp_path):
     assert report["checks"]["python_version"]["ok"] is True
     assert report["checks"]["loop_supervisor_version"] == {
         "ok": True,
-        "detail": f"loop-supervisor {__version__}",
+        "detail": f"loop-supervisor {version('loop-supervisor')}",
     }
 
 

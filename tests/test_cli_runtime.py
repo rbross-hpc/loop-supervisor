@@ -7,12 +7,12 @@ import argparse
 import json
 import os
 import signal
+from importlib.metadata import version
 from typing import Any, cast
 
 import pytest
 
 import loop_supervisor.cli as cli_mod
-from loop_supervisor import __version__
 from loop_supervisor.git import GitError
 from loop_supervisor.locking import LockError
 from loop_supervisor.runtime import RuntimeError_
@@ -1004,7 +1004,7 @@ def test_main_version_flag_prints_package_version(capsys):
         cli_mod.main(["--version"])
 
     assert exc_info.value.code == 0
-    assert capsys.readouterr().out == f"{__version__}\n"
+    assert capsys.readouterr().out == f"{version('loop-supervisor')}\n"
 
 
 def test_build_parser_wires_config_validate():
@@ -1047,7 +1047,7 @@ def test_cmd_config_validate_json_includes_loop_supervisor_version(tmp_path, cap
     assert cli_mod.cmd_config_validate(args) == 1
     report = json.loads(capsys.readouterr().out)
     assert report["checks"]["loop_supervisor_version"]["detail"] == (
-        f"loop-supervisor {__version__}"
+        f"loop-supervisor {version('loop-supervisor')}"
     )
 
 
