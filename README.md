@@ -274,7 +274,7 @@ loop-supervisor run --project /path/to/integration/checkout
 
 Useful flags: `--worktree-root`, `--max-tasks`, `--max-revisions`,
 `--max-replans`, `--max-architect-retries`,
-`--max-builder-guidance-attempts`, `--role-timeout`,
+`--max-builder-guidance-attempts`, `--max-operational-retries`, `--role-timeout`,
 `--require-decision-approval`, `--opencode-executable`,
 `--recover-stale-lock`, and the mutually exclusive `--step`/
 `--max-steps` (bound how many phase transitions this invocation

@@ -31,6 +31,7 @@ def _run_args(tmp_path, **overrides):
         max_replans=3,
         max_architect_retries=3,
         max_builder_guidance_attempts=3,
+        max_operational_retries=3,
         role_timeout=1800.0,
         recover_stale_lock=False,
         config=None,
@@ -128,6 +129,7 @@ def test_cmd_resume_normalizes_expected_errors(tmp_path, monkeypatch, capsys, ex
         {"max_replans": -1},
         {"max_architect_retries": -1},
         {"max_builder_guidance_attempts": -1},
+        {"max_operational_retries": -1},
         {"role_timeout": 0.0},
         {"role_timeout": -1.0},
         {"startup_timeout": 0.0},
@@ -194,6 +196,18 @@ def _capture_options(monkeypatch):
 
     monkeypatch.setattr(cli_mod, "run_new", fake_run_new)
     return captured_options
+
+
+@pytest.mark.parametrize("max_operational_retries", [5, 0])
+def test_cmd_run_passes_operational_retry_limit_to_run_new(
+    tmp_path, monkeypatch, max_operational_retries
+):
+    captured = _capture_options(monkeypatch)
+
+    rc = cli_mod.cmd_run(_run_args(tmp_path, max_operational_retries=max_operational_retries))
+
+    assert rc == 0
+    assert captured["options"].max_operational_retries == max_operational_retries
 
 
 def test_cmd_run_defaults_provision_and_verify_to_off(tmp_path, monkeypatch):
@@ -619,6 +633,15 @@ def test_build_parser_rejects_step_and_max_steps_together_for_resume():
     parser = cli_mod.build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["resume", "run-1", "--step", "--max-steps", "3"])
+
+
+@pytest.mark.parametrize("argv, expected", [([], 3), (["--max-operational-retries", "0"], 0)])
+def test_build_parser_sets_operational_retry_limit_for_run(argv, expected):
+    parser = cli_mod.build_parser()
+
+    args = parser.parse_args(["run", *argv])
+
+    assert args.max_operational_retries == expected
 
 
 def test_build_parser_accepts_max_steps_on_resume():
