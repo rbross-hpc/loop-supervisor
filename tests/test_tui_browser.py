@@ -1012,6 +1012,16 @@ async def test_run_detail_renders_ordered_incomplete_history_timeline(tmp_path: 
         assert "0002-planning.json: malformed history record" in timeline
 
 
+def test_shared_render_output_bound_applies_marker_without_splitting_unicode() -> None:
+    marker = "Shared output truncated."
+    rendered = RunBrowserApp._bound_rendered_output("é" * (256 * 1024), marker)
+
+    assert len(rendered.encode("utf-8")) <= RunBrowserApp._MAX_RENDERED_BYTES
+    assert len(rendered.splitlines()) <= RunBrowserApp._MAX_RENDERED_LINES
+    assert rendered.endswith(marker)
+    assert rendered.removesuffix(marker).endswith("\n")
+
+
 def test_timeline_rendering_reserves_incomplete_diagnostic_within_output_limits() -> None:
     entry = HistoryEntry(
         seq=1,
