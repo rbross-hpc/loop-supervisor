@@ -369,6 +369,123 @@ def test_creating_worktree_provisioning_stops_at_first_failing_command(tmp_path)
     assert not marker.exists()
 
 
+def test_creating_worktree_creates_a_scratch_directory(tmp_path):
+    runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+
+    worktree_path = Path(state.task_worktree_path)
+    scratch_path = worktree_path.parent / f"{worktree_path.name}.scratch"
+    assert scratch_path.is_dir()
+
+
+def test_creating_worktree_scratch_creation_is_idempotent_on_retry(tmp_path):
+    # Provisioning failure retries the entire creating_worktree phase on
+    # resume (create_or_reconcile_task_worktree's reconciliation path);
+    # scratch creation must not wipe a file the builder already placed
+    # there from an earlier, since-failed attempt at this same phase.
+    runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
+    options = _make_options(provision_commands=("sh -c 'exit 1'",))
+    supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> operational_failure
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+
+    worktree_path = Path(state.task_worktree_path or state.pending_worktree_path)
+    scratch_path = worktree_path.parent / f"{worktree_path.name}.scratch"
+    assert scratch_path.is_dir()
+    marker = scratch_path / "probe.bak"
+    marker.write_text("backed up content")
+
+    supervisor.options = _make_options(provision_commands=("true",))
+    state.phase = state.last_error["retry_phase"]
+    supervisor.advance(state)
+
+    assert state.phase == "building"
+    assert scratch_path.is_dir()
+    assert marker.read_text() == "backed up content"
+
+
+def test_cleanup_worktree_removes_the_scratch_directory(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(), _planner_complete()],
+            "loop-builder": [_builder(status="COMPLETE")],
+            "loop-auditor": [_auditor(disposition="ACCEPT")],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+
+    worktree_path = Path(state.task_worktree_path)
+    scratch_path = worktree_path.parent / f"{worktree_path.name}.scratch"
+    assert scratch_path.is_dir()
+
+    supervisor.advance(state)  # building -> auditing
+    supervisor.advance(state)  # auditing -> merging
+    supervisor.advance(state)  # merging -> cleanup_worktree
+    supervisor.advance(state)  # cleanup_worktree -> cleanup_branch
+
+    assert not scratch_path.exists()
+
+
+def test_cleanup_worktree_scratch_removal_is_best_effort(tmp_path):
+    # A failure removing the scratch directory must not turn a completed,
+    # merged task into an operational failure. Reproduced with a real
+    # OSError-inducing condition (the scratch path is a regular file, not
+    # a directory, so shutil.rmtree cannot remove it as one) rather than
+    # by replacing shutil.rmtree itself, so this exercises the actual
+    # ignore_errors=True contract instead of a stand-in for it.
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready(), _planner_complete()],
+            "loop-builder": [_builder(status="COMPLETE")],
+            "loop-auditor": [_auditor(disposition="ACCEPT")],
+        }
+    )
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> building
+
+    worktree_path = Path(state.task_worktree_path)
+    scratch_path = worktree_path.parent / f"{worktree_path.name}.scratch"
+    scratch_path.rmdir()
+    scratch_path.write_text("not a directory")
+
+    supervisor.advance(state)  # building -> auditing
+    supervisor.advance(state)  # auditing -> merging
+    supervisor.advance(state)  # merging -> cleanup_worktree
+    supervisor.advance(state)  # cleanup_worktree -> cleanup_branch
+    supervisor.advance(state)  # cleanup_branch -> planning
+
+    assert state.phase == "planning"
+    assert scratch_path.exists()
+
+
+def test_terminal_failure_preserves_the_scratch_directory(tmp_path):
+    # A worktree/branch preserved for inspection after a terminal failure
+    # keeps its scratch directory too, for the same reason: it may hold
+    # diagnostic evidence (e.g. a failing-first probe's backup).
+    runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
+    options = _make_options(provision_commands=("sh -c 'exit 1'",))
+    supervisor, repo = _make_supervisor(tmp_path, runner, options=options)
+    state = supervisor.start_new_run()
+    supervisor.advance(state)  # planning -> creating_worktree
+    supervisor.advance(state)  # creating_worktree -> operational_failure
+    assert state.phase == PHASE_OPERATIONAL_FAILURE
+
+    worktree_path = Path(state.task_worktree_path or state.pending_worktree_path)
+    scratch_path = worktree_path.parent / f"{worktree_path.name}.scratch"
+    assert scratch_path.is_dir()
+    assert worktree_path.is_dir()
+
+
 def test_creating_worktree_provisioning_retry_reconciles_existing_worktree(tmp_path):
     # A provisioning failure leaves the worktree/branch created (only task
     # identity is withheld) so resume re-enters via

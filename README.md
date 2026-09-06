@@ -448,17 +448,23 @@ instead:
   injection.** Do this in your own task worktree — it persists
   unchanged through verification, auditing, and merge, so it is
   already an isolated trial environment; do not create a second
-  worktree for this. Back up the file(s) the fix touched (e.g. `cp
-  src/foo.py /tmp/foo.py.bak`), overwrite them with the pre-fix
-  version (`git show <commit-before-the-fix>:path/to/file.py >
-  path/to/file.py`), run the new test and confirm it fails, then
-  restore from your backup (`cp /tmp/foo.py.bak src/foo.py`) — never
+  worktree for this. Back up the file(s) the fix touched into the
+  scratch directory the supervisor created beside your worktree (its
+  path is your worktree's own path with `.scratch` appended — see your
+  agent instructions), e.g. `cp src/foo.py
+  ../<your-worktree-name>.scratch/foo.py.bak`. Overwrite the originals
+  with the pre-fix version (`git show
+  <commit-before-the-fix>:path/to/file.py > path/to/file.py`), run the
+  new test and confirm it fails, then restore from your backup — never
   `git checkout --` on uncommitted work, which discards it instead of
-  restoring it. Confirm `git status` is clean again before reporting
-  COMPLETE: the supervisor rejects a dirty worktree at that point. A
-  hand-written injection only proves the test detects *your*
-  injection, which is frequently a different (and often more broken)
-  bug than the one that actually shipped.
+  restoring it, and never a directory outside the project and its
+  sibling worktrees (e.g. `/tmp`), which is denied by policy and
+  silently stops the whole run in this headless mode. Confirm `git
+  status` is clean again before reporting COMPLETE: the supervisor
+  rejects a dirty worktree at that point. A hand-written injection only
+  proves the test detects *your* injection, which is frequently a
+  different (and often more broken) bug than the one that actually
+  shipped.
 
   If a probe genuinely needs a different commit checked out entirely
   (not just one or two files swapped), a temporary worktree is the
