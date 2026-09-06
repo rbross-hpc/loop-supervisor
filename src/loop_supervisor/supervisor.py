@@ -563,6 +563,8 @@ class Supervisor:
             else:
                 raise LoopError(f"unknown phase {phase_before!r}")
         except _InputRequiredSignal:
+            if phase_before != PHASE_OPERATIONAL_FAILURE:
+                state.operational_retry_count = 0
             self._save(state)
             return AdvanceOutcome(
                 status=AdvanceStatus.INPUT_REQUIRED,
@@ -635,7 +637,10 @@ class Supervisor:
         safe as any other phase retry.
         """
         classify_phase = phase_before if state.phase in _TERMINAL_PHASES else state.phase
-        if success_status == AdvanceStatus.ADVANCED and phase_before != PHASE_OPERATIONAL_FAILURE:
+        if (
+            success_status != AdvanceStatus.INPUT_UNAVAILABLE
+            and phase_before != PHASE_OPERATIONAL_FAILURE
+        ):
             state.operational_retry_count = 0
         try:
             self._save(state)

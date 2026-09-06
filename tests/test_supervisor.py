@@ -13,6 +13,7 @@ from loop_supervisor.supervisor import (
     PHASE_DONE,
     PHASE_OPERATIONAL_FAILURE,
     PHASE_PLANNING,
+    AdvanceStatus,
     LoopError,
     Supervisor,
     _build_planner_prompt,
@@ -883,6 +884,26 @@ def test_advance_resets_retry_count_only_after_successful_non_recovery_dispatch(
     supervisor.advance(state)
 
     assert state.phase == PHASE_DONE
+    assert state.operational_retry_count == 0
+
+
+def test_input_required_phase_completion_resets_retry_count(tmp_path):
+    runner = ScriptedRunner(
+        {
+            "loop-planner": [_planner_ready()],
+            "loop-builder": [_builder(status="BLOCKED", open_concerns=["clarification needed"])],
+        }
+    )
+    supervisor, _ = _make_supervisor(tmp_path, runner, input_provider=ScriptedInput([]))
+    state = supervisor.start_new_run()
+    supervisor.advance(state)
+    supervisor.advance(state)
+    state.operational_retry_count = 2
+
+    outcome = supervisor.advance(state)
+
+    assert outcome.status is AdvanceStatus.INPUT_REQUIRED
+    assert state.phase == PHASE_AWAITING_INPUT
     assert state.operational_retry_count == 0
 
 
