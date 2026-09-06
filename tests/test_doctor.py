@@ -6,6 +6,8 @@ test_cli_init.py-style CLI wiring tests in test_cli_runtime.py."""
 
 import json
 import subprocess
+import tomllib
+from importlib.metadata import version
 from pathlib import Path
 
 from loop_supervisor.doctor import (
@@ -39,6 +41,15 @@ def _init_repo(path: Path) -> None:
     (path / "README.md").write_text("hello\n")
     _run(["add", "-A"], path)
     _run(["commit", "-m", "initial"], path)
+
+
+def test_package_version_matches_installed_distribution_metadata():
+    import loop_supervisor
+
+    with Path("pyproject.toml").open("rb") as file:
+        declared_version = tomllib.load(file)["project"]["version"]
+
+    assert loop_supervisor.__version__ == version("loop-supervisor") == declared_version
 
 
 def test_check_python_version_passes_on_current_interpreter():
@@ -312,11 +323,22 @@ def test_env_status_never_includes_values(monkeypatch):
     assert "super-secret-value" not in serialized
 
 
+def test_validate_report_includes_package_version_with_python_version(tmp_path):
+    report = validate_report(tmp_path)
+
+    assert report["checks"]["python_version"]["ok"] is True
+    assert report["checks"]["loop_supervisor_version"] == {
+        "ok": True,
+        "detail": f"loop-supervisor {version('loop-supervisor')}",
+    }
+
+
 def test_run_checks_returns_all_named_checks(tmp_path):
     _init_repo(tmp_path)
     results = run_checks(tmp_path)
     names = {r.name for r in results}
     assert names == {
+        "loop_supervisor_version",
         "python_version",
         "git_executable",
         "opencode_executable",

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from . import __version__
 from .config import ConfigError, ProjectConfig, load_project_config
 from .doctor import validate_report
 from .git import GitError, GitRepo
@@ -666,6 +667,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="loop-supervisor")
+    parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
 
     run_parser = sub.add_parser("run", help="Start a new loop run")

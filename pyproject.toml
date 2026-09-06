@@ -1,6 +1,6 @@
 [project]
 name = "loop-supervisor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Headless supervisor that orchestrates an OpenCode planner/architect/builder/auditor loop over Git worktrees."
 readme = "README.md"
 requires-python = ">=3.11"

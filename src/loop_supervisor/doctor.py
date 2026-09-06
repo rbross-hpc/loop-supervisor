@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .config import ConfigError, load_project_config
 from .git import GitError, GitRepo
 
@@ -63,6 +64,10 @@ class CheckResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {"ok": self.ok, "detail": self.detail}
+
+
+def _check_loop_supervisor_version() -> CheckResult:
+    return CheckResult("loop_supervisor_version", True, f"loop-supervisor {__version__}")
 
 
 def _check_python_version() -> CheckResult:
@@ -310,6 +315,7 @@ def run_checks(project_root: Path, *, opencode_executable: str = "opencode") -> 
     """Run every preflight check and return results in a fixed, stable
     order (used for both human and --json output)."""
     return [
+        _check_loop_supervisor_version(),
         _check_python_version(),
         _check_git_executable(),
         _check_opencode_executable(opencode_executable),
