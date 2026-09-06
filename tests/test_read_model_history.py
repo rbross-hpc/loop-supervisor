@@ -70,6 +70,45 @@ def test_load_history_returns_valid_records_in_numeric_sequence_order(tmp_path):
     assert loaded.diagnostics == ()
 
 
+@pytest.mark.parametrize("supplied_retry_count", [None, 2])
+def test_load_history_accepts_legacy_and_extended_counter_sets(tmp_path, supplied_retry_count):
+    record = _record("run-1", 1)
+    counters = record["counters"]
+    assert isinstance(counters, dict)
+    if supplied_retry_count is not None:
+        counters["operational_retry_count"] = supplied_retry_count
+    _write_history(tmp_path, "0001-planning.json", record)
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert len(loaded.entries) == 1
+    assert loaded.entries[0].counters["operational_retry_count"] == (supplied_retry_count or 0)
+    assert loaded.completeness is HistoryStatus.COMPLETE
+    assert loaded.diagnostics == ()
+
+
+@pytest.mark.parametrize(
+    "counter_change",
+    [
+        lambda counters: counters.update(unexpected_counter=0),
+        lambda counters: counters.update(operational_retry_count=-1),
+        lambda counters: counters.update(operational_retry_count=True),
+    ],
+)
+def test_load_history_rejects_invalid_extended_counter_set_or_value(tmp_path, counter_change):
+    record = _record("run-1", 1)
+    counters = record["counters"]
+    assert isinstance(counters, dict)
+    counter_change(counters)
+    _write_history(tmp_path, "0001-planning.json", record)
+
+    loaded = load_history(tmp_path, "run-1")
+
+    assert loaded.entries == ()
+    assert loaded.completeness is HistoryStatus.INCOMPLETE
+    assert [diagnostic.reason for diagnostic in loaded.diagnostics] == ["malformed history record"]
+
+
 def _consistent_adjacent_records() -> tuple[dict[str, object], dict[str, object]]:
     first = _record("run-1", 1)
     second = _record("run-1", 2, "creating_worktree")

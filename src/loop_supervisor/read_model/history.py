@@ -43,6 +43,10 @@ _COUNTER_FIELDS = frozenset(
         "builder_guidance_count",
     }
 )
+_OPTIONAL_COUNTER_FIELD = "operational_retry_count"
+_ACCEPTED_COUNTER_FIELD_SETS = frozenset(
+    {_COUNTER_FIELDS, _COUNTER_FIELDS | {_OPTIONAL_COUNTER_FIELD}}
+)
 _RESET_TRANSITIONS_BY_COUNTER: dict[str, frozenset[tuple[str, str]]] = {
     "revision_count": frozenset(
         {
@@ -414,10 +418,15 @@ def _validate_record(raw: Any, run_id: str, filename_seq: int, filename_phase: s
     ):
         raise ValueError("original_task_id must be null or a non-empty string")
     counters = raw["counters"]
-    if not isinstance(counters, dict) or set(counters) != _COUNTER_FIELDS:
-        raise ValueError("counters must contain exactly the five known counters")
+    if not isinstance(counters, dict) or set(counters) not in _ACCEPTED_COUNTER_FIELD_SETS:
+        raise ValueError(
+            "counters must contain exactly the five known counters, optionally plus "
+            "operational_retry_count"
+        )
     if not all(_non_negative_int(value) for value in counters.values()):
         raise ValueError("counters must be non-negative integers")
+    normalized_counters = dict(counters)
+    normalized_counters.setdefault(_OPTIONAL_COUNTER_FIELD, 0)
     result = raw["result"]
     error = raw["error"]
     _validate_result(phase, result)
@@ -432,7 +441,7 @@ def _validate_record(raw: Any, run_id: str, filename_seq: int, filename_phase: s
         phase_after=phase_after,
         status=status,
         recorded_at=recorded_at,
-        counters=MappingProxyType(dict(counters)),
+        counters=MappingProxyType(normalized_counters),
         original_task_id=original_task_id,
         has_result=result is not None,
         has_error=error is not None,
