@@ -28,15 +28,6 @@ _SKELETON_AGENTS_DIR = _REPO_ROOT / "src" / "loop_supervisor" / "_skeleton" / ".
 # additionally templated (its `model:` pin is user-overridable at init
 # time via `--architect-model`) and is compared separately.
 #
-# loop-planner.md is currently a deliberate, temporary exception: its
-# live copy is carrying an in-progress task-sizing prompt revision
-# (tighter task scoping, 1-3 acceptance criteria, deferred-scope
-# rationale) that is being validated against real planner invocations
-# before being folded into the generic skeleton every new project
-# gets. There is intentionally no drift test for loop-planner.md while
-# this is live-only; once the revision is validated, sync it into
-# src/loop_supervisor/_skeleton/.opencode/agents/loop-planner.md and
-# restore exact-match (or model-line-modulo) parity coverage.
 _EXPECTED_TO_DIVERGE = ("loop-builder.md", "loop-auditor.md")
 
 
@@ -46,6 +37,15 @@ def _without_model_line(text: str) -> str:
     choice (ADR 0023: generated projects ship no provider configuration,
     so the skeleton never pins a model)."""
     return "\n".join(line for line in text.splitlines() if not line.startswith("model: ")) + "\n"
+
+
+def test_skeleton_planner_matches_live_modulo_model_line():
+    """The generic planner prompt must match the live prompt except for
+    this repository's provider-specific model pin (ADR 0023)."""
+    live = _without_model_line((_LIVE_AGENTS_DIR / "loop-planner.md").read_text())
+    skeleton = (_SKELETON_AGENTS_DIR / "loop-planner.md").read_text()
+
+    assert skeleton == live
 
 
 def test_skeleton_architect_matches_live_modulo_model_line():
