@@ -170,18 +170,14 @@ def test_build_snapshot_returns_an_immutable_empty_snapshot_for_absent_runs(tmp_
         snapshot.runs = ()  # type: ignore[misc]
 
 
-@pytest.mark.parametrize(
-    ("counter", "phase", "phase_after"),
-    [
-        ("revision_count", "planning", "building"),
-        ("replan_count", "cleanup_branch", "planning"),
-        ("architect_retry_count", "recording_decision", "building"),
-        ("builder_guidance_count", "building", "verifying"),
-    ],
-)
 def test_build_snapshot_suppresses_resettable_disagreements_when_current_is_later(
-    tmp_path: Path, counter: str, phase: str, phase_after: str
+    tmp_path: Path,
 ) -> None:
+    # ADR 0039's current-may-be-later window is transition-blind. Reset-family
+    # transitions are covered by history validation, so one unrelated pair is sufficient here.
+    counter = "revision_count"
+    phase = "verifying"
+    phase_after = "planning"
     _save_state(
         tmp_path,
         "run-1",
