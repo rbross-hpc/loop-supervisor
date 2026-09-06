@@ -68,6 +68,24 @@ class TaskWorktree:
     original_task_id: str
     base_commit: str
 
+    @property
+    def scratch_path(self) -> Path:
+        """A peer directory for the builder's own temporary/probe files.
+
+        Named by appending ``.scratch`` to the worktree's own path (a
+        `.`-leading suffix `sanitize_task_id` can never produce from a
+        task ID, since it strips leading/trailing dots, so this can never
+        collide with a real sibling worktree). It sits beside, not inside,
+        the worktree, so it is outside every Git worktree and writing to
+        it never affects `git status` there. It is also already covered
+        by the same `external_directory` allowance that makes sibling
+        task worktrees themselves reachable (the project's parent
+        directory and its `/**` subtree), so no separate permission is
+        needed. See `Supervisor._do_creating_worktree`/
+        `_do_cleanup_worktree` for its lifecycle.
+        """
+        return self.path.parent / f"{self.path.name}.scratch"
+
 
 class GitRepo:
     """Wraps Git operations for one integration worktree."""

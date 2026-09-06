@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import uuid
 from collections import Counter
 from collections.abc import Callable
@@ -963,6 +964,13 @@ class Supervisor:
             worktree_root=self.worktree_root,
         )
 
+        # Idempotent and non-destructive: this phase is retried in its
+        # entirety on resume (see this method's docstring), and a resume
+        # that lands here mid-probe must not wipe a backup the builder is
+        # about to restore from. Created before provisioning so a
+        # configured provision command can use it too.
+        worktree.scratch_path.mkdir(parents=True, exist_ok=True)
+
         if self.options.provision_commands:
             results = run_commands(
                 self.options.provision_commands,
@@ -1503,7 +1511,24 @@ class Supervisor:
         worktree = self._require_worktree(state)
         self._validate_merge_cleanup_safety(state, worktree)
         self.repo.remove_task_worktree_only(worktree)
+        self._remove_task_scratch(worktree)
         state.phase = PHASE_CLEANUP_BRANCH
+
+    @staticmethod
+    def _remove_task_scratch(worktree: TaskWorktree) -> None:
+        """Best-effort removal of the task's scratch directory.
+
+        Only reached after a successful merge and worktree removal (this
+        runs in `_do_cleanup_worktree`, after `remove_task_worktree_only`
+        has already succeeded), so a leftover scratch directory is a
+        harmless side effect, never lost work -- unlike the worktree/branch
+        themselves, it must not fail this phase or block resume:
+        `ignore_errors=True` means a transient OSError here (e.g. a
+        concurrently open file handle) silently leaves the directory in
+        place rather than turning a completed, merged task into an
+        operational failure.
+        """
+        shutil.rmtree(worktree.scratch_path, ignore_errors=True)
 
     def _do_cleanup_branch(self, state: RunState) -> None:
         worktree = self._require_worktree(state)

@@ -47,6 +47,26 @@ worktree. Your worktree has its own `.venv`; installing against
 another environment can silently corrupt the integration checkout's
 environment.
 
+A scratch directory has been created for you beside your task
+worktree, at your worktree's path with `.scratch` appended (if your
+worktree is `/parent/project-task-007`, it is
+`/parent/project-task-007.scratch`). Use it for backups before a
+failing-first probe, intermediate output, or anything temporary. It is
+outside every Git worktree, so it never affects `git status`, and the
+supervisor removes it when the task is cleaned up.
+
+Never write to `/tmp`, `/dev`, or any other directory outside the
+project and its sibling worktrees. Those paths are denied by policy
+and there is no human to approve the request: it is auto-denied, your
+invocation returns no output, and the whole run stops with an
+operational failure. Treat an external path as unavailable, not as
+something to ask about or retry.
+
+If a probe requires restoring a file you overwrote, restore it from a
+backup in that scratch directory. Do not use `git checkout --` on
+uncommitted work — that discards your changes rather than restoring
+them. Confirm `git status` is clean before reporting COMPLETE.
+
 Return exactly one JSON object and no other text.
 
 The status must be exactly one of:
