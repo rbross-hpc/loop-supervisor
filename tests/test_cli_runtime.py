@@ -12,6 +12,7 @@ from typing import Any, cast
 import pytest
 
 import loop_supervisor.cli as cli_mod
+from loop_supervisor import __version__
 from loop_supervisor.git import GitError
 from loop_supervisor.locking import LockError
 from loop_supervisor.runtime import RuntimeError_
@@ -998,6 +999,14 @@ def test_cmd_tui_is_not_wrapped_by_the_sigterm_bridge(tmp_path, monkeypatch):
     assert after is before, "cmd_tui must not touch SIGTERM disposition at all"
 
 
+def test_main_version_flag_prints_package_version(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(["--version"])
+
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out == f"{__version__}\n"
+
+
 def test_build_parser_wires_config_validate():
     parser = cli_mod.build_parser()
     args = parser.parse_args(["config", "validate", "--project", "/tmp/x"])
@@ -1030,6 +1039,16 @@ def test_cmd_config_validate_exit_code_matches_report_ok(tmp_path, monkeypatch, 
     out = capsys.readouterr()
     assert "dotenv_file" in out.out
     assert "one or more checks failed" in out.err
+
+
+def test_cmd_config_validate_json_includes_loop_supervisor_version(tmp_path, capsys):
+    args = argparse.Namespace(project=str(tmp_path), opencode_executable="opencode", json=True)
+
+    assert cli_mod.cmd_config_validate(args) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["checks"]["loop_supervisor_version"]["detail"] == (
+        f"loop-supervisor {__version__}"
+    )
 
 
 def test_cmd_config_validate_prints_json_when_requested(tmp_path, monkeypatch, capsys):
