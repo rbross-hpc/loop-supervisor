@@ -199,6 +199,31 @@ def test_one_record_per_advance_in_sequence_order(tmp_path):
     assert "auditing" in phases
 
 
+def test_written_record_includes_operational_retry_count_from_run_state(tmp_path):
+    runner = ScriptedRunner({"loop-planner": [_planner_ready()]})
+    supervisor, repo = _make_supervisor(tmp_path, runner)
+    state = supervisor.start_new_run()
+    recorder = PhaseHistoryRecorder()
+
+    outcome = supervisor.advance(state)
+    outcome.state.operational_retry_count = 2
+    recorder.on_advance(outcome)
+
+    directory = history_dir(Path(outcome.state.git_common_dir), outcome.state.run_id)
+    record = json.loads(next(directory.glob("*.json")).read_text())
+    counters = record["counters"]
+    assert isinstance(counters, dict)
+    assert set(counters) == {
+        "accepted_task_count",
+        "revision_count",
+        "replan_count",
+        "architect_retry_count",
+        "builder_guidance_count",
+        "operational_retry_count",
+    }
+    assert counters["operational_retry_count"] == 2
+
+
 def test_revision_preserves_both_builder_results(tmp_path):
     """RunState overwrites builder_result on every REVISE cycle; the
     history directory must retain both, unlike the state snapshot."""

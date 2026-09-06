@@ -34,7 +34,7 @@ _MAX_SEQUENCE_DIGITS = 128
 _MAX_HISTORY_LEAVES = 10_000
 """Maximum directory entries inspected for a single run's history."""
 _MAX_DIAGNOSTIC_ARTIFACT_LENGTH = 256
-_COUNTER_FIELDS = frozenset(
+_LEGACY_COUNTER_FIELDS = frozenset(
     {
         "accepted_task_count",
         "revision_count",
@@ -44,9 +44,9 @@ _COUNTER_FIELDS = frozenset(
     }
 )
 _OPTIONAL_COUNTER_FIELD = "operational_retry_count"
-_ACCEPTED_COUNTER_FIELD_SETS = frozenset(
-    {_COUNTER_FIELDS, _COUNTER_FIELDS | {_OPTIONAL_COUNTER_FIELD}}
-)
+_OPERATIONAL_RETRY_COUNTER_FIELD = "operational_retry_count"
+_COUNTER_FIELDS = _LEGACY_COUNTER_FIELDS | {_OPTIONAL_COUNTER_FIELD}
+_ACCEPTED_COUNTER_FIELD_SETS = frozenset({_LEGACY_COUNTER_FIELDS, _COUNTER_FIELDS})
 _RESET_TRANSITIONS_BY_COUNTER: dict[str, frozenset[tuple[str, str]]] = {
     "revision_count": frozenset(
         {
@@ -368,6 +368,13 @@ def _append_adjacent_contradiction_diagnostics(
 
 def _is_permitted_counter_reset(field: str, following: HistoryEntry) -> bool:
     """Return whether a decreased counter is a documented reset on this transition."""
+    if field == _OPERATIONAL_RETRY_COUNTER_FIELD:
+        return (
+            following.counters[field] == 0
+            and following.phase != "operational_failure"
+            and following.status is not AdvanceStatus.INPUT_UNAVAILABLE
+        )
+
     transition = (following.phase, following.phase_after)
     if following.counters[field] != 0 or transition not in _RESET_TRANSITIONS_BY_COUNTER.get(
         field, frozenset()
