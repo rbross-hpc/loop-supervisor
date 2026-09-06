@@ -50,5 +50,23 @@ def test_resolve_project_canonicalizes_an_explicit_path_inside_a_repository(tmp_
 def test_resolve_project_rejects_a_nonexistent_path_without_a_partial_result(tmp_path):
     missing = tmp_path / "missing"
 
-    with pytest.raises(ProjectResolutionError, match="Cannot resolve project"):
+    with pytest.raises(
+        ProjectResolutionError,
+        match=r"Cannot resolve project .*: Git repository access failed\.",
+    ):
         resolve_project(missing)
+
+
+def test_resolve_project_does_not_expose_git_command_output(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    raw_git_output = "git-command-stderr-secret"
+    (project / ".git").write_text(f"gitdir: {tmp_path / raw_git_output}\n")
+
+    with pytest.raises(
+        ProjectResolutionError,
+        match=r"Cannot resolve project .*: Git repository access failed\.",
+    ) as caught:
+        resolve_project(project)
+
+    assert raw_git_output not in str(caught.value)

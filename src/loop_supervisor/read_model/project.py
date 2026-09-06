@@ -34,4 +34,9 @@ def resolve_project(project_path: Path | str | None = None) -> ProjectResolution
             git_common_dir=repo.common_dir(),
         )
     except (GitError, OSError) as exc:
-        raise ProjectResolutionError(f"Cannot resolve project {path}: {exc}") from exc
+        detail = (
+            "Git repository access failed."
+            if isinstance(exc, GitError)
+            else "Filesystem access failed."
+        )
+        raise ProjectResolutionError(f"Cannot resolve project {path}: {detail}") from exc
