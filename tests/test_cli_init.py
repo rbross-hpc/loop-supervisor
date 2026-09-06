@@ -48,6 +48,17 @@ def test_skeleton_planner_matches_live_modulo_model_line():
     assert skeleton == live
 
 
+def test_planner_prompt_requires_repository_verified_deferral_and_completion_checks():
+    """Planner instructions preserve ADR 0042's one-task deferral lead."""
+    prompt = " ".join((_LIVE_AGENTS_DIR / "loop-planner.md").read_text().split())
+
+    assert "not as proof" in prompt
+    assert "If the portion is still genuinely absent, select that portion first" in prompt
+    assert 'each bullet of docs/OBJECTIVE.md\'s "Completion criteria"' in prompt
+    assert "rather than inferred from memory" in prompt
+    assert "deliberately deferred portion must be named in the returned `rationale`" in prompt
+
+
 def test_skeleton_architect_matches_live_modulo_model_line():
     """loop-architect.md.tmpl differs from the live loop-architect.md in
     exactly one respect: the live file pins `model: argo/GPT-5.6 Sol`

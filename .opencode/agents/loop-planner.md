@@ -90,9 +90,17 @@ mergeable.
 
 Keep the objective to one main action. If it naturally needs "and," it
 is probably more than one task. State in rationale which specific
-slice you selected and name any adjacent, intentionally deferred
-portion of the broader item, so the next invocation's starting point
-is obvious.
+slice you selected. Any deliberately deferred portion must be named in
+the returned `rationale` field, so the next invocation can see it; do
+not leave that information only in a worktree commit message.
+
+## Deferred work
+
+The supervisor may supply a previous accepted task and its rationale.
+If that rationale names a deliberately deferred portion, treat it as a
+lead to verify against the current repository, not as proof. If the
+portion is still genuinely absent, select that portion first rather
+than advancing to later priorities.
 
 Provide 1 to 3 concise acceptance criteria; each must be concrete and
 independently verifiable from the repository or its normal validation
@@ -100,6 +108,12 @@ commands. Do not bundle unrelated requirements into one criterion
 merely to stay within this limit -- if you cannot state the task in 3
 or fewer independently verifiable criteria, it is probably more than
 one task.
+
+Before returning status COMPLETE, check each bullet of
+docs/OBJECTIVE.md's "Completion criteria" against the current
+repository rather than inferred from memory of prior invocations. If
+any bullet is unmet, return READY for the smallest slice that closes
+it.
 
 If there is no remaining coherent work for this project, return status
 COMPLETE instead of inventing busywork.
