@@ -717,6 +717,20 @@ def test_build_on_advance_chains_verbosity_reporter_on_top(monkeypatch, capsys):
     assert "planning -> building" in capsys.readouterr().err
 
 
+def test_build_on_advance_chains_automatic_retry_reporting_at_verbose(monkeypatch, capsys):
+    monkeypatch.setattr(cli_mod, "PhaseHistoryRecorder", lambda: _FakeRecorder([]))
+    observer, consumers, on_advance = cli_mod._build_on_advance(1)
+    assert on_advance is not None
+
+    class _FakeState:
+        planner_result = None
+        original_task_id = "task-001"
+
+    cast(Any, on_advance).operational_retry(retry_count=1, max_retries=3, state=_FakeState())
+
+    assert "automatic operational retry 1/3" in capsys.readouterr().err
+
+
 def test_cmd_run_passes_verbosity_hooks_to_run_new(tmp_path, monkeypatch):
     captured: dict[str, object] = {}
 

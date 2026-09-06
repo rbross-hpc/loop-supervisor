@@ -211,12 +211,21 @@ def _build_on_advance(
     verbosity_observer, consumers, verbosity_on_advance = _build_verbosity_hooks(verbosity)
     recorder_on_advance = PhaseHistoryRecorder().on_advance
 
-    def on_advance(outcome: AdvanceOutcome) -> None:
-        recorder_on_advance(outcome)
-        if verbosity_on_advance is not None:
-            verbosity_on_advance(outcome)
+    class _AdvanceReporter:
+        def __call__(self, outcome: AdvanceOutcome) -> None:
+            recorder_on_advance(outcome)
+            if verbosity_on_advance is not None:
+                verbosity_on_advance(outcome)
 
-    return verbosity_observer, consumers, on_advance
+        def operational_retry(self, **kwargs: object) -> None:
+            if verbosity_on_advance is None:
+                return
+            reporter = getattr(verbosity_on_advance, "__self__", None)
+            retry_reporter = getattr(reporter, "operational_retry", None)
+            if callable(retry_reporter):
+                retry_reporter(**kwargs)
+
+    return verbosity_observer, consumers, _AdvanceReporter()
 
 
 def _resolve_max_steps(args: argparse.Namespace) -> int | None:
