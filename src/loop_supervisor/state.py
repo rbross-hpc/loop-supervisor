@@ -107,12 +107,20 @@ class RunOptions:
     provision_timeout: float
     verify_commands: tuple[str, ...]
     verify_timeout: float
+    max_operational_retries: int = 3
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RunOptions:
+        data = dict(data)
+
+        # ADR 0042 permits this narrowly scoped same-schema additive
+        # compatibility default before exact-field validation, so options
+        # persisted before the operational retry limit existed still load.
+        data.setdefault("max_operational_retries", 3)
+
         known = {f.name for f in fields(cls)}
         unknown = set(data) - known
         if unknown:
@@ -134,6 +142,7 @@ class RunOptions:
             "max_architect_retries",
             "max_builder_guidance_attempts",
             "malformed_output_retries",
+            "max_operational_retries",
         ):
             value = data[name]
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -355,6 +364,7 @@ class RunState:
     replan_count: int = 0
     architect_retry_count: int = 0
     builder_guidance_count: int = 0
+    operational_retry_count: int = 0
     pending_question: dict[str, Any] | None = None
     last_task_head: str | None = None
     created_at: str = field(default_factory=_now)
@@ -398,6 +408,7 @@ class RunState:
         # documents persisted before this field existed remain resumable;
         # unknown fields and every other missing field still fail closed.
         data.setdefault("last_completed_task", None)
+        data.setdefault("operational_retry_count", 0)
 
         # Strict, exact field set. Dataclass defaults are appropriate for
         # constructing *new* in-memory states, but must never implicitly
@@ -465,6 +476,7 @@ def _validate_scalar_types(data: dict[str, Any]) -> None:
         "replan_count",
         "architect_retry_count",
         "builder_guidance_count",
+        "operational_retry_count",
     ):
         value = data.get(name)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
