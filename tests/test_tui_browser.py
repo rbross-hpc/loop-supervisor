@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -306,6 +307,57 @@ async def test_run_browser_bounds_sanitized_degraded_row_and_snapshot_diagnostic
         assert "Activity: not evidenced running (inactive at inspection time)" in row
         assert sensitive_path not in row
         assert "secret" not in row
+
+
+@pytest.mark.asyncio
+async def test_browser_labels_use_shared_bound_and_preserve_in_bounds_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00", phase="auditing")
+    _persist_history(tmp_path, run_id, "0001-planning.json", seq=1)
+    _persist_verification_result(tmp_path, run_id, _verification_result(tmp_path, run_id))
+    log = tmp_path / "loop-supervisor" / "verification" / run_id / ("a" * 40) / "01.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("log")
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    original_bound = RunBrowserApp._bound_browser_output
+    bound_inputs: list[str] = []
+
+    def record_bound(cls: type[RunBrowserApp], text: str) -> str:
+        bound_inputs.append(text)
+        return original_bound(text)
+
+    monkeypatch.setattr(RunBrowserApp, "_bound_browser_output", classmethod(record_bound))
+    app = RunBrowserApp(snapshot)
+    project_label = f"Project: {tmp_path}"
+    record_label = "Sequence 1: planning (open detail)"
+    log_label = "Attempt 1 log (open; unredacted sensitive output)"
+    async with app.run_test() as pilot:
+        project = cast(Any, app.screen.query_one(".project-path").render()).plain
+        assert project == project_label
+
+        await pilot.press("enter")
+
+        record = cast(Any, app.screen.query("#record-list Static")[1].render()).plain
+        rendered_log_label = cast(
+            Any, app.screen.query_one("#verification-log-list Static").render()
+        ).plain
+        assert record == record_label
+        assert rendered_log_label == log_label
+
+    assert project_label in bound_inputs
+    assert record_label in bound_inputs
+    assert log_label in bound_inputs
+    assert RunBrowserApp._bound_browser_output("ordinary label") == "ordinary label"
+    oversized_project = replace(
+        snapshot,
+        project=replace(snapshot.project, integration_root=tmp_path / ("x" * (256 * 1024))),
+    )
+    oversized_app = RunBrowserApp(oversized_project)
+    async with oversized_app.run_test():
+        oversized_label = cast(Any, oversized_app.screen.query_one(".project-path").render()).plain
+    assert oversized_label.endswith("Browser output truncated: rendered-output limit reached.")
 
 
 @pytest.mark.asyncio
