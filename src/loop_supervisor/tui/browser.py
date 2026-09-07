@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from textual.app import App, ComposeResult
 from textual.containers import VerticalScroll
+from textual.widget import Widget
 from textual.widgets import Footer, Header, ListItem, ListView, Static
 
 from ..read_model import verification
@@ -35,6 +36,8 @@ class RunBrowserApp(App[None]):
     _SENSITIVE_LOG_WARNING = "WARNING: Verification output is unredacted and potentially sensitive."
     _REFRESH_FAILURE_DIAGNOSTIC = "Refresh failed: unable to scan supervisor run state."
     _BROWSER_TRUNCATION_MARKER = "Browser output truncated: rendered-output limit reached."
+    _SCROLL_INTO_VIEW_MAX_ATTEMPTS = 4
+    """Bounded retries for ``_scroll_record_list_into_view``'s settle-and-recheck loop."""
 
     TITLE = "Loop Supervisor"
     SUB_TITLE = "Run browser"
@@ -51,6 +54,11 @@ class RunBrowserApp(App[None]):
 
     .run-row {
         margin-bottom: 1;
+    }
+
+    #record-list, #verification-log-list {
+        height: auto;
+        max-height: 15;
     }
     """
 
@@ -460,10 +468,46 @@ class RunBrowserApp(App[None]):
             self.call_after_refresh(self._focus_record_list)
 
     def _focus_record_list(self) -> None:
-        """Keep the selected run's current and history records keyboard-accessible."""
+        """Keep the selected run's current and history records keyboard-accessible.
+
+        Focusing alone is not enough: the record list sits below a much taller
+        workflow-timeline ``Static`` in the same scrolling container, so the
+        outer container's own scroll position after a fresh compose can leave
+        the list entirely outside the visible viewport -- confirmed by
+        Textual's own click machinery rejecting a click there as out of
+        bounds. See ``_scroll_record_list_into_view`` for why one scroll call
+        is not sufficient either.
+        """
         record_list = self._find_list_view("#record-list")
         if record_list is not None:
             record_list.focus()
+            self._scroll_record_list_into_view(record_list, self._SCROLL_INTO_VIEW_MAX_ATTEMPTS)
+
+    def _scroll_record_list_into_view(self, record_list: ListView, remaining_attempts: int) -> None:
+        """Scroll the record list into view, retrying while its container still reflows.
+
+        A single ``scroll_visible`` call after this container's first
+        post-compose layout is not reliable: the workflow-timeline ``Static``
+        directly above the list can still be wrapped for a width that does
+        not yet account for the container's own vertical scrollbar, which
+        appears only once true content height is known. That scrollbar
+        reservation shrinks the timeline's available width, changing how
+        many lines it wraps to and shifting the record list further down --
+        after the scroll call already ran against the pre-shift position.
+        Rechecking ``can_view_entire`` and retrying (bounded, not indefinite)
+        settles once layout stops moving, rather than guessing a fixed
+        number of deferred frames.
+        """
+        record_list.scroll_visible(animate=False, immediate=True)
+        container = record_list.parent
+        if (
+            remaining_attempts > 0
+            and isinstance(container, Widget)
+            and not container.can_view_entire(record_list)
+        ):
+            self.call_after_refresh(
+                lambda: self._scroll_record_list_into_view(record_list, remaining_attempts - 1)
+            )
 
     def action_toggle_raw_json(self) -> None:
         """Toggle the opt-in raw JSON view for the open record detail."""
