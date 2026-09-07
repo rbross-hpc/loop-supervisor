@@ -1738,4 +1738,126 @@ async def test_run_detail_record_list_is_fully_visible_at_common_terminal_sizes(
         records_pane = app.screen.query_one("#run-detail-records")
 
         assert records_pane.can_view_entire(record_list)
+
+
+@pytest.mark.asyncio
+async def test_run_detail_nav_pane_is_forty_percent_of_the_screen(tmp_path: Path) -> None:
+    """The selector column must be 40% wide; the preview pane takes the rest.
+
+    Selecting from the narrower left column, rather than dedicating the
+    full screen width to one record at a time, is the point of this
+    layout: it must consistently claim 40% regardless of terminal size.
+    """
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00")
+    _persist_history(tmp_path, run_id, "0001-planning.json", seq=1)
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        nav = app.screen.query_one("#run-detail-nav")
+        body = app.screen.query_one("#run-detail-body")
+
+        assert nav.outer_size.width == 48
+        assert body.outer_size.width == 72
+
+
+@pytest.mark.asyncio
+async def test_run_detail_preview_pane_is_populated_on_open(tmp_path: Path) -> None:
+    """The preview pane must show the initially highlighted record's detail
+    as soon as run detail opens, without requiring a keypress first."""
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00")
+    _persist_history(tmp_path, run_id, "0001-planning.json", seq=1, has_result=True)
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        body_text = cast(Any, app.screen.query_one("#detail-body-text").render()).plain
+        assert "Result: unavailable (none recorded)." in body_text
+        assert "Raw JSON: collapsed (press e to expand)" in body_text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_preview_pane_follows_arrow_key_highlight(tmp_path: Path) -> None:
+    """Moving the highlight with arrow keys must update the preview pane's
+    content to match the newly highlighted record, live, without `enter`."""
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00")
+    _persist_history(tmp_path, run_id, "0001-planning.json", seq=1, has_result=True)
+    _persist_history(
+        tmp_path, run_id, "0002-planning.json", seq=2, has_result=False, has_error=True
+    )
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        initial = cast(Any, app.screen.query_one("#detail-body-text").render()).plain
+        assert "Result: unavailable (none recorded)." in initial
+
+        await pilot.press("down")
+        await pilot.pause()
+
+        first_record = cast(Any, app.screen.query_one("#detail-body-text").render()).plain
+        assert "Result: available (detail truncated)." not in first_record
+        assert "Result:" in first_record
+        assert "unavailable (none recorded)." not in first_record.split("Error:")[0]
+
+        await pilot.press("down")
+        await pilot.pause()
+
+        second_record = cast(Any, app.screen.query_one("#detail-body-text").render()).plain
+        assert "Error:" in second_record
+        assert second_record != first_record
+
+
+@pytest.mark.asyncio
+async def test_run_detail_highlighting_a_log_row_does_not_read_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Arrowing onto a verification-log row must never trigger a bounded
+    read of that log's content: opening a log is an explicit, warned
+    action (ADR 0036), and the live preview must not become an implicit
+    way to read unredacted, potentially sensitive output."""
+    run_id = "selected"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-04T00:00:00+00:00", phase="auditing")
+    _persist_verification_result(tmp_path, run_id, _verification_result(tmp_path, run_id))
+    log = tmp_path / "loop-supervisor" / "verification" / run_id / ("a" * 40) / "01.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("sensitive log content")
+
+    calls: list[object] = []
+    original_read_log = browser.verification.read_log
+
+    def recording_read_log(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        return original_read_log(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(browser.verification, "read_log", recording_read_log)
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        record_list = app.screen.query_one("#record-list", ListView)
+        record_list.focus()
+        await pilot.press("tab")
+        await pilot.pause()
+
+        log_list = app.screen.query_one("#verification-log-list", ListView)
+        assert log_list.has_focus
+        await pilot.pause()
+
+        assert calls == []
         assert record_list.outer_size.height > 1

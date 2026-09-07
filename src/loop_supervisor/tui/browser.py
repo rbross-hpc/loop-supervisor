@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from textual.app import App, ComposeResult
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Footer, Header, ListItem, ListView, Static
 
 from ..read_model import verification
@@ -55,16 +55,23 @@ class RunBrowserApp(App[None]):
 
     #run-detail {
         padding: 0;
+        layout: horizontal;
+    }
+
+    #run-detail-nav {
+        width: 40%;
+        padding: 0;
+        border-right: solid $accent;
     }
 
     #run-detail-narrative {
         height: 1fr;
-        padding: 1 2;
+        padding: 1 1 0 2;
     }
 
     #run-detail-records {
         height: 1fr;
-        padding: 0 2 1 2;
+        padding: 0 1 1 2;
         border-top: solid $accent;
     }
 
@@ -76,6 +83,11 @@ class RunBrowserApp(App[None]):
     #verification-log-list {
         height: auto;
         max-height: 40%;
+    }
+
+    #run-detail-body {
+        width: 1fr;
+        padding: 1 2;
     }
     """
 
@@ -145,7 +157,7 @@ class RunBrowserApp(App[None]):
                 )
 
     def _compose_detail(self, run_id: str) -> ComposeResult:
-        """Compose run detail as two independently scrolling panes.
+        """Compose run detail as a 40% selector column beside a live preview pane.
 
         The workflow-timeline ``Static`` renders one literal line per history
         entry and grows unbounded (over 1600 rows for a long-running real
@@ -157,62 +169,76 @@ class RunBrowserApp(App[None]):
         the list outside the visible viewport entirely. Splitting the
         narrative (summary, timeline, verification) and the records
         (record list, verification log list) into their own ``1fr`` panes
-        means each one only ever needs to fit its own content, and the
-        record list is visible immediately without any scroll-into-view
-        chase.
+        first fixed that; putting those two panes in a narrower left column
+        beside a wider live-preview pane on the right lets the record list
+        claim far more visible rows than a full-width stacked layout ever
+        could, and lets the highlighted record's detail be read without an
+        extra keystroke into a separate screen (see
+        ``on_list_view_highlighted``). The full-screen record-detail and
+        verification-log-viewer screens are intentionally left in place for
+        now: ``enter`` still opens them for a larger, dedicated read.
         """
         detail = self._snapshot.detail_for(run_id)
         current = detail.current
         history = detail.history
         discovered_verification = detail.verification
-        with Vertical(id="run-detail"):
-            with VerticalScroll(id="run-detail-narrative"):
-                yield Static("Run detail — press b to return to the browser.", markup=False)
+        with Horizontal(id="run-detail"):
+            with Vertical(id="run-detail-nav"):
+                with VerticalScroll(id="run-detail-narrative"):
+                    yield Static("Run detail — press b to return to the browser.", markup=False)
+                    yield Static(
+                        self._render_current_run(
+                            current, self._snapshot.lock, detail.current_state_disagreements
+                        ),
+                        markup=False,
+                        classes="run-detail-summary",
+                    )
+                    yield Static(
+                        self._render_history(history), markup=False, classes="run-detail-timeline"
+                    )
+                    yield Static(
+                        self._render_verification(discovered_verification),
+                        markup=False,
+                        classes="run-detail-verification",
+                    )
+                self._openable_logs = tuple(
+                    attempt.log
+                    for attempt in discovered_verification.attempts
+                    if attempt.log is not None
+                )
+                self._detail_records = (current, *history.entries)
+                record_rows = (
+                    ListItem(Static(self._record_label(record), markup=False))
+                    for record in self._detail_records
+                )
+                with VerticalScroll(id="run-detail-records"):
+                    yield ListView(
+                        *record_rows,
+                        initial_index=self._record_highlight_index(),
+                        id="record-list",
+                    )
+                    if self._openable_logs:
+                        log_rows = (
+                            ListItem(
+                                Static(
+                                    self._bound_browser_output(
+                                        f"Attempt {reference.ordinal} log "
+                                        "(open; unredacted sensitive output)"
+                                    ),
+                                    markup=False,
+                                )
+                            )
+                            for reference in self._openable_logs
+                        )
+                        yield ListView(*log_rows, id="verification-log-list")
+            with VerticalScroll(id="run-detail-body"):
                 yield Static(
-                    self._render_current_run(
-                        current, self._snapshot.lock, detail.current_state_disagreements
+                    self._render_record_detail(
+                        self._detail_records[self._record_highlight_index()]
                     ),
                     markup=False,
-                    classes="run-detail-summary",
+                    id="detail-body-text",
                 )
-                yield Static(
-                    self._render_history(history), markup=False, classes="run-detail-timeline"
-                )
-                yield Static(
-                    self._render_verification(discovered_verification),
-                    markup=False,
-                    classes="run-detail-verification",
-                )
-            self._openable_logs = tuple(
-                attempt.log
-                for attempt in discovered_verification.attempts
-                if attempt.log is not None
-            )
-            self._detail_records = (current, *history.entries)
-            record_rows = (
-                ListItem(Static(self._record_label(record), markup=False))
-                for record in self._detail_records
-            )
-            with VerticalScroll(id="run-detail-records"):
-                yield ListView(
-                    *record_rows,
-                    initial_index=self._record_highlight_index(),
-                    id="record-list",
-                )
-                if self._openable_logs:
-                    log_rows = (
-                        ListItem(
-                            Static(
-                                self._bound_browser_output(
-                                    f"Attempt {reference.ordinal} log "
-                                    "(open; unredacted sensitive output)"
-                                ),
-                                markup=False,
-                            )
-                        )
-                        for reference in self._openable_logs
-                    )
-                    yield ListView(*log_rows, id="verification-log-list")
 
     def _compose_record_detail(self) -> ComposeResult:
         record = self._detail_records[self._selected_record_index or 0]
@@ -465,6 +491,31 @@ class RunBrowserApp(App[None]):
             return self._run_id_by_row_index.index(self._browser_highlighted_run_id)
         except ValueError:
             return 0
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        """Live-preview the highlighted record's detail without opening a log.
+
+        This mirrors ``_render_record_detail`` used by the full-screen record
+        detail, but is render-only: it must never call ``verification.read_log``.
+        Opening a verification log is an explicit, warned action (ADR 0036),
+        so highlighting a log row here only updates the preview via
+        ``on_list_view_selected``/``_show_selected_run``'s existing log-open
+        path, never as a side effect of moving the cursor.
+        """
+        if event.list_view.id != "record-list" or self._selected_run_id is None:
+            return
+        index = event.list_view.index
+        if index is None or index >= len(self._detail_records):
+            return
+        matches = self.query("#detail-body-text")
+        if not matches:
+            # The preview pane may not be mounted yet if this highlight event
+            # arrives during a pending recompose; tolerate rather than crash,
+            # matching ``_find_list_view``'s documented hazard above.
+            return
+        body = matches.first()
+        assert isinstance(body, Static)
+        body.update(self._render_record_detail(self._detail_records[index]))
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Open a selected run, record, or explicitly requested authorized log."""
