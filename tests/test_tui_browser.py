@@ -1604,3 +1604,138 @@ async def test_record_list_is_clickable_after_opening_a_run_with_a_long_timeline
         await pilot.pause()
 
         await pilot.click("#record-list")
+
+
+@pytest.mark.asyncio
+async def test_run_detail_record_list_fills_available_height(tmp_path: Path) -> None:
+    """The record list must occupy most of its pane, not a capped sliver.
+
+    Before this fix the record list was capped at `max-height: 15` and, on a
+    long-running real run, pinned to the bottom of one ~1650-row scrolling
+    page shared with the workflow timeline -- on screen it looked like "a
+    few lines at the bottom" no matter the terminal size. Splitting the
+    narrative and the records into their own `1fr` panes means the record
+    list's height tracks the terminal instead of a fixed cap.
+    """
+    run_id = "many-records"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-01T00:00:00+00:00")
+    for seq in range(1, 61):
+        _persist_history(tmp_path, run_id, f"{seq:04d}-planning.json", seq=seq)
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        record_list = app.screen.query_one("#record-list", ListView)
+        records_pane = app.screen.query_one("#run-detail-records")
+        narrative_pane = app.screen.query_one("#run-detail-narrative")
+
+        assert record_list.outer_size.height >= 12
+        assert records_pane.can_view_entire(record_list)
+        assert narrative_pane.outer_size.height + records_pane.outer_size.height == 38
+
+
+@pytest.mark.asyncio
+async def test_run_detail_timeline_scrolls_independently_of_the_record_list(
+    tmp_path: Path,
+) -> None:
+    """Scrolling the tall timeline must not move or hide the record list.
+
+    The two panes are siblings in their own `VerticalScroll` containers, so
+    the workflow timeline -- which can be far taller than any single
+    terminal -- has room to scroll on its own, and doing so must leave the
+    record list's position in its own pane untouched.
+    """
+    run_id = "many-records"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-01T00:00:00+00:00")
+    for seq in range(1, 61):
+        _persist_history(tmp_path, run_id, f"{seq:04d}-planning.json", seq=seq)
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        narrative_pane = app.screen.query_one("#run-detail-narrative")
+        record_list = app.screen.query_one("#record-list", ListView)
+        records_pane = app.screen.query_one("#run-detail-records")
+
+        assert narrative_pane.max_scroll_y > 0
+
+        before_region = record_list.region
+        narrative_pane.scroll_end(animate=False, immediate=True)
+        await pilot.pause()
+
+        assert record_list.region == before_region
+        assert records_pane.can_view_entire(record_list)
+
+
+@pytest.mark.asyncio
+async def test_verification_log_list_does_not_crowd_out_the_record_list(
+    tmp_path: Path,
+) -> None:
+    """A run with many openable logs must still leave the record list usable.
+
+    `#verification-log-list` is capped at `max-height: 40%` of the records
+    pane precisely so a run with many verification attempts cannot push the
+    record list itself out of view or down to zero rows.
+    """
+    run_id = "many-logs"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-01T00:00:00+00:00")
+    result = _verification_result(tmp_path, run_id)
+    commands = result["commands"]
+    assert isinstance(commands, list)
+    template = commands[0]
+    assert isinstance(template, dict)
+    commit = "a" * 40
+    commands.clear()
+    for ordinal in range(1, 13):
+        log = tmp_path / "loop-supervisor" / "verification" / run_id / commit / f"{ordinal:02d}.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("log")
+        commands.append({**template, "command": f"pytest {ordinal}", "output_path": str(log)})
+    state_path = _persist_verification_result(tmp_path, run_id, result)
+    state = json.loads(state_path.read_text())
+    state["options"]["verify_commands"] = [command["command"] for command in commands]
+    state_path.write_text(json.dumps(state))
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        record_list = app.screen.query_one("#record-list", ListView)
+        assert app.screen.query_one("#verification-log-list", ListView).outer_size.height > 0
+        records_pane = app.screen.query_one("#run-detail-records")
+
+        assert record_list.outer_size.height >= 1
+        assert records_pane.can_view_entire(record_list)
+        await pilot.click("#record-list")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 40), (200, 60)])
+async def test_run_detail_record_list_is_fully_visible_at_common_terminal_sizes(
+    tmp_path: Path, size: tuple[int, int]
+) -> None:
+    """The record list must be fully on screen across common terminal sizes."""
+    run_id = "many-records"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-01T00:00:00+00:00")
+    for seq in range(1, 61):
+        _persist_history(tmp_path, run_id, f"{seq:04d}-planning.json", seq=seq)
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test(size=size) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        record_list = app.screen.query_one("#record-list", ListView)
+        records_pane = app.screen.query_one("#run-detail-records")
+
+        assert records_pane.can_view_entire(record_list)
+        assert record_list.outer_size.height > 1

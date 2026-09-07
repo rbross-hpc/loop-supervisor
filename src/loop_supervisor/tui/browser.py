@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from textual.app import App, ComposeResult
-from textual.containers import VerticalScroll
-from textual.widget import Widget
+from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Footer, Header, ListItem, ListView, Static
 
 from ..read_model import verification
@@ -36,8 +35,6 @@ class RunBrowserApp(App[None]):
     _SENSITIVE_LOG_WARNING = "WARNING: Verification output is unredacted and potentially sensitive."
     _REFRESH_FAILURE_DIAGNOSTIC = "Refresh failed: unable to scan supervisor run state."
     _BROWSER_TRUNCATION_MARKER = "Browser output truncated: rendered-output limit reached."
-    _SCROLL_INTO_VIEW_MAX_ATTEMPTS = 4
-    """Bounded retries for ``_scroll_record_list_into_view``'s settle-and-recheck loop."""
 
     TITLE = "Loop Supervisor"
     SUB_TITLE = "Run browser"
@@ -48,7 +45,7 @@ class RunBrowserApp(App[None]):
         ("e", "toggle_raw_json", "Toggle raw JSON"),
     ]
     CSS = """
-    #run-browser, #run-detail {
+    #run-browser {
         padding: 1 2;
     }
 
@@ -56,9 +53,29 @@ class RunBrowserApp(App[None]):
         margin-bottom: 1;
     }
 
-    #record-list, #verification-log-list {
+    #run-detail {
+        padding: 0;
+    }
+
+    #run-detail-narrative {
+        height: 1fr;
+        padding: 1 2;
+    }
+
+    #run-detail-records {
+        height: 1fr;
+        padding: 0 2 1 2;
+        border-top: solid $accent;
+    }
+
+    #record-list {
+        height: 1fr;
+        max-height: 100%;
+    }
+
+    #verification-log-list {
         height: auto;
-        max-height: 15;
+        max-height: 40%;
     }
     """
 
@@ -128,25 +145,44 @@ class RunBrowserApp(App[None]):
                 )
 
     def _compose_detail(self, run_id: str) -> ComposeResult:
+        """Compose run detail as two independently scrolling panes.
+
+        The workflow-timeline ``Static`` renders one literal line per history
+        entry and grows unbounded (over 1600 rows for a long-running real
+        run), while the record list only ever needs a handful of visible
+        rows at a time. Sharing one ``VerticalScroll`` made the timeline's
+        height push the record list to the very bottom of a single
+        multi-thousand-row page -- on screen it looked like "the list is a
+        few lines at the bottom", and on a short terminal it could scroll
+        the list outside the visible viewport entirely. Splitting the
+        narrative (summary, timeline, verification) and the records
+        (record list, verification log list) into their own ``1fr`` panes
+        means each one only ever needs to fit its own content, and the
+        record list is visible immediately without any scroll-into-view
+        chase.
+        """
         detail = self._snapshot.detail_for(run_id)
         current = detail.current
         history = detail.history
         discovered_verification = detail.verification
-        with VerticalScroll(id="run-detail"):
-            yield Static("Run detail — press b to return to the browser.", markup=False)
-            yield Static(
-                self._render_current_run(
-                    current, self._snapshot.lock, detail.current_state_disagreements
-                ),
-                markup=False,
-                classes="run-detail-summary",
-            )
-            yield Static(self._render_history(history), markup=False, classes="run-detail-timeline")
-            yield Static(
-                self._render_verification(discovered_verification),
-                markup=False,
-                classes="run-detail-verification",
-            )
+        with Vertical(id="run-detail"):
+            with VerticalScroll(id="run-detail-narrative"):
+                yield Static("Run detail — press b to return to the browser.", markup=False)
+                yield Static(
+                    self._render_current_run(
+                        current, self._snapshot.lock, detail.current_state_disagreements
+                    ),
+                    markup=False,
+                    classes="run-detail-summary",
+                )
+                yield Static(
+                    self._render_history(history), markup=False, classes="run-detail-timeline"
+                )
+                yield Static(
+                    self._render_verification(discovered_verification),
+                    markup=False,
+                    classes="run-detail-verification",
+                )
             self._openable_logs = tuple(
                 attempt.log
                 for attempt in discovered_verification.attempts
@@ -157,25 +193,26 @@ class RunBrowserApp(App[None]):
                 ListItem(Static(self._record_label(record), markup=False))
                 for record in self._detail_records
             )
-            yield ListView(
-                *record_rows,
-                initial_index=self._record_highlight_index(),
-                id="record-list",
-            )
-            if self._openable_logs:
-                log_rows = (
-                    ListItem(
-                        Static(
-                            self._bound_browser_output(
-                                f"Attempt {reference.ordinal} log "
-                                "(open; unredacted sensitive output)"
-                            ),
-                            markup=False,
-                        )
-                    )
-                    for reference in self._openable_logs
+            with VerticalScroll(id="run-detail-records"):
+                yield ListView(
+                    *record_rows,
+                    initial_index=self._record_highlight_index(),
+                    id="record-list",
                 )
-                yield ListView(*log_rows, id="verification-log-list")
+                if self._openable_logs:
+                    log_rows = (
+                        ListItem(
+                            Static(
+                                self._bound_browser_output(
+                                    f"Attempt {reference.ordinal} log "
+                                    "(open; unredacted sensitive output)"
+                                ),
+                                markup=False,
+                            )
+                        )
+                        for reference in self._openable_logs
+                    )
+                    yield ListView(*log_rows, id="verification-log-list")
 
     def _compose_record_detail(self) -> ComposeResult:
         record = self._detail_records[self._selected_record_index or 0]
@@ -470,44 +507,15 @@ class RunBrowserApp(App[None]):
     def _focus_record_list(self) -> None:
         """Keep the selected run's current and history records keyboard-accessible.
 
-        Focusing alone is not enough: the record list sits below a much taller
-        workflow-timeline ``Static`` in the same scrolling container, so the
-        outer container's own scroll position after a fresh compose can leave
-        the list entirely outside the visible viewport -- confirmed by
-        Textual's own click machinery rejecting a click there as out of
-        bounds. See ``_scroll_record_list_into_view`` for why one scroll call
-        is not sufficient either.
+        The record list lives in its own ``#run-detail-records`` pane
+        alongside the verification log list, separate from the much taller
+        ``#run-detail-narrative`` pane holding the workflow timeline. It is
+        visible as soon as the run detail composes, so focusing it is
+        sufficient; no scroll-into-view chase is needed.
         """
         record_list = self._find_list_view("#record-list")
         if record_list is not None:
             record_list.focus()
-            self._scroll_record_list_into_view(record_list, self._SCROLL_INTO_VIEW_MAX_ATTEMPTS)
-
-    def _scroll_record_list_into_view(self, record_list: ListView, remaining_attempts: int) -> None:
-        """Scroll the record list into view, retrying while its container still reflows.
-
-        A single ``scroll_visible`` call after this container's first
-        post-compose layout is not reliable: the workflow-timeline ``Static``
-        directly above the list can still be wrapped for a width that does
-        not yet account for the container's own vertical scrollbar, which
-        appears only once true content height is known. That scrollbar
-        reservation shrinks the timeline's available width, changing how
-        many lines it wraps to and shifting the record list further down --
-        after the scroll call already ran against the pre-shift position.
-        Rechecking ``can_view_entire`` and retrying (bounded, not indefinite)
-        settles once layout stops moving, rather than guessing a fixed
-        number of deferred frames.
-        """
-        record_list.scroll_visible(animate=False, immediate=True)
-        container = record_list.parent
-        if (
-            remaining_attempts > 0
-            and isinstance(container, Widget)
-            and not container.can_view_entire(record_list)
-        ):
-            self.call_after_refresh(
-                lambda: self._scroll_record_list_into_view(record_list, remaining_attempts - 1)
-            )
 
     def action_toggle_raw_json(self) -> None:
         """Toggle the opt-in raw JSON view for the open record detail."""
