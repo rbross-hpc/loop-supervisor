@@ -1504,3 +1504,103 @@ async def test_record_list_selection_with_stale_index_is_ignored_not_a_crash(
         app.on_list_view_selected(event)
 
         assert app._selected_record_index is None
+
+
+@pytest.mark.asyncio
+async def test_record_list_keeps_multiple_rows_visible_with_a_long_timeline(
+    tmp_path: Path,
+) -> None:
+    """The record list must not collapse to a single visible row.
+
+    `ListView` inherits `height: 1fr` from `ScrollableContainer`. Sharing a
+    `VerticalScroll` with the workflow-timeline `Static` -- which renders one
+    literal line per history entry and grows unbounded -- left the record
+    list with no `fr` space to claim once that timeline was tall enough,
+    regardless of how many records the list itself held. `outer_size.height`
+    is the actual number of simultaneously visible rows; asserting it stays
+    above 1 is what a screen-content assertion checking only `.index` would
+    have missed, since `.index` changes correctly even while nothing moves
+    on screen (see the companion test for that failure mode).
+    """
+    run_id = "many-records"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-01T00:00:00+00:00")
+    for seq in range(1, 61):
+        _persist_history(tmp_path, run_id, f"{seq:04d}-planning.json", seq=seq)
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        record_list = app.screen.query_one("#record-list", ListView)
+        assert record_list.outer_size.height > 1
+
+
+@pytest.mark.asyncio
+async def test_record_list_highlight_visibly_moves_with_arrow_keys(
+    tmp_path: Path,
+) -> None:
+    """Pressing down must move the on-screen highlighted row, not just `.index`.
+
+    Before this fix, `record_list.index` advanced correctly on every `down`
+    press, but the record list's visible viewport (`outer_size.height`) was
+    collapsed to a single row that was also scrolled outside the outer
+    container's visible window on open. The internal state changed while the
+    rendered screen was provably identical byte-for-byte. Asserting only
+    `.index` -- as prior tests did -- cannot distinguish "the highlight
+    moved on screen" from "the model moved but nothing visible changed",
+    which is exactly the bug a user reported as arrow keys doing nothing.
+    """
+    run_id = "many-records"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-01T00:00:00+00:00")
+    for seq in range(1, 61):
+        _persist_history(tmp_path, run_id, f"{seq:04d}-planning.json", seq=seq)
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        record_list = app.screen.query_one("#record-list", ListView)
+        run_detail = app.screen.query_one("#run-detail")
+        assert run_detail.can_view_entire(record_list)
+
+        before_item = record_list.highlighted_child
+        assert before_item is not None
+        before_region = before_item.region
+
+        await pilot.press("down", "down", "down")
+        await pilot.pause()
+
+        after_item = record_list.highlighted_child
+        assert after_item is not None
+        assert after_item is not before_item
+        assert after_item.region.y == before_region.y + 3
+
+
+@pytest.mark.asyncio
+async def test_record_list_is_clickable_after_opening_a_run_with_a_long_timeline(
+    tmp_path: Path,
+) -> None:
+    """A real mouse click on the record list must land, not raise `OutOfBounds`.
+
+    Before this fix, opening a run whose timeline was tall enough to scroll
+    the record list outside the visible viewport made Textual's own click
+    dispatch reject any click there (`OutOfBounds: Target offset is outside
+    of currently-visible screen region`), independent of and in addition to
+    the arrow-key symptom covered above.
+    """
+    run_id = "many-records"
+    _persist_run(tmp_path, run_id, updated_at="2026-01-01T00:00:00+00:00")
+    for seq in range(1, 61):
+        _persist_history(tmp_path, run_id, f"{seq:04d}-planning.json", seq=seq)
+
+    snapshot = build_snapshot(ProjectResolution(integration_root=tmp_path, git_common_dir=tmp_path))
+    app = RunBrowserApp(snapshot)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+
+        await pilot.click("#record-list")
