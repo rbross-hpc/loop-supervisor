@@ -5,10 +5,10 @@ drives an OpenCode planner/architect/builder/auditor loop over Git worktrees.
 
 The read-only `loop-supervisor tui` run browser has shipped, including
 PID-reuse-resistant active-run identity (ADR 0037) on both the writer and
-reader sides. A post-delivery audit of that work found remaining defects
-and one unimplemented requirement; this document records the delivered
-product contract and the remaining post-audit remediation work still in
-progress (see "Ordered priorities").
+reader sides. Successive post-delivery audits of that work found remaining
+defects and unimplemented requirements; this document records the delivered
+product contract and that remediation work, which is now complete (see
+"Ordered priorities").
 
 ## Product model
 
@@ -149,7 +149,7 @@ it is not an open work item.
 
 ## Ordered priorities
 
-Items 1 through 32 are delivered: the initial vertical slice, ADR
+Items 1 through 37 are delivered: the initial vertical slice, ADR
 0036/0037, the Textual-independent read model, writer/reader
 lock-identity hardening, a post-delivery audit's fixes for the TUI
 refresh crash, record-selection reconciliation, lock-diagnostic and
@@ -162,204 +162,41 @@ installed distribution metadata, and rendering of the ADR 0039
 disagreement diagnostics that were previously computed but never
 shown; a builder-managed scratch directory (item 30) closing a
 recurring `external_directory` denial the loop hit repeatedly while
-delivering items 16-29; and, sharing ADR 0042, planner deferred-work
+delivering items 16-29; sharing ADR 0042, planner deferred-work
 carry-forward (item 31) and automatic retry of transient operational
-failures (item 32). ADR 0041 additionally superseded ADR 0040:
-verification logs are write-once (`_summarize_verification` in
-`supervisor.py`), so the same-size in-place-rewrite gap ADR 0040
-flagged is not a mutation shape this project's writer can produce, and
-the byte-comparison slice it proposed was not implemented.
+failures (item 32); and a third-pass audit's completion of ADR 0042's
+sixth-history-counter contract (item 33), the operator-settable
+`--max-operational-retries` flag (item 34), source-side
+`ProjectResolutionError` sanitization (item 35), the last three TUI
+render sites routed through the shared output ceiling (item 36), and
+a corrected reset-family test parametrization (item 37). ADR 0041
+additionally superseded ADR 0040: verification logs are write-once
+(`_summarize_verification` in `supervisor.py`), so the same-size
+in-place-rewrite gap ADR 0040 flagged is not a mutation shape this
+project's writer can produce, and the byte-comparison slice it
+proposed was not implemented.
 
-A post-delivery audit of items 31-32 found that ADR 0042 itself decides
-more than the two implementation slices built: it states plainly that
-`operational_retry_count` is the sixth history counter, amends ADR
-0038's reset table and ADR 0039's comparison to cover it, and requires
-that new history records always write six counters, none of which
-reached the code. This is latent, not active -- the writer still emits
-five counters, so nothing currently breaks -- but it is a documented
-decision the code does not yet match, and leaving it unaddressed would
-let a future change follow the ADR's own instruction to widen the
-writer before the reader tolerates it. Item 33 below closes that gap.
-No new ADR is required; ADR 0042 is not rewritten, only implemented.
+ADR 0042 decided more than items 31-32 initially implemented:
+`operational_retry_count` is the sixth history counter, with
+amendments to ADR 0038's reset table and ADR 0039's comparison, and
+new records were meant to write six counters. Item 33 closed that gap
+in three ordered slices -- reader tolerance merged before the writer
+widened -- so a record written before the change still loads with the
+counter normalized to zero. No new ADR was required; ADR 0042 was
+implemented, not rewritten.
 
-31. Give the planner a narrow, mechanical way to carry a just-completed
-    task's stated rationale into its next invocation, and require it to
-    check that rationale for a named, still-unresolved deferral before
-    considering the objective complete. This item was previously held
-    back in "Deferred work" below; it is promoted here because it
-    shares an architect decision and a `RunState` shape change with item
-    32, and doing both in one ADR avoids two separate state-shape
-    revisions for closely related loop-control changes. Two
-    independently mergeable slices:
-    - Add an optional `last_completed_task` field to `RunState`
-      (`task_id`, `objective`, `rationale`; `None` by default, no schema
-      version bump), populated by `_finish_task_cleanup` immediately
-      before it clears `planner_result`, and included by
-      `_build_planner_prompt` on the next planning invocation whenever it
-      is set. This carries forward exactly one task's worth of context
-      across an accepted-task boundary; it does not need to persist
-      beyond that.
-    - Update the planner agent prompt
-      (`.opencode/agents/loop-planner.md`) to: (a) treat a carried-forward
-      rationale that names a deliberately deferred portion as a lead to
-      verify against the current repository state, not as proof, and
-      select that portion first if it is still genuinely absent; (b)
-      require, before returning status COMPLETE, that each bullet of this
-      document's "Completion criteria" be checked against the repository
-      rather than inferred from memory of prior invocations, returning
-      READY for the smallest slice closing any bullet found unmet; and
-      (c) require that a deliberately deferred portion be named in the
-      returned `rationale` field, not only in a worktree commit message,
-      since only `rationale` is ever visible to a future invocation.
-    Note the field above carries context for exactly one task boundary.
-    A deferral that survives more than one accepted task between when it
-    is named and when it is next picked up will not be caught by this
-    mechanism; closing that gap, if it proves necessary in practice, is
-    intentionally left for a later decision rather than solved
-    speculatively here.
-32. Automatically retry a transient operational failure instead of
-    always stopping for a human. `Supervisor.run()` unconditionally
-    raises on `AdvanceStatus.OPERATIONAL_FAILURE`, even though the
-    persisted error record already distinguishes retryable transient
-    failures (e.g. `AgentInvocationError` from a denied
-    `external_directory` request, `PhaseTimeoutError`, a plain
-    `GitError`) from failures that require human repair (a merge
-    conflict, a dirty `cleanup_worktree`, an unresolved `DecisionError`)
-    -- `retryable`/`requires_repair` on `OperationalErrorRecord` and
-    `_do_retry_operational_failure()` already know how to resume the
-    former; nothing currently calls that path automatically. This
-    recurred four times across the runs that delivered items 16-29,
-    each requiring a manual `resume` that did nothing a loop iteration
-    could not have done itself. Two independently mergeable slices:
-    - Record an ADR deciding: a new persisted, run-scoped
-      `operational_retry_count` counter, reset to zero on every
-      successful `advance()` (so it bounds *consecutive* failures, not
-      a run's lifetime total, matching how `max_builder_guidance_attempts`
-      already behaves) and incremented only on an auto-retried
-      operational failure; a `max_operational_retries` limit (default
-      3) on `Limits`/`RunOptions`, gated so only `retryable and not
-      requires_repair` failures auto-retry -- a failure requiring
-      repair must still stop for a human exactly as today; whether and
-      how the new counter joins the five counters ADR 0038's reset
-      table already enumerates, and whether (and how) it participates
-      in ADR 0039's newest-history/current-state comparison; and how
-      `RunOptions` accepts a run resumed from state saved before this
-      field existed, since `RunOptions.from_dict` currently raises
-      `StateError` on any unknown field.
-    - Implement the decision: the new counter and limit; auto-retry in
-      `Supervisor.run()`'s `OPERATIONAL_FAILURE` branch, incrementing
-      the counter, persisting state, and continuing the loop (so the
-      next `advance()` reaches `_do_retry_operational_failure()`)
-      instead of raising, until the limit is reached or the failure is
-      classified as requiring repair; a short, interrupt-safe delay
-      between automatic retries so a genuinely flapping dependency
-      cannot exhaust the budget in a tight loop; and a `-v` line on
-      each automatic retry distinguishing it from a human-initiated
-      `resume`, so a log reader is never left wondering which happened.
-33. Implement ADR 0042's sixth-history-counter contract, which the
-    runs delivering items 31-32 decided but did not build. ADR 0042
-    states that `operational_retry_count` is the sixth history
-    counter, amends ADR 0038's reset table and ADR 0039's
-    same-persisted-transition comparison to cover it, and requires
-    that new history records always write six counters. None of that
-    reached the code: `history.py`'s `_COUNTER_FIELDS`,
-    `read_model/history.py`'s `_COUNTER_FIELDS` and
-    `_RESET_TRANSITIONS_BY_COUNTER`, `read_model/snapshot.py`'s
-    `CurrentStateDisagreementField`, `read_model/current_run.py`, and
-    `tui/browser.py` all still know only the original five. This is
-    latent rather than active: the writer also still emits five, so
-    the reader's exact-set check currently passes. The decision is
-    already recorded and must not be re-litigated -- no new ADR is
-    required for this item.
-    Three slices, which MUST merge in this order:
-    - Reader tolerance first. `_validate_record` in
-      `read_model/history.py` currently rejects any record whose
-      counters are not exactly the five known fields; widen it to
-      accept either five or six, normalizing an absent
-      `operational_retry_count` to zero per ADR 0042, and carry the
-      field on `HistoryEntry.counters`. Merging this alone changes no
-      observable behavior, because the writer still emits five.
-    - Writer and diagnostics second, never before the slice above:
-      add `operational_retry_count` to `history.py`'s `_COUNTER_FIELDS`
-      so new records write six; extend ADR 0038 regression checking
-      to the new counter; and extend ADR 0039's comparison so it joins
-      exact equality when newest valid history is strictly newer than
-      current `RunState`, and is suppressed like the other resettable
-      counters when current state may be later, leaving
-      `accepted_task_count` as the only cross-generation monotonic
-      comparison. Note this counter's reset rule is a predicate, not
-      an enumerable transition set: unlike the other four it resets on
-      nearly every successful advance, so it does not belong in
-      `_RESET_TRANSITIONS_BY_COUNTER`'s tuple table. A decrease is a
-      permitted reset exactly when the new value is zero, the
-      record's `phase` is not `operational_failure`, and its `status`
-      is not `INPUT_UNAVAILABLE` -- mirroring the writer condition in
-      `_finalize_advance` and the `_InputRequiredSignal` handler.
-    - Presentation third, and independently mergeable relative to the
-      two above since it reads `RunState` rather than history: surface
-      the counter on `read_model/current_run.py`'s `CurrentRun`
-      (including its `degraded` constructor), add it to the
-      `CurrentStateDisagreementField` literal, and render it in
-      `tui/browser.py`'s current-summary counter block, history-entry
-      counter line, and disagreement labels. Without this an operator
-      cannot see how much of a run's retry budget has been consumed;
-      the `-v` line added by item 32 only helps someone watching a
-      live log.
-    Tests must cover a legacy five-counter record loading with the
-    counter normalized to zero, a six-counter record round-tripping,
-    a permitted reset on an ordinary successful advance, forbidden
-    decreases on an operational-failure unwrapping record and on an
-    input-unavailable record, a decrease to a nonzero value, and both
-    ADR 0039 timestamp windows for the new counter.
-34. Add a `--max-operational-retries` flag to `run`, defaulting to 3
-    and threaded through `cmd_run`'s `RunOptions.from_dict` call
-    alongside the three limit flags already there, so ADR 0042's
-    limit is operator-settable and a zero value can disable automatic
-    retry from the command line. It is currently reachable only via
-    its dataclass default.
-35. Sanitize `ProjectResolutionError` at its source rather than at its
-    sole consumer. `read_model/project.py`'s `resolve_project` builds
-    the message `f"Cannot resolve project {path}: {exc}"`, embedding
-    the underlying Git command's stdout/stderr in the exception
-    object. `cmd_tui` (item 19's fix) no longer prints it, so nothing
-    currently discloses it, but the containment is at the caller: a
-    second caller, or an unhandled propagation, would expose it again.
-    Replace the interpolated `{exc}` with a fixed, safe
-    classification chosen from the caught type -- the same approach
-    `read_model/current_run.py`'s `_safe_diagnostic` already uses for
-    `StateError`/`OSError` -- keeping the resolved path, which is
-    operator-supplied and already OS-bounded. Update
-    `tests/test_read_model_project.py`'s `match="Cannot resolve
-    project"` assertion and add one proving underlying Git output does
-    not reach the exception's string form.
-36. Route the three remaining TUI render sites through the shared
-    rendered-output-ceiling helper that item 24's consolidation
-    introduced, so no rendered site bypasses it: the project path line
-    (`_compose_browser`'s `f"Project: {...integration_root}"`), the
-    record-list row label (`_record_label`'s `f"Sequence {record.seq}:
-    {record.phase} ..."`), and the verification log-list row label.
-    Each currently interpolates a value bounded separately upstream --
-    an OS-bounded path, an ordinal capped at 128 digits, a phase name
-    from a fixed set -- so this is a consistency gap, not a reachable
-    overflow, and the change should be behavior-preserving for every
-    in-bounds value. Fixing it removes the standing need to re-derive
-    that upstream-bounded argument at each site during future audits.
-37. Close two gaps in ADR 0039's current-state disagreement test
-    coverage. First,
-    `test_build_snapshot_suppresses_resettable_disagreements_when_current_is_later`
-    is parametrized over ADR 0038's four reset-family transitions but
-    still passes if every transition is replaced with an unrelated
-    phase pair, because suppression in that window is driven entirely
-    by the timestamp gate in `_current_state_disagreements`, not by
-    the transition -- the parametrization asserts nothing it appears
-    to. Either assert something transition-specific or state plainly
-    that the suppression is transition-blind and reduce the
-    parametrization to match, so the test does not imply coverage it
-    lacks. Second, add the missing ordinary post-merge case where
-    history's `accepted_task_count` exceeds current `RunState`'s --
-    a lagging or failed history write -- which is the one comparison
-    ADR 0039 keeps active in the current-may-be-later window and
-    which no test currently exercises.
+Two details of items 33 and 37 were corrected by their implementations
+rather than followed as originally scheduled, and are recorded here so
+a later reader does not mistake the shipped shape for drift. ADR
+0039's comparison was scheduled in item 33's second slice but shipped
+in its third, because that comparison reads
+`CurrentRun.operational_retry_count`, which the third slice creates.
+Item 37's second half asked for a post-merge `accepted_task_count`
+test that already existed --
+`test_build_snapshot_reports_only_accepted_count_when_current_is_not_older`
+covers both timestamp windows -- so only its first half, removing a
+four-way parametrization that asserted nothing transition-specific,
+was genuine work.
 
 ## Deferred work (not yet scheduled)
 
