@@ -35,13 +35,25 @@ recoverable (see `references/recovering-an-interrupted-run.md`), but
 avoiding it entirely is far cheaper:
 
 ```bash
-nohup loop-supervisor run --project . --max-tasks 1 > /tmp/run.log 2>&1 &
+nohup loop-supervisor run --project . --max-tasks 1 -v > /tmp/run.log 2>&1 &
 disown
 ```
 
-Then poll rather than block — see
-`references/observing-a-run.md` for what to poll and how to tell a
-slow-but-healthy run apart from a stuck one.
+`-v` (and `-vv` for more detail) costs nothing to add — it's
+per-invocation only, never persisted into the run's saved options —
+and turns `/tmp/run.log` into a live, timestamped timeline instead of a
+mostly-empty file you have to supplement with polling. See
+`references/verbose-output.md` for exactly what it prints.
+
+Then, whether or not you used `-v`, poll rather than block — see
+`references/observing-a-run.md` for what to poll (including the
+persisted files under `references/on-disk-layout.md`) and how to tell
+a slow-but-healthy run apart from a stuck one.
+
+Before starting at all, `loop-supervisor config validate --project .`
+is a fast, fully offline preflight that catches most "why won't it
+start" problems (missing executables, a dirty worktree, a malformed
+`opencode.json`) without touching the network or starting a run.
 
 ## Bounding a run
 

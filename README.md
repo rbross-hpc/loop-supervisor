@@ -280,6 +280,19 @@ Useful flags: `--worktree-root`, `--max-tasks`, `--max-revisions`,
 `--max-steps` (bound how many phase transitions this invocation
 performs before stopping; `--step` is shorthand for `--max-steps 1`).
 
+`-v`/`--verbose` (repeatable, `-vv`) prints timestamped diagnostics to
+stderr while a run is in progress: agent invocation start/finish,
+phase transitions, and automatic operational-retry attempts. `-vv`
+additionally prints one per-invocation event-timing summary, useful
+for telling a slow-but-working session (steady tool-call activity,
+few new streamed tokens) apart from one that has actually stalled
+(both event streams go quiet). Neither level changes run behavior —
+diagnostics only, and safe to add on `resume` even if the original
+`run` didn't use it, since verbosity is per-invocation and never
+persisted. Both levels write to stderr; stdout keeps only the
+`run_id:`/`final phase:` lines, so scripts consuming stdout are
+unaffected either way.
+
 Two optional, off-by-default features are configured via
 `loop-supervisor.toml` at the project root (or `--config PATH`), with
 CLI flags taking precedence over the file: `[provision].commands`
