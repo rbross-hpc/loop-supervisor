@@ -22,10 +22,12 @@ The skill walks through the whole process: checking prerequisites with
 a temporary directory, writing `docs/OBJECTIVE.md` and seed ADRs from
 the existing codebase, retargeting the builder/auditor toolchain away
 from the Python defaults, configuring `opencode.json` and permissions,
-and a `--max-steps 1` smoke test before handing off to normal
-operation. It also documents two specific configuration mistakes that
-produce a run that hangs or fails with no obvious cause — both are
-easy to hit by hand and neither is obvious from `opencode.json` alone.
+and a `--max-steps 1` smoke test — inspected in the TUI, then continued
+with `resume <run-id>`, never a second `run` — before handing off to
+normal operation. It also documents two specific configuration
+mistakes that produce a run that hangs or fails with no obvious cause
+— both are easy to hit by hand and neither is obvious from
+`opencode.json` alone.
 
 This is intentionally agent-driven rather than a `loop-supervisor
 adopt` command: the hardest part of adoption — writing an accurate

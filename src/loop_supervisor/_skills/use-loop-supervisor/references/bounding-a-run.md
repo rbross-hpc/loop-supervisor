@@ -20,28 +20,46 @@ Note this still runs to completion for that one task — planning
 through merge and cleanup — which can be a long time (see `SKILL.md`'s
 detach guidance). It does not limit how long the task itself takes.
 
+**`--max-tasks` defaults to 20 when omitted** — there is no unbounded
+value. A run that reaches `phase: done` because
+`accepted_task_count == max_accepted_tasks` looks identical to one
+that reached `done` because the planner reported `COMPLETE`; check
+`accepted_task_count` against the configured limit (or the planner's
+own last result) if the distinction matters, e.g. before concluding
+the project is actually finished.
+
 ## `--step` / `--max-steps N`
 
-Bounds **completed phase transitions**, regardless of which task
-they belong to or whether any task ever completes. `--step` is
-shorthand for `--max-steps 1`.
+Bounds **completed steps** (`advance()` calls), regardless of which
+task they belong to or whether any task ever completes. Most steps
+change phase, but a step that pauses for input (`awaiting_input`)
+still consumes one unit of budget even though it does not advance the
+phase. `--step` is shorthand for `--max-steps 1`.
 
 ```bash
 loop-supervisor run --project . --max-steps 1
 ```
 
-Use this to inspect one phase transition at a time — e.g. confirming
-the planner picks a sane first task before letting the loop continue,
-or stepping through a run you don't yet trust. Each step can still
-block for up to `--role-timeout` if it invokes an agent (most phases
-do), so this bounds progress, not wall-clock time.
+Use this to inspect one step at a time — e.g. confirming the planner
+picks a sane first task before letting the loop continue, or stepping
+through a run you don't yet trust. Each step can still block for up to
+`--role-timeout` if it invokes an agent (most phases do), so this
+bounds progress, not wall-clock time.
+
+A single-step run does not print what the planner chose — it persists
+the choice and stops. Inspect it with `loop-supervisor tui --project .`
+(select the run, open **Current state**), then continue the **same**
+run with `loop-supervisor resume <run-id> --project .` — not another
+`run`, which would start an unrelated run and invoke the planner again.
 
 `--step`/`--max-steps` and `--max-tasks` are not mutually exclusive:
 combine them if you want a hard ceiling on both.
 
 ## Neither flag
 
-An unbounded `loop-supervisor run --project .` runs until the planner
-reports `COMPLETE` (nothing left to do) or a terminal failure. This is
-appropriate for genuine unattended operation, not for a first
-supervised run of anything you don't already trust.
+`loop-supervisor run --project .` still defaults to `--max-tasks 20`
+(see above) unless overridden. It stops earlier than that only if the
+planner reports `COMPLETE` (nothing left to do) or a terminal failure
+occurs first. Pass an explicit `--max-tasks N` for a different ceiling
+appropriate to genuine unattended operation; there is no flag value
+that removes the limit entirely.

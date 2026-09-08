@@ -132,18 +132,21 @@ mistakes from step 4 if they slipped through.
 loop-supervisor run --project . --max-steps 1
 ```
 
-This runs exactly one phase transition (almost always the planner
-choosing a first task) and stops, so you see real output without
-committing to a full run. Read `references/first-run.md` for what a
-healthy first step looks like and how to interpret common early
+This stops after one completed step (almost always the planner
+choosing a first task) without printing it — note the `run_id:` line,
+then inspect the choice with `loop-supervisor tui --project .` (select
+the run, open **Current state**). Read `references/first-run.md` for
+what a healthy first step looks like and how to interpret common early
 failures (permission denials, an empty/wrong objective, a planner that
 immediately reports `COMPLETE`).
 
-**Checkpoint:** show the human the planner's first task before running
-further steps. Once they're satisfied, hand off to normal operation:
+**Checkpoint:** show the human the planner's first task (from the TUI,
+not from run output) before running further steps. Once they're
+satisfied, continue the **same** run — a second `run` would start an
+unrelated one and invoke the planner again:
 
 ```bash
-loop-supervisor run --project .
+loop-supervisor resume <run-id> --project .
 ```
 
 for a full unattended run.

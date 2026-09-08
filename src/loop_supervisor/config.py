@@ -40,10 +40,14 @@ class ConfigError(RuntimeError):
 class ProjectConfig:
     """Parsed, validated project configuration.
 
-    `provision_commands`/`verify_commands` are shell-style command
-    lines, parsed with `shlex.split` at the point of execution (never
-    `shell=True`) -- see `commands.py`. An empty tuple means the
-    corresponding feature is off.
+    `provision_commands`/`verify_commands` are command lines tokenized
+    with `shlex.split` and executed directly at the point of execution,
+    never through an implicit shell (`shell=True` is never used) -- see
+    `commands.py`. Shell operators (`&&`, `|`, `>`, `;`) in a command
+    string are therefore inert, passed to the executable as literal
+    argv text rather than interpreted; a project needing shell
+    composition must configure an explicit shell, e.g. `sh -c '...'`.
+    An empty tuple means the corresponding feature is off.
     """
 
     provision_commands: tuple[str, ...] = ()

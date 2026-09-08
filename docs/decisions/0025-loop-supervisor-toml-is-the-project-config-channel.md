@@ -134,11 +134,14 @@ contract ADR 0022 established.
   version) landed immediately before this change specifically to
   avoid that tax.
 - A project wanting the venv-provisioning speed advantages of a faster
-  installer (e.g. `uv venv && uv pip install -e '.[dev]'`, which uses
-  hardlinks from a global cache rather than a fresh download/copy per
-  worktree) gets that entirely through `[provision].commands` -- this
-  project takes no dependency on `uv` or any other installer, and
-  knows nothing about which one a project chooses.
+  installer (e.g. `uv venv` followed by `uv pip install -e '.[dev]'`
+  as two separate `[provision].commands` entries, which uses hardlinks
+  from a global cache rather than a fresh download/copy per worktree)
+  gets that entirely through `[provision].commands` -- this project
+  takes no dependency on `uv` or any other installer, and knows
+  nothing about which one a project chooses. Each entry is executed
+  directly, never through a shell, so `&&` cannot be used to join two
+  commands into one entry (see the Decision section above).
 - `loop-supervisor.toml` is read once per `run` invocation (not on
   `resume`), consistent with every other run-behavior setting; editing
   it mid-run has no effect on that run, only on the next `run` (this

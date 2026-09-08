@@ -72,6 +72,16 @@ running `git checkout --` or `git clean` in a task worktree, or before
 concluding a resume failure means the run must be abandoned — both of
 those are easy to get wrong in a way that discards real, good work.
 
+## If a run stops with a merge conflict
+
+This is a distinct case from an interrupted process: `phase ==
+"operational_failure"` with `last_error.kind == "merge_conflict"`.
+Read `references/recovering-a-merge-conflict.md` for the exact `--no-ff`
+repair recipe before touching the integration worktree — "resolve the
+conflict" is not enough by itself, because the supervisor already
+aborted the failed merge and left no conflict markers to resolve in
+place.
+
 ## What the integration branch is (you don't create one)
 
 The integration branch is simply whatever branch is checked out in the

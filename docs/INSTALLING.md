@@ -146,12 +146,28 @@ run" checklist covering this.
 loop-supervisor run --project . --max-steps 1
 ```
 
-`--max-steps 1` performs exactly one phase transition and stops, so
-you can see the planner's first proposed task before committing to a
-full run. Once satisfied:
+`--max-steps 1` stops after one completed step (`advance()` call) —
+almost always the planner choosing a first task — rather than printing
+it. Note the `run_id:` it prints, then inspect what the planner chose:
 
 ```bash
-loop-supervisor run --project .
+loop-supervisor tui --project .
+```
+
+Select the run, then open its **Current state** record to read the
+planner's chosen task ID, objective, and acceptance criteria. A
+healthy first step ends at `final phase: creating_worktree` with exit
+code `1` (a pause, not a failure); if the planner reported the project
+`COMPLETE` instead, it ends at `final phase: done` with exit code `0`
+— see the [Troubleshooting](#troubleshooting) section below if that's
+unexpected.
+
+Once satisfied, **continue the same run** — do not start another
+`run`, which would create an unrelated run and invoke the planner
+again:
+
+```bash
+loop-supervisor resume <run-id> --project .
 ```
 
 for a full unattended run. See the main [README](../README.md) for the

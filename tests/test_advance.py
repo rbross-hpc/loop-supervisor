@@ -1689,6 +1689,11 @@ def test_merge_conflict_goes_to_operational_failure(tmp_path):
     assert state.last_error["kind"] == "merge_conflict"
     assert state.last_error["requires_repair"] is True
     assert state.last_error["retry_phase"] == PHASE_MERGING
+    hint = state.last_error["recovery_hint"]
+    assert hint is not None
+    assert "merge_task_head" in hint
+    assert "--no-ff" in hint
+    assert "second parent" in hint
 
 
 def test_operator_guidance_survives_a_retried_building_phase(tmp_path):
