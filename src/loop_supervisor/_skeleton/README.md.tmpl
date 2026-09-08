@@ -120,9 +120,19 @@ timeout = 600
 ```
 
 Consider [`uv`](https://docs.astral.sh/uv/) instead of `venv`/`pip`
-for faster repeated installs (`uv venv && uv pip install -e '.[dev]'`)
-— it hardlinks from a global cache rather than reinstalling from
-scratch on every worktree. `loop-supervisor` has no opinion on which
-installer you use; it only runs whatever commands you configure. See
-`loop-supervisor run --help` for the equivalent `--provision-command`/
-`--no-provision` flags, which take precedence over this file.
+for faster repeated installs — it hardlinks from a global cache rather
+than reinstalling from scratch on every worktree:
+
+```toml
+[provision]
+commands = ["uv venv", "uv pip install -e '.[dev]'"]
+```
+
+`loop-supervisor` has no opinion on which installer you use; it only
+runs whatever commands you configure. Each entry is parsed with
+`shlex.split` and executed directly, **never through a shell** —
+shell operators like `&&` are inert, so put sequential steps in
+separate list entries as shown above rather than joining them with
+`&&` in one string. See `loop-supervisor run --help` for the
+equivalent `--provision-command`/`--no-provision` flags, which take
+precedence over this file.

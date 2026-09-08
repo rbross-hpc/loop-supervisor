@@ -402,6 +402,14 @@ def test_creating_worktree_provisioning_failure_is_an_operational_failure(tmp_pa
     # task identity must not be committed on a failed provisioning attempt
     assert state.task_worktree_path is None
     assert state.pending_worktree_path is not None
+    # the recovery hint must not tell an operator that editing
+    # loop-supervisor.toml can repair this run -- resume reconstructs
+    # provision_commands from the persisted run, never from the config
+    # file, so that edit would have no effect on a retry
+    hint = state.last_error["recovery_hint"]
+    assert hint is not None
+    assert "cannot repair this run" in hint
+    assert "start a new run" in hint
 
 
 def test_creating_worktree_provisioning_stops_at_first_failing_command(tmp_path):
@@ -549,8 +557,14 @@ def test_creating_worktree_provisioning_retry_reconciles_existing_worktree(tmp_p
     supervisor.advance(state)
     assert state.phase == PHASE_OPERATIONAL_FAILURE
 
-    # Fix the configured command (simulating an operator editing
-    # loop-supervisor.toml) and retry the failed phase.
+    # Directly mutating supervisor.options exercises reconciliation of an
+    # existing worktree/branch on retry; it is not how a real `resume`
+    # changes provisioning commands -- `resume` always reconstructs
+    # RunOptions (including provision_commands) from the persisted run,
+    # never from loop-supervisor.toml, so editing that file cannot repair
+    # an already-failed run's provisioning step (see the persisted
+    # ProvisioningError recovery_hint). This substitutes a command that
+    # succeeds purely to reach the reconciliation path under test.
     supervisor.options = _make_options(provision_commands=("true",))
     state.phase = state.last_error["retry_phase"]
     supervisor.advance(state)

@@ -1724,8 +1724,14 @@ def _classify_operational_failure(
             PHASE_MERGING,
             True,
             True,
-            "The merge was aborted. Manually resolve and create a no-FF merge of the "
-            "exact persisted task commit into the integration branch, then resume.",
+            "The merge was aborted; there are no conflict markers left to "
+            "resolve in place. In the integration worktree, run 'git merge "
+            "--no-ff --no-commit <merge_task_head>' (the exact commit "
+            "recorded in this run's state, not the task branch name, which "
+            "may have moved), resolve and commit, then resume. Resume "
+            "requires the resulting merge commit's second parent to be "
+            "exactly merge_task_head; a fast-forward, squash, cherry-pick, "
+            "or a merge of a moved branch tip will not be recognized.",
         )
     if isinstance(exc, PhaseTimeoutError):
         return (failed_phase, True, False, "Resume to retry the timed-out phase.")
@@ -1775,10 +1781,14 @@ def _classify_operational_failure(
             failed_phase,
             True,
             False,
-            "A configured [provision].commands entry failed or timed out. Resume "
-            "to retry; the worktree/branch are reused as-is (provisioning "
-            "commands must be idempotent), or fix the command in "
-            "loop-supervisor.toml first if it will fail the same way again.",
+            "A configured [provision].commands entry failed or timed out. This "
+            "run reuses the exact commands captured when it started (resume "
+            "does not re-read loop-supervisor.toml), so editing that file "
+            "cannot repair this run. Resume to retry the whole sequence "
+            "in the reused worktree/branch (provisioning commands must be "
+            "idempotent); if the command itself is wrong, salvage or discard "
+            "the retained worktree/branch and start a new run with a "
+            "corrected loop-supervisor.toml.",
         )
     return (failed_phase, True, False, None)
 

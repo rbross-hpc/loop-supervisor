@@ -55,10 +55,12 @@ git checkout main   # or wherever the merge landed
 
 If the project has a `loop-supervisor.toml` `[verify]` section, those
 are the same commands the supervisor itself already ran against the
-task's commit — rerunning them on the merged integration branch is
-still worth doing, since the two are not always guaranteed to be
-identical (see the project's own backlog for whether `[provision]`/
-`[verify]` config applies uniformly across `run`/`resume`).
+task's commit — specifically, the exact commands captured when the run
+started (`resume` reuses them and never re-reads
+`loop-supervisor.toml`, so a later edit to the file was not what ran
+against this task). Rerunning them on the merged integration branch is
+still worth doing regardless, since the merged tree can differ from
+the pre-merge task commit even when the commands are identical.
 
 ## Spot-check the failing-first claim
 

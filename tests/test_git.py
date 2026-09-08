@@ -645,6 +645,55 @@ def test_reconcile_or_merge_conflict_raises_merge_conflict_error(tmp_path):
     assert repo.head_commit() == pre_head
 
 
+def test_reconcile_or_merge_recognizes_manually_repaired_conflict(tmp_path):
+    """Exercises the documented operator merge-conflict repair recipe
+    (README.md's "Merge-conflict repair" / the use-loop-supervisor skill's
+    recovering-a-merge-conflict.md): after an aborted conflicting merge,
+    an operator manually runs `git merge --no-ff --no-commit
+    <merge_task_head>`, resolves, and commits. reconcile_or_merge_task
+    must recognize that manually created commit as satisfying the
+    persisted merge intent, without performing a second merge."""
+    repo = _init_repo(tmp_path / "project")
+    worktree = _make_worktree(repo)
+    (worktree.path / "README.md").write_text("task version\n")
+    _run(["add", "-A"], worktree.path)
+    _run(["commit", "-m", "task edits README"], worktree.path)
+    task_head = repo.head_commit(cwd=worktree.path)
+
+    (repo.root / "README.md").write_text("integration version\n")
+    _run(["add", "-A"], repo.root)
+    _run(["commit", "-m", "integration edits README"], repo.root)
+    pre_head = repo.head_commit()
+
+    with pytest.raises(MergeConflictError):
+        repo.reconcile_or_merge_task(pre_head=pre_head, task_head=task_head)
+    assert repo.is_clean()
+    assert repo.head_commit() == pre_head
+
+    # Operator repair: recreate the merge of the exact task_head (not the
+    # branch name), resolve the conflict, and commit -- exactly the
+    # recipe the persisted recovery_hint and public docs prescribe.
+    # This merge attempt is expected to conflict and exit nonzero, so it
+    # bypasses _run's zero-exit assertion.
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", task_head],
+        cwd=str(repo.root),
+        capture_output=True,
+        text=True,
+    )
+    (repo.root / "README.md").write_text("resolved version\n")
+    _run(["add", "-A"], repo.root)
+    _run(["commit", "-m", "Merge commit " + repr(task_head)], repo.root)
+    manual_merge_commit = repo.head_commit()
+    parents = repo.commit_parents(manual_merge_commit)
+    assert parents == [pre_head, task_head]
+
+    reconciled = repo.reconcile_or_merge_task(pre_head=pre_head, task_head=task_head)
+    assert reconciled == manual_merge_commit
+    # No second merge was performed: HEAD is unchanged from the manual repair.
+    assert repo.head_commit() == manual_merge_commit
+
+
 def test_reconcile_or_merge_rejects_missing_pre_head(tmp_path):
     repo = _init_repo(tmp_path / "project")
     worktree = _make_worktree(repo)

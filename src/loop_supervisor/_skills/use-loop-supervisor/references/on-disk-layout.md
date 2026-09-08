@@ -65,10 +65,21 @@ are:
   `pending_question` is non-null.
 - **`last_error`** — non-null in `operational_failure` (and left in
   place through a subsequent `failed`). Fields include `message`,
-  `retryable`, `retry_phase`, `failed_phase`, `kind`, and `occurred_at`;
-  `retryable` is what tells you whether an unattended `resume` (or the
-  supervisor's own automatic retry, under `--max-operational-retries`)
-  is expected to make progress on its own, versus needing a human.
+  `retryable`, `retry_phase`, `failed_phase`, `kind`, `occurred_at`,
+  `requires_repair`, and `recovery_hint`. `retryable` is what tells you
+  whether an unattended `resume` (or the supervisor's own automatic
+  retry, under `--max-operational-retries`) is expected to make
+  progress on its own, versus needing a human; `requires_repair` (true
+  only for a subset of retryable failures, e.g. `merge_conflict`)
+  means a human must act first — `recovery_hint` says what. A failed
+  `[provision]` command (`kind: provisioning`) is retryable but its
+  command text cannot be changed by editing `loop-supervisor.toml`:
+  `resume` reuses the commands captured at run start, never the
+  current file (see "Two optional, off-by-default features" in the
+  main README). `[verify]` commands never produce an
+  `operational_failure` at all — every configured command runs
+  regardless of earlier failures, and the results become a finding for
+  the auditor, not a supervisor fault.
 - **`created_at`** / **`updated_at`** — ISO-8601 timestamps.
   `updated_at` is a *recording* time, not a heartbeat: a long gap since
   the last update is expected mid-invocation and is not by itself
@@ -79,13 +90,22 @@ are:
 
 Everything else on the object — the raw `planner_result`/
 `architect_result`/`builder_result`/`verification_result`/
-`auditor_result` payloads, worktree/merge checkpoint bookkeeping
-(`pending_worktree_*`, `pending_adr_*`, `merge_*`), and schema/identity
-fields (`schema_version`, `run_id`, `git_common_dir`,
-`integration_path`, ...) — exists mainly for the supervisor's own
-resume logic rather than at-a-glance observation. Read them if you need
-one specifically; they're safe to inspect, just not usually where
-you'd start.
+`auditor_result` payloads, worktree checkpoint bookkeeping
+(`pending_worktree_*`, `pending_adr_*`), and schema/identity fields
+(`schema_version`, `run_id`, `git_common_dir`, `integration_path`,
+...) — exists mainly for the supervisor's own resume logic rather than
+at-a-glance observation. Read them if you need one specifically;
+they're safe to inspect, just not usually where you'd start.
+
+**`merge_pre_head`, `merge_task_head`, `merge_commit`** are the
+exception worth knowing by name: non-null while `phase` is `merging`
+or later for the current task, they are the exact immutable merge
+intent (integration `HEAD` just before merging, the reviewed task
+commit, and the resulting merge commit once it exists). If `phase` is
+`operational_failure` with `last_error.kind == "merge_conflict"`,
+these two fields are exactly what `recovering-a-merge-conflict.md`
+needs to construct the required repair merge — read them from here,
+not from a branch name, since branches can move.
 
 ## `runs/<run_id>/NNNN-<phase>.json` — per-phase history, append-only
 

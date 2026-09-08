@@ -11,4 +11,5 @@ doing, not all of them up front.
 | `on-disk-layout.md` | The persisted run-state, phase-history, and verification-log files |
 | `bounding-a-run.md` | Choosing between `--max-tasks`, `--step`, and `--max-steps` |
 | `recovering-an-interrupted-run.md` | What to do (and not do) when a run is killed mid-phase |
+| `recovering-a-merge-conflict.md` | The exact `--no-ff` repair recipe for a `merge_conflict` operational failure |
 | `auditing-a-merge.md` | What to check before trusting and pushing what the loop merged |

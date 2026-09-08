@@ -129,14 +129,16 @@ def _add_step_control_arguments(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--step",
         action="store_true",
-        help="Perform exactly one phase transition, then stop (shorthand for --max-steps 1)",
+        help="Perform exactly one completed step (advance() call), then stop "
+        "(shorthand for --max-steps 1)",
     )
     group.add_argument(
         "--max-steps",
         type=int,
         default=None,
         metavar="N",
-        help="Stop after N completed phase transitions, even if the run has not finished",
+        help="Stop after N completed steps (advance() calls), even if the run "
+        "has not finished; a step that pauses for input counts too",
     )
 
 
@@ -716,7 +718,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=None,
         metavar="CMD",
-        help="Command to run in a new task worktree before building "
+        help="Command to run in a new task worktree before building, "
+        "executed directly (not through a shell) "
         "(repeatable; replaces [provision].commands from the config file "
         "entirely, does not append to it)",
     )
@@ -733,7 +736,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="CMD",
         help="Command to run after building and before auditing, with results "
-        "shown to the auditor (repeatable; replaces [verify].commands from "
+        "shown to the auditor, executed directly (not through a shell) "
+        "(repeatable; replaces [verify].commands from "
         "the config file entirely, does not append to it)",
     )
     verify_group.add_argument(

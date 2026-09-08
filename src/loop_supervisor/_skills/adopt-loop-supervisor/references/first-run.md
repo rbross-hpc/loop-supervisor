@@ -1,22 +1,46 @@
 # Interpreting the first `--max-steps 1` run
 
-`loop-supervisor run --project . --max-steps 1` performs exactly one
-phase transition and stops — almost always the planner choosing (or
-declining to choose) a first task. Read the printed `final phase` and
-any `paused at phase ...` line.
+`loop-supervisor run --project . --max-steps 1` stops after one
+completed step (`advance()` call) — almost always the planner choosing
+(or declining to choose) a first task. It persists that choice; it
+does **not** print it. Read the printed `run_id:`, `final phase:`, and
+any `paused at phase ...` line, then inspect the actual choice with the
+TUI (see below).
 
 ## A healthy first step
 
-- `final phase: planning` (or similar), with a paused message, and the
-  planner's chosen task visible via `loop-supervisor resume` (list
-  mode, no run_id). The task should be a coherent, reasonably-scoped
-  unit of work that plausibly matches `docs/OBJECTIVE.md`.
+- `final phase: creating_worktree`, with a `paused at phase
+  creating_worktree` message. This means the planner returned `READY`
+  with a chosen task; the worktree itself has not been created yet.
 - Exit code `1` is normal here — it means the run paused rather than
   reaching `done`, which is expected after exactly one step.
+- Inspect the planner's actual choice:
+
+  ```bash
+  loop-supervisor tui --project .
+  ```
+
+  Select the run just printed, then open its **Current state** record.
+  It shows the planner's task ID, objective, rationale, acceptance
+  criteria, and any relevant files. The task should be a coherent,
+  reasonably-scoped unit of work that plausibly matches
+  `docs/OBJECTIVE.md`. `loop-supervisor resume` with no run ID only
+  lists saved run IDs — it does not show task content.
+
+If the planner instead reported `COMPLETE` on this first step, the run
+ends at `final phase: done` with exit code `0` instead — see "Planner
+immediately reports `COMPLETE`" below.
 
 If this is what you see, show it to the human (the checkpoint at the
-end of `SKILL.md`), then let them decide whether to continue with
-`loop-supervisor run --project .` (no step limit).
+end of `SKILL.md`), then let them decide whether to continue. Continue
+the **same** run with `resume`, not another `run`:
+
+```bash
+loop-supervisor resume <run-id> --project .
+```
+
+A second `loop-supervisor run` would start an unrelated run and invoke
+the planner again, leaving this one paused.
 
 ## Common early failures and what they mean
 

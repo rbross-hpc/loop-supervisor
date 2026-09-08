@@ -272,13 +272,18 @@ configured stays unprotected across every future resume.
 loop-supervisor run --project /path/to/integration/checkout
 ```
 
-Useful flags: `--worktree-root`, `--max-tasks`, `--max-revisions`,
+Useful flags: `--worktree-root`, `--max-tasks` (default 20 — there is
+no unbounded value; a run reaching `done` because it hit this limit
+looks the same as one where the planner reported `COMPLETE`, so check
+`accepted_task_count` if the distinction matters), `--max-revisions`,
 `--max-replans`, `--max-architect-retries`,
 `--max-builder-guidance-attempts`, `--max-operational-retries`, `--role-timeout`,
 `--require-decision-approval`, `--opencode-executable`,
 `--recover-stale-lock`, and the mutually exclusive `--step`/
-`--max-steps` (bound how many phase transitions this invocation
-performs before stopping; `--step` is shorthand for `--max-steps 1`).
+`--max-steps` (bound how many completed steps, i.e. `advance()` calls,
+this invocation performs before stopping — most steps change phase,
+but a step that pauses for input also counts; `--step` is shorthand
+for `--max-steps 1`).
 
 `-v`/`--verbose` (repeatable, `-vv`) prints timestamped diagnostics to
 stderr while a run is in progress: agent invocation start/finish,
@@ -289,9 +294,18 @@ few new streamed tokens) apart from one that has actually stalled
 (both event streams go quiet). Neither level changes run behavior —
 diagnostics only, and safe to add on `resume` even if the original
 `run` didn't use it, since verbosity is per-invocation and never
-persisted. Both levels write to stderr; stdout keeps only the
-`run_id:`/`final phase:` lines, so scripts consuming stdout are
-unaffected either way.
+persisted. Both levels write to stderr, so scripts consuming stdout
+are unaffected either way.
+
+`run`'s stdout is `run_id: ...` followed by `final phase: ...`;
+`resume`'s is `final phase: ...` alone (it already knows the run ID).
+Either command additionally prints `paused at phase ...` on stdout
+whenever the invocation stops without reaching `done` or `failed` —
+including an ordinary `--max-steps`/`--step` stop or an
+`awaiting_input` pause with no TTY available, not only an error. Both
+commands exit `0` only when `final phase: done`; every other stop,
+including a normal bounded pause, exits `1` — check `final phase` (or
+persisted state) rather than treating a nonzero exit as failure.
 
 Two optional, off-by-default features are configured via
 `loop-supervisor.toml` at the project root (or `--config PATH`), with
@@ -301,6 +315,22 @@ CLI flags taking precedence over the file: `[provision].commands`
 results shown to the auditor). See ADR 0025 for the config format and
 `--provision-command`/`--no-provision`/`--verify-command`/
 `--no-verify` for the equivalent flags.
+
+Each command in `commands` is parsed with `shlex.split` and executed
+directly — **never through a shell**. Shell operators (`&&`, `|`, `>`,
+`;`) are inert; sequence setup steps as separate list entries instead:
+
+```toml
+[provision]
+commands = ["python3 -m venv .venv", ".venv/bin/pip install -e '.[dev]'"]
+```
+
+`provision_commands`/`verify_commands` are captured once, at
+`start_new_run()`, exactly like every other run-behavior setting (see
+"Pausing and resuming" above): `resume` reuses the commands persisted
+when the run started and never re-reads `loop-supervisor.toml`.
+Editing the file cannot repair an already-created run whose configured
+command fails — see "Operational failure and retry" below.
 
 The integration checkout must be a clean Git working tree on a real
 branch (not detached `HEAD`) before a run starts.
@@ -340,8 +370,24 @@ Remote-hostname and malformed locks are never auto-recovered.
 
 Transient failures (network errors, Git errors, merge conflicts) are
 persisted as `operational_failure` with a structured error record and a
-`retry_phase`. `loop-supervisor resume` retries from the recorded
-phase.
+`retry_phase`. The error record's `requires_repair` flag distinguishes
+two cases: when `false`, `loop-supervisor resume` (or the supervisor's
+own automatic in-invocation retry, up to `--max-operational-retries`)
+can retry the phase unattended; when `true`, an operator must repair
+something first (the recorded `recovery_hint` says what).
+
+**A failed `[provision]` command is `requires_repair: false` but not
+fixable by editing `loop-supervisor.toml`.** (A failed `[verify]`
+command is not an operational failure at all — every configured
+command still runs, and the results are handed to the auditor as
+findings, not a supervisor fault.) `resume` reuses the exact
+provisioning commands captured when the run started; it never re-reads
+the config file (see "Running" above). If the command itself needs to
+change, the retained worktree/branch can be inspected or salvaged, but
+repairing it for *this* run requires making the already-persisted
+command succeed (e.g. fixing whatever external condition made it
+fail), not rewriting it — only a new run picks up an edited
+`loop-supervisor.toml`.
 
 Non-recoverable failures (policy limits, invariant violations) set
 `phase = "failed"`; no further resume is possible. Start a new run.
@@ -355,9 +401,30 @@ from the loop's own operation alone. It can only happen if something
 external changes the integration branch while a run is in progress
 (e.g. an operator manually committing to it, or a second supervisor
 run pointed at the same repository). If a `--no-ff` merge conflicts,
-the supervisor aborts the merge, records the conflict as an
-operational failure requiring repair, and stops. Resolve the conflict
-manually in the integration worktree, then resume.
+the supervisor aborts the merge (there are no conflict markers left to
+resolve in place afterward) and persists the conflict as an
+operational failure with `requires_repair: true`.
+
+Repair requires recreating the merge yourself, using the exact
+persisted task commit rather than the (mutable) task branch name:
+read `merge_task_head` and `merge_pre_head` from the run's state (see
+`<git-common-dir>/loop-supervisor/runs/<run-id>.json`), then in the
+integration worktree:
+
+```bash
+git merge --no-ff --no-commit <merge_task_head>
+# resolve conflicts, git add the resolved paths
+git commit
+loop-supervisor resume <run-id> --project .
+```
+
+Resume specifically looks for a merge commit whose **second parent is
+exactly `merge_task_head`**; fast-forwarding, squashing, cherry-picking,
+rebasing, or merging a branch whose tip has since moved will not
+satisfy it and leaves the run unresumable that way. See the bundled
+`use-loop-supervisor` skill's `recovering-a-merge-conflict.md` for the
+full step-by-step recipe, including how to verify the repair before
+resuming.
 
 ## Bootstrapping a new project
 
